@@ -1,0 +1,139 @@
+# ==============================================================================
+# AV1-Restorer: Professional Training Configuration 
+# ==============================================================================
+
+# --- Project & Experiment Tracking ---
+project:
+  name: "AV1-Compression-Artifact-Restorer"
+  experiment_name: "AV1-Restorer-Tiny"
+  log_to_wandb: true
+
+# --- Data Paths ---
+data:
+  train_lq_root: "~/Documents/aura/av1_data/train/lq"
+  train_hq_root: "~/Documents/aura/av1_data/train/hq"
+  val_lq_root: "~/Documents/aura/av1_data/val/lq"
+  val_hq_root: "~/Documents/aura/av1_data/val/hq"
+  hq_ext: ".png"
+  lq_ext: ".avif"
+
+# --- Dataset Settings ---
+dataset:
+  crf_range: [23, 63]
+  preset_range: [4, 4] # Train only on preset 4 for now
+  norm_range: [-1,1] # Options: '[-1,1]' or '[0,1]'
+
+# --- Training Strategy ---
+curriculum:
+  patch_sizes: [128, 256]      # Progressively train on larger image patches
+  batch_sizes: [64, 16]        # Adjust based on VRAM for each patch size
+  epochs_per_stage: [100, 150] # Number of epochs for each curriculum stage
+
+# # --- Model Architecture (AV1UNetRestorer) ---
+# model:
+#   # Select which model configuration to use below
+#   size: "small" # Options: "small", "base", "large"
+#   # channels: [Head, L1, L2, L3, Bottleneck]
+#   # blocks: [Head, L1, L2, L3, Bottleneck
+
+#   # A smaller, faster configuration for quick experiments (~6M params)
+#   small:
+#     channels: [32, 64, 128, 256, 512]
+#     blocks: [2, 3, 4, 4, 6]
+
+#   # The main, high-performance configuration (~12M params)
+#   base:
+#     channels: [48, 96, 192, 384, 512]
+#     blocks: [2, 2, 3, 3, 4]
+
+#   # The full-capacity configuration based on your design spec (~48M params)
+#   large:
+#     channels: [64, 128, 256, 384, 512] 
+#     blocks: [2, 3, 4, 4, 12]
+# --- Model Architecture (AV1UNetRestorer) ---
+model:
+  size: "tiny" # Options: "tiny", "small", "base", "large"
+
+  tiny:   # ~4M params
+    channels: [24, 48, 64, 128, 256] # [24, 48, 64, 128, 256]
+    blocks: [2, 2, 2, 2, 4]
+
+  small:  # ~10M params
+    channels: [20, 40, 80, 160, 320]
+    blocks: [2, 2, 3, 3, 6]
+
+  base:   # ~16M params
+    channels: [48, 64, 128, 224, 384]
+    blocks: [2, 2, 3, 3, 6]
+
+  large:  # ~32M params
+    channels: [64, 96, 128, 256, 512]
+    blocks: [2, 3, 4, 4, 8]
+
+
+# --- Loss Function (Configures the `CombinedLoss` class) ---
+loss:
+  # Using Charbonnier as the primary pixel loss. It's a robust L1 variant.
+  charbonnier:
+    enabled: false
+    weight: 1.0
+    params:
+      eps: 0.001
+
+  l1:
+    enabled: false
+    weight: 1.0
+    params: {}
+
+  l2:
+    enabled: true
+    weight: 1.0
+    params: {}
+
+  perceptual:
+    enabled: false
+    weight: 0.1
+    params:
+      network: 'vgg' # 'vgg' (faster) or 'lpips' (often better quality)
+
+  ms_ssim:
+    enabled: false # Enable for better structural similarity
+    weight: 0.2
+    params: {}
+
+  frequency:
+    enabled: false # Enable to focus on high-frequency details (textures/edges)
+    weight: 0.05
+    params:
+      alpha: 0.8 # 1.0 focuses on magnitude; 0.5 on both magnitude & phase
+
+# --- Optimization ---
+optimizer:
+  type: "adamw"      # 'adamw' is generally recommended
+  lr: 1.0e-4 # 2.0e-4         # Learning rate
+  weight_decay: 1.0e-4
+  betas: [0.9, 0.999]
+  use_ema: true      # Use Exponential Moving Average for stabler weights
+
+scheduler:
+  type: "cosine"     # Cosine annealing schedule
+  min_lr: 1.0e-6
+
+# --- Training Process ---
+training:
+  grad_clip_norm: 1.0
+  validate_every_n_epochs: 1
+  num_val_samples_to_log: 4
+
+# --- Checkpointing ---
+checkpoint:
+  dir: "./checkpoints/av1-restorer-tiny/"
+  save_every_n_epochs: 1
+  keep_last_n: 3
+
+# --- System & Performance ---
+system:
+  num_workers: 8
+  device: "mps"             # "cuda", "mps", or "cpu", or "auto"
+  mixed_precision: false     # Recommended for NVIDIA/Apple GPUs
+  seed: 8

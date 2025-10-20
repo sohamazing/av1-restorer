@@ -1,0 +1,28 @@
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.venv/
+venv/
+env/
+
+# --- macOS ---
+.DS_Store
+.AppleDouble
+.LSOverride
+.Spotlight-V100
+.Trashes
+
+# --- Project-Specific ---
+# Ignore all data, checkpoints, results, and local logs
+av1_data/
+checkpoints/
+results/
+wandb/
+*.log
+
+# Ignore temporary or backup files
+archive/
+*.textClipping
