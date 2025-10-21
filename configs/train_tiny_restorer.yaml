@@ -5,15 +5,15 @@
 # --- Project & Experiment Tracking ---
 project:
   name: "AV1-Compression-Artifact-Restorer"
-  experiment_name: "AV1-Restorer-Tiny-V2"
+  experiment_name: "AV1-Restorer-Tiny-VM"
   log_to_wandb: true
 
 # --- Data Paths ---
 data:
-  train_lq_root: "~/Documents/aura/av1_data/train/lq"
-  train_hq_root: "~/Documents/aura/av1_data/train/hq"
-  val_lq_root: "~/Documents/aura/av1_data/val/lq"
-  val_hq_root: "~/Documents/aura/av1_data/val/hq"
+  train_lq_root: "av1_data/train/lq"
+  train_hq_root: "av1_data/train/hq"
+  val_lq_root: "av1_data/val/lq"
+  val_hq_root: "av1_data/val/hq"
   hq_ext: ".png"
   lq_ext: ".avif"
 
@@ -25,8 +25,8 @@ dataset:
 
 # --- Training Strategy ---
 curriculum:
-  patch_sizes: [192, 256]      # Progressively train on larger image patches
-  batch_sizes: [16, 8]        # Adjust based on VRAM for each patch size
+  patch_sizes: [128, 256]      # Progressively train on larger image patches
+  batch_sizes: [32, 8]        # Adjust based on VRAM for each patch size
   epochs_per_stage: [50, 50] # Number of epochs for each curriculum stage
 
 # --- Model Architecture (AV1UNetRestorer) ---
@@ -70,18 +70,18 @@ loss:
     params: {}
 
   perceptual:
-    enabled: true
+    enabled: false
     weight: 0.1
     params:
       network: 'vgg' # 'vgg' (faster) or 'lpips' (often better quality)
 
   ms_ssim:
-    enabled: true # Enable for better structural similarity
+    enabled: false # Enable for better structural similarity
     weight: 0.15
     params: {}
 
   frequency:
-    enabled: true # Enable to focus on high-frequency details (textures/edges)
+    enabled: false # Enable to focus on high-frequency details (textures/edges)
     weight: 0.05
     params:
       alpha: 0.8 # 1.0 focuses on magnitude; 0.5 on both magnitude & phase
@@ -113,6 +113,6 @@ checkpoint:
 # --- System & Performance ---
 system:
   num_workers: 8
-  device: "mps"             # "cuda", "mps", or "cpu", or "auto"
-  mixed_precision: false     # Recommended for NVIDIA/Apple GPUs
+  device: "cuda"             # "cuda", "mps", or "cpu", or "auto"
+  mixed_precision: true     # Recommended for NVIDIA/Apple GPUs
   seed: 8

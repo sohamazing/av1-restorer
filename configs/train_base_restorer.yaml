@@ -5,15 +5,15 @@
 # --- Project & Experiment Tracking ---
 project:
   name: "AV1-Compression-Artifact-Restorer"
-  experiment_name: "AV1-Restorer-Base"
+  experiment_name: "AV1-Restorer-Base-VM"
   log_to_wandb: true
 
 # --- Data Paths ---
 data:
-  train_lq_root: "~/Documents/aura/av1_data/train/lq"
-  train_hq_root: "~/Documents/aura/av1_data/train/hq"
-  val_lq_root: "~/Documents/aura/av1_data/val/lq"
-  val_hq_root: "~/Documents/aura/av1_data/val/hq"
+  train_lq_root: "av1_data/train/lq"
+  train_hq_root: "av1_data/train/hq"
+  val_lq_root: "av1_data/val/lq"
+  val_hq_root: "av1_data/val/hq"
   hq_ext: ".png"
   lq_ext: ".avif"
 
@@ -113,6 +113,6 @@ checkpoint:
 # --- System & Performance ---
 system:
   num_workers: 8
-  device: "mps"             # "cuda", "mps", or "cpu", or "auto"
+  device: "cuda"             # "cuda", "mps", or "cpu", or "auto"
   mixed_precision: false     # Recommended for NVIDIA/Apple GPUs
   seed: 8
