@@ -409,18 +409,92 @@ class AV1RestorerTrainer:
             logger.warning(f"Could not sample validation images: {e}")
             return None
     
-    def _create_dataloaders(
-        self,
-        patch_size: int,
-        batch_size: int
-    ) -> Tuple[DataLoader, DataLoader]:
-        """Create train and validation dataloaders for a curriculum stage."""
+    # def _create_dataloaders(
+    #     self,
+    #     patch_size: int,
+    #     batch_size: int
+    # ) -> Tuple[DataLoader, DataLoader]:
+    #     """Create train and validation dataloaders for a curriculum stage."""
+    #     data_cfg = self.config['data']
+    #     dset_cfg = self.config['dataset']
+    #     sys_cfg = self.config['system']
+        
+    #     # Training dataset
+    #     train_dataset = AV1Dataset(
+    #         lq_root_dir=data_cfg['train_lq_root'],
+    #         hq_root_dir=data_cfg['train_hq_root'],
+    #         hq_ext=data_cfg['hq_ext'],
+    #         patch_size=patch_size,
+    #         crf_range=tuple(dset_cfg['crf_range']),
+    #         preset_range=tuple(dset_cfg['preset_range']),
+    #         augment=True,
+    #         norm_range=tuple(dset_cfg.get('norm_range', [-1, 1])),
+    #         return_metadata=False
+    #     )
+        
+    #     # Validation dataset
+    #     val_dataset = AV1Dataset(
+    #         lq_root_dir=data_cfg['val_lq_root'],
+    #         hq_root_dir=data_cfg['val_hq_root'],
+    #         hq_ext=data_cfg['hq_ext'],
+    #         patch_size=patch_size,
+    #         crf_range=tuple(dset_cfg['crf_range']),
+    #         preset_range=tuple(dset_cfg['preset_range']),
+    #         augment=False,
+    #         norm_range=tuple(dset_cfg.get('norm_range', [-1, 1])),
+    #         return_metadata=False
+    #     )
+        
+    #     # FIXED: pin_memory only on CUDA
+    #     pin_memory = (self.device.type == 'cuda')
+        
+    #     # Dataloaders
+    #     train_loader = DataLoader(
+    #         train_dataset,
+    #         batch_size=batch_size,
+    #         shuffle=True,
+    #         num_workers=sys_cfg.get('num_workers', 4),
+    #         pin_memory=pin_memory,
+    #         drop_last=True,
+    #         persistent_workers=sys_cfg.get('num_workers', 4) > 0,
+    #         prefetch_factor=4,
+    #     )
+        
+    #     val_loader = DataLoader(
+    #         val_dataset,
+    #         batch_size=min(batch_size * 2, 32),
+    #         shuffle=False,
+    #         num_workers=sys_cfg.get('num_workers', 4),
+    #         pin_memory=pin_memory,
+    #         drop_last=False,
+    #         persistent_workers=sys_cfg.get('num_workers', 4) > 0,
+    #         prefetch_factor=2
+    #     )
+        
+    #     logger.info(f"✓ Dataloaders created")
+    #     logger.info(f"  Train: {len(train_dataset):,} samples, {len(train_loader)} batches")
+    #     logger.info(f"  Val: {len(val_dataset):,} samples, {len(val_loader)} batches")
+        
+    #     return train_loader, val_loader
+
+    def _create_dataloaders(self, patch_size: int,batch_size: int) -> Tuple[DataLoader, DataLoader]:
+        """Create dataloaders with automatic fast/slow dataset selection."""
         data_cfg = self.config['data']
         dset_cfg = self.config['dataset']
         sys_cfg = self.config['system']
         
-        # Training dataset
-        train_dataset = AV1Dataset(
+        # SMART SELECTION: Use fast dataset if .npy files exist
+        lq_ext = data_cfg.get('lq_ext', '.avif')
+        
+        if lq_ext == '.npy':
+            from utils.av1_npy_dataset import AV1DatasetFast as DatasetClass
+            logger.info("Using FastAV1Dataset (NumPy format) - faster loading! (preprocessed from AVIF)")
+        else:
+            from utils.av1_dataset import AV1Dataset as DatasetClass
+            logger.info("Using standard AV1Dataset (AVIF format)")
+        
+        # Create datasets
+        train_dataset = DatasetClass(
             lq_root_dir=data_cfg['train_lq_root'],
             hq_root_dir=data_cfg['train_hq_root'],
             hq_ext=data_cfg['hq_ext'],
@@ -432,8 +506,7 @@ class AV1RestorerTrainer:
             return_metadata=False
         )
         
-        # Validation dataset
-        val_dataset = AV1Dataset(
+        val_dataset = DatasetClass(
             lq_root_dir=data_cfg['val_lq_root'],
             hq_root_dir=data_cfg['val_hq_root'],
             hq_ext=data_cfg['hq_ext'],
@@ -445,30 +518,30 @@ class AV1RestorerTrainer:
             return_metadata=False
         )
         
-        # FIXED: pin_memory only on CUDA
+        # Optimized DataLoader settings
         pin_memory = (self.device.type == 'cuda')
+        num_workers = sys_cfg.get('num_workers', 8)
         
-        # Dataloaders
         train_loader = DataLoader(
             train_dataset,
             batch_size=batch_size,
             shuffle=True,
-            num_workers=sys_cfg.get('num_workers', 4),
+            num_workers=num_workers,
             pin_memory=pin_memory,
             drop_last=True,
-            persistent_workers=sys_cfg.get('num_workers', 4) > 0,
-            prefetch_factor=8,
+            persistent_workers=True,
+            prefetch_factor=4,  # Increased for throughput
         )
         
         val_loader = DataLoader(
             val_dataset,
             batch_size=min(batch_size * 2, 32),
             shuffle=False,
-            num_workers=sys_cfg.get('num_workers', 4),
+            num_workers=max(2, num_workers // 2),
             pin_memory=pin_memory,
             drop_last=False,
-            persistent_workers=sys_cfg.get('num_workers', 4) > 0,
-            prefetch_factor=2
+            persistent_workers=True,
+            prefetch_factor=2,
         )
         
         logger.info(f"✓ Dataloaders created")

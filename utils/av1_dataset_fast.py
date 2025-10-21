@@ -29,12 +29,12 @@ from tqdm import tqdm
 logger = logging.getLogger(__name__)
 
 
-class FastAV1Dataset(Dataset):
+class AV1DatasetFast(Dataset):
     """
-    High-performance dataset for pre-processed .npy files.
+    High-performance dataset for pre-processed .npy files. (NumPy)
     
     ~10x faster than decoding AVIF files on-the-fly.
-    Identical API to AV1Dataset for drop-in replacement.
+    Identical API to AV1Dataset for drop-in replacement. 
     """
     
     FILENAME_PATTERN = re.compile(r"^(.+?)_crf(\d+)_p(\d+)\.npy$")
@@ -255,92 +255,6 @@ class FastAV1Dataset(Dataset):
         return dict(Counter(pair["preset"] for pair in self.image_pairs))
 
 
-# ==============================================================================
-# FILE 2: Update train_av1_restorer.py - Smart Dataset Selection
-# ==============================================================================
-
-def _create_dataloaders(
-    self,
-    patch_size: int,
-    batch_size: int
-) -> Tuple[DataLoader, DataLoader]:
-    """Create dataloaders with automatic fast/slow dataset selection."""
-    data_cfg = self.config['data']
-    dset_cfg = self.config['dataset']
-    sys_cfg = self.config['system']
-    
-    # SMART SELECTION: Use fast dataset if .npy files exist
-    lq_ext = data_cfg.get('lq_ext', '.avif')
-    
-    if lq_ext == '.npy':
-        from utils.av1_dataset_fast import FastAV1Dataset as DatasetClass
-        logger.info("Using FastAV1Dataset (NumPy format) - 10x faster loading!")
-    else:
-        from utils.av1_dataset import AV1Dataset as DatasetClass
-        logger.info("Using standard AV1Dataset (AVIF format)")
-    
-    # Create datasets
-    train_dataset = DatasetClass(
-        lq_root_dir=data_cfg['train_lq_root'],
-        hq_root_dir=data_cfg['train_hq_root'],
-        hq_ext=data_cfg['hq_ext'],
-        patch_size=patch_size,
-        crf_range=tuple(dset_cfg['crf_range']),
-        preset_range=tuple(dset_cfg['preset_range']),
-        augment=True,
-        norm_range=tuple(dset_cfg.get('norm_range', [-1, 1])),
-        return_metadata=False
-    )
-    
-    val_dataset = DatasetClass(
-        lq_root_dir=data_cfg['val_lq_root'],
-        hq_root_dir=data_cfg['val_hq_root'],
-        hq_ext=data_cfg['hq_ext'],
-        patch_size=patch_size,
-        crf_range=tuple(dset_cfg['crf_range']),
-        preset_range=tuple(dset_cfg['preset_range']),
-        augment=False,
-        norm_range=tuple(dset_cfg.get('norm_range', [-1, 1])),
-        return_metadata=False
-    )
-    
-    # Optimized DataLoader settings
-    pin_memory = (self.device.type == 'cuda')
-    num_workers = sys_cfg.get('num_workers', 8)
-    
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        drop_last=True,
-        persistent_workers=True,
-        prefetch_factor=4,  # Increased for throughput
-    )
-    
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=min(batch_size * 2, 32),
-        shuffle=False,
-        num_workers=max(2, num_workers // 2),
-        pin_memory=pin_memory,
-        drop_last=False,
-        persistent_workers=True,
-        prefetch_factor=2,
-    )
-    
-    logger.info(f"✓ Dataloaders created")
-    logger.info(f"  Train: {len(train_dataset):,} samples, {len(train_loader)} batches")
-    logger.info(f"  Val: {len(val_dataset):,} samples, {len(val_loader)} batches")
-    
-    return train_loader, val_loader
-
-
-# ==============================================================================
-# FILE 3: WORKFLOW - How to Use This
-# ==============================================================================
-
 """
 STEP 1: Pre-process your dataset (ONE TIME, run overnight)
 ============================================================
@@ -371,10 +285,10 @@ STEP 2: Update your config YAML
 ================================
 
 data:
-  train_lq_root: "~/av1_data_npy/train/lq"  # Point to .npy files
-  train_hq_root: "~/av1_data_npy/train/hq"
-  val_lq_root: "~/av1_data_npy/val/lq"
-  val_hq_root: "~/av1_data_npy/val/hq"
+  train_lq_root: "~/gcs_data/av1_data_npy/train/lq"  # Point to .npy files
+  train_hq_root: "~/gcs_data/av1_data_npy/train/hq"
+  val_lq_root: "~/gcs_data/av1_data_npy/val/lq"
+  val_hq_root: "~/gcs_data/av1_data_npy/val/hq"
   hq_ext: ".npy"  # Changed from .png
   lq_ext: ".npy"  # Changed from .avif - THIS TRIGGERS FAST MODE
 
@@ -389,26 +303,4 @@ python -m av1_restorer.train_av1_restorer --config configs/train_tiny_restorer.y
 
 # Training will automatically detect .npy format and use FastAV1Dataset!
 
-
-EXPECTED PERFORMANCE IMPROVEMENT
-=================================
-
-Metric              | Before (AVIF) | After (.npy) | Speedup
---------------------|---------------|--------------|--------
-Loading time/batch  | ~1.0s         | ~0.05s       | 20x
-Iteration time      | 1.35s/it      | ~0.4s/it     | 3.4x
-Epoch time (994it)  | ~22 min       | ~6.5 min     | 3.4x
-Training time (50ep)| ~18 hours     | ~5.5 hours   | 3.3x
-GPU utilization     | 60-70%        | 95-99%       | Much better!
-
-
-STORAGE REQUIREMENTS
-====================
-
-Your dataset:
-- Original: 40GB train + 5GB val = 45GB
-- As .npy: ~45GB (similar, NumPy is uncompressed)
-- Total: ~90GB (both formats, delete AVIF after verification)
-
-This is totally manageable on your VM!
 """

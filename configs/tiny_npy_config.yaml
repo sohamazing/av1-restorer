@@ -5,7 +5,7 @@
 # --- Project & Experiment Tracking ---
 project:
   name: "AV1-Compression-Artifact-Restorer"
-  experiment_name: "AV1-Restorer-Tiny-VM"
+  experiment_name: "AV1-Restorer-Tiny-NumPy"
   log_to_wandb: true
 
 # --- Data Paths ---
@@ -14,8 +14,8 @@ data:
   train_hq_root: "~/gcs_data/av1_data_npy/train/hq"
   val_lq_root: "~/gcs_data/av1_data_npy/val/lq"
   val_hq_root: "~/gcs_data/av1_data_npy/val/hq"
-  hq_ext: ".png" # ".npy"
-  lq_ext: ".npy"
+  hq_ext: ".npy" # ".png"
+  lq_ext: ".npy" # ".avif"
 
 # --- Dataset Settings ---
 dataset:
@@ -116,13 +116,13 @@ training:
 
 # --- Checkpointing ---
 checkpoint:
-  dir: "./checkpoints/av1-restorer-tiny/"
+  dir: "./checkpoints/av1-restorer-tiny-npy/"
   save_every_n_epochs: 1
   keep_last_n: 3
 
 # --- System & Performance ---
 system:
-  num_workers: 8
+  num_workers: 12
   device: "cuda"             # "cuda", "mps", or "cpu", or "auto"
   mixed_precision: true     # Recommended for NVIDIA/Apple GPUs
   seed: 8
