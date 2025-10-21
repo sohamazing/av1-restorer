@@ -5,7 +5,7 @@
 # --- Project & Experiment Tracking ---
 project:
   name: "AV1-Compression-Artifact-Restorer"
-  experiment_name: "AV1-Restorer-Base-VM"
+  experiment_name: "AV1-Restorer-Base"
   log_to_wandb: true
 
 # --- Data Paths ---
@@ -25,7 +25,7 @@ dataset:
 
 # --- Training Strategy ---
 curriculum:
-  patch_sizes: [192, 256]      # Progressively train on larger image patches
+  patch_sizes: [128, 256]      # Progressively train on larger image patches
   batch_sizes: [16, 8]        # Adjust based on VRAM for each patch size
   epochs_per_stage: [50, 50] # Number of epochs for each curriculum stage
 
@@ -70,18 +70,18 @@ loss:
     params: {}
 
   perceptual:
-    enabled: true
+    enabled: false
     weight: 0.1
     params:
       network: 'vgg' # 'vgg' (faster) or 'lpips' (often better quality)
 
   ms_ssim:
-    enabled: true # Enable for better structural similarity
+    enabled: false # Enable for better structural similarity
     weight: 0.15
     params: {}
 
   frequency:
-    enabled: true # Enable to focus on high-frequency details (textures/edges)
+    enabled: false # Enable to focus on high-frequency details (textures/edges)
     weight: 0.05
     params:
       alpha: 0.8 # 1.0 focuses on magnitude; 0.5 on both magnitude & phase
