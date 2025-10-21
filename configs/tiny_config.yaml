@@ -5,7 +5,11 @@
 # --- Project & Experiment Tracking ---
 project:
   name: "AV1-Compression-Artifact-Restorer"
+<<<<<<< HEAD:configs/tiny_npy_config.yaml
   experiment_name: "AV1-Restorer-Tiny-VM"
+=======
+  experiment_name: "AV1-Restorer-Tiny-V3"
+>>>>>>> main:configs/tiny_config.yaml
   log_to_wandb: true
 
 # --- Data Paths ---
@@ -25,11 +29,13 @@ dataset:
 
 # --- Training Strategy ---
 curriculum:
+<<<<<<< HEAD:configs/tiny_npy_config.yaml
   patch_sizes: [128, 256]      # Progressively train on larger image patches
   batch_sizes: [64, 16]        # Adjust based on VRAM for each patch size
-  # ms_ssim needs > 160px
-  # patch_sizes: [192, 256]      # Progressively train on larger image patches
-  # batch_sizes: [24, 16]        # Adjust based on VRAM for each patch size
+=======
+  patch_sizes: [192, 256]      # Progressively train on larger image patches
+  batch_sizes: [24, 16]        # Adjust based on VRAM for each patch size
+>>>>>>> main:configs/tiny_config.yaml
   epochs_per_stage: [50, 50] # Number of epochs for each curriculum stage
 
 # --- Model Architecture (AV1UNetRestorer) ---
@@ -73,26 +79,34 @@ loss:
     params: {}
 
   perceptual:
+<<<<<<< HEAD:configs/tiny_npy_config.yaml
     enabled: false
     weight: 0.1
-    # enabled: true
-    # weight: 0.001
+=======
+    enabled: true
+    weight: 0.001
+>>>>>>> main:configs/tiny_config.yaml
     params:
       network: 'vgg' # 'vgg' (faster) or 'lpips' (often better quality)
 
   ms_ssim:
+<<<<<<< HEAD:configs/tiny_npy_config.yaml
     enabled: false # Enable for better structural similarity
     weight: 0.15
     params: {}
-    # enabled: true # Enable for better structural similarity
-    # weight: 0.1
-    # params: {}
 
   frequency:
     enabled: false # Enable to focus on high-frequency details (textures/edges)
     weight: 0.05
-    # enabled: true # Enable to focus on high-frequency details (textures/edges)
-    # weight: 0.01
+=======
+    enabled: true # Enable for better structural similarity
+    weight: 0.1
+    params: {}
+
+  frequency:
+    enabled: true # Enable to focus on high-frequency details (textures/edges)
+    weight: 0.01
+>>>>>>> main:configs/tiny_config.yaml
     params:
       alpha: 0.8 # 1.0 focuses on magnitude; 0.5 on both magnitude & phase
 

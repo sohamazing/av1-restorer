@@ -1,19 +1,19 @@
 # ==============================================================================
-# AV1-Restorer: Professional Training Configuration 
+# AV1-Restorer: Professional Training Configuration (Huge)
 # ==============================================================================
 
 # --- Project & Experiment Tracking ---
 project:
   name: "AV1-Compression-Artifact-Restorer"
-  experiment_name: "AV1-Restorer-Tiny-VM"
+  experiment_name: "AV1-Restorer-Huge"
   log_to_wandb: true
 
 # --- Data Paths ---
 data:
-  train_lq_root: "av1_data/train/lq"
-  train_hq_root: "av1_data/train/hq"
-  val_lq_root: "av1_data/val/lq"
-  val_hq_root: "av1_data/val/hq"
+  train_lq_root: "~/Documents/aura/av1_data/train/lq"
+  train_hq_root: "~/Documents/aura/av1_data/train/hq"
+  val_lq_root: "~/Documents/aura/av1_data/val/lq"
+  val_hq_root: "~/Documents/aura/av1_data/val/hq"
   hq_ext: ".png"
   lq_ext: ".avif"
 
@@ -25,19 +25,16 @@ dataset:
 
 # --- Training Strategy ---
 curriculum:
-  patch_sizes: [128, 256]      # Progressively train on larger image patches
-  batch_sizes: [64, 16]        # Adjust based on VRAM for each patch size
-  # ms_ssim needs > 160px
-  # patch_sizes: [192, 256]      # Progressively train on larger image patches
-  # batch_sizes: [24, 16]        # Adjust based on VRAM for each patch size
-  epochs_per_stage: [50, 50] # Number of epochs for each curriculum stage
+  patch_sizes: [256, 512]      # Progressively train on larger image patches
+  batch_sizes: [16, 4]        # Adjust based on VRAM for each patch size
+  epochs_per_stage: [150, 50] # Number of epochs for each curriculum stage
 
 # --- Model Architecture (AV1UNetRestorer) ---
 model:
-  size: "tiny" # Options: "tiny", "small", "base", "large"
+  size: "huge" # Options: "tiny", "small", "base", "large", "huge"
 
-  tiny:   # ~5M params
-    channels: [32, 48, 64, 128, 256] # [24, 48, 64, 128, 256]
+  tiny:   # ~4M params
+    channels: [24, 48, 64, 128, 256] # [32, 48, 64, 128, 256]
     blocks: [2, 2, 2, 2, 4]
 
   small:  # ~10M params
@@ -52,13 +49,17 @@ model:
     channels: [64, 96, 128, 256, 512]
     blocks: [2, 3, 4, 4, 8]
 
+  huge:  # ~48M params
+    channels: [64, 128, 256, 384, 512]
+    blocks: [2, 3, 4, 4, 12]
+
 
 # --- Loss Function (Configures the `CombinedLoss` class) ---
 loss:
   # Using Charbonnier as the primary pixel loss. It's a robust L1 variant.
   charbonnier:
     enabled: true
-    weight: 1.0
+    weight: 10.0
     params:
       eps: 0.001
 
@@ -73,26 +74,19 @@ loss:
     params: {}
 
   perceptual:
-    enabled: false
+    enabled: true
     weight: 0.1
-    # enabled: true
-    # weight: 0.001
     params:
       network: 'vgg' # 'vgg' (faster) or 'lpips' (often better quality)
 
   ms_ssim:
-    enabled: false # Enable for better structural similarity
+    enabled: true # Enable for better structural similarity
     weight: 0.15
     params: {}
-    # enabled: true # Enable for better structural similarity
-    # weight: 0.1
-    # params: {}
 
   frequency:
-    enabled: false # Enable to focus on high-frequency details (textures/edges)
+    enabled: true # Enable to focus on high-frequency details (textures/edges)
     weight: 0.05
-    # enabled: true # Enable to focus on high-frequency details (textures/edges)
-    # weight: 0.01
     params:
       alpha: 0.8 # 1.0 focuses on magnitude; 0.5 on both magnitude & phase
 
@@ -116,13 +110,13 @@ training:
 
 # --- Checkpointing ---
 checkpoint:
-  dir: "./checkpoints/av1-restorer-tiny/"
+  dir: "./checkpoints/av1-restorer-huge/"
   save_every_n_epochs: 1
   keep_last_n: 3
 
 # --- System & Performance ---
 system:
-  num_workers: 6
-  device: "cuda"             # "cuda", "mps", or "cpu", or "auto"
-  mixed_precision: true     # Recommended for NVIDIA/Apple GPUs
+  num_workers: 8
+  device: "mps"             # "cuda", "mps", or "cpu", or "auto"
+  mixed_precision: false     # Recommended for NVIDIA/Apple GPUs
   seed: 8

@@ -5,7 +5,7 @@
 # --- Project & Experiment Tracking ---
 project:
   name: "AV1-Compression-Artifact-Restorer"
-  experiment_name: "AV1-Restorer-Tiny"
+  experiment_name: "AV1-Restorer-Base-M4"
   log_to_wandb: true
 
 # --- Data Paths ---
@@ -27,35 +27,14 @@ dataset:
 curriculum:
   patch_sizes: [128, 256]      # Progressively train on larger image patches
   batch_sizes: [64, 16]        # Adjust based on VRAM for each patch size
-  epochs_per_stage: [100, 150] # Number of epochs for each curriculum stage
+  epochs_per_stage: [50, 50] # Number of epochs for each curriculum stage
 
-# # --- Model Architecture (AV1UNetRestorer) ---
-# model:
-#   # Select which model configuration to use below
-#   size: "small" # Options: "small", "base", "large"
-#   # channels: [Head, L1, L2, L3, Bottleneck]
-#   # blocks: [Head, L1, L2, L3, Bottleneck
-
-#   # A smaller, faster configuration for quick experiments (~6M params)
-#   small:
-#     channels: [32, 64, 128, 256, 512]
-#     blocks: [2, 3, 4, 4, 6]
-
-#   # The main, high-performance configuration (~12M params)
-#   base:
-#     channels: [48, 96, 192, 384, 512]
-#     blocks: [2, 2, 3, 3, 4]
-
-#   # The full-capacity configuration based on your design spec (~48M params)
-#   large:
-#     channels: [64, 128, 256, 384, 512] 
-#     blocks: [2, 3, 4, 4, 12]
 # --- Model Architecture (AV1UNetRestorer) ---
 model:
-  size: "tiny" # Options: "tiny", "small", "base", "large"
+  size: "base" # Options: "tiny", "small", "base", "large"
 
   tiny:   # ~4M params
-    channels: [24, 48, 64, 128, 256] # [24, 48, 64, 128, 256]
+    channels: [24, 48, 64, 128, 256] # [32, 48, 64, 128, 256]
     blocks: [2, 2, 2, 2, 4]
 
   small:  # ~10M params
@@ -75,8 +54,8 @@ model:
 loss:
   # Using Charbonnier as the primary pixel loss. It's a robust L1 variant.
   charbonnier:
-    enabled: false
-    weight: 1.0
+    enabled: true
+    weight: 10.0
     params:
       eps: 0.001
 
@@ -86,12 +65,12 @@ loss:
     params: {}
 
   l2:
-    enabled: true
-    weight: 1.0
+    enabled: false
+    weight: 0.1
     params: {}
 
   perceptual:
-    enabled: false
+    enabled: true
     weight: 0.1
     params:
       network: 'vgg' # 'vgg' (faster) or 'lpips' (often better quality)
@@ -103,7 +82,7 @@ loss:
 
   frequency:
     enabled: false # Enable to focus on high-frequency details (textures/edges)
-    weight: 0.05
+    weight: 0.1
     params:
       alpha: 0.8 # 1.0 focuses on magnitude; 0.5 on both magnitude & phase
 
@@ -127,7 +106,7 @@ training:
 
 # --- Checkpointing ---
 checkpoint:
-  dir: "./checkpoints/av1-restorer-tiny/"
+  dir: "./checkpoints/av1-restorer-base/"
   save_every_n_epochs: 1
   keep_last_n: 3
 
