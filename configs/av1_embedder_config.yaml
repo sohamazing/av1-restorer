@@ -1,0 +1,137 @@
+# ==============================================================================
+# AURA-Net Phase 1 Training Configuration
+# AV1 Compression Embedder with Dual Learning Strategy
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Project & Experiment Tracking
+# ------------------------------------------------------------------------------
+project_name: "AV1-Compression-Embedder"
+experiment_name: "av1_dual_learning"
+log_to_wandb: true  # Set to false to disable Weights & Biases logging
+wandb_entity: null  # Your wandb username/team (optional)
+
+# ------------------------------------------------------------------------------
+# Data Paths
+# IMPORTANT: Update these paths to match your system
+# ------------------------------------------------------------------------------
+lq_data_root: "/Users/soham/Documents/aura/av1_dataset/train"
+hq_data_root: "/Users/soham/Desktop/Photos/Div2K/DIV2K_train_HR"
+hq_file_extension: ".png"  # Extension of high-quality images (.png, .jpg, etc.)
+lq_file_extension: ".avif" # AV1 image file format
+
+# ------------------------------------------------------------------------------
+# Dataset Settings
+# ------------------------------------------------------------------------------
+# CRF (Constant Rate Factor) range for AV1 compression
+# - Lower values = higher quality, less compression
+# - Higher values = lower quality, more compression
+# - Valid range: [0, 63]
+# - Training range: [23, 63] covers moderate to high compression
+crf_range: [23, 63]
+
+# Preset (cpu-used) range for AV1 encoder speed
+# - Lower values = slower encoding, better quality
+# - Higher values = faster encoding, slightly lower quality
+# - Valid range: [0, 8]
+# - Current: [4, 4] trains only on preset 4 (balanced speed/quality)
+# - Future: [2, 8] for multi-preset training
+preset_range: [4, 4]
+
+# ------------------------------------------------------------------------------
+# Phase 1: Compression Prior Embedder Training
+# ------------------------------------------------------------------------------
+phase1:
+  
+  # --------------------------------------------------------------------------
+  # Curriculum Learning Strategy
+  # --------------------------------------------------------------------------
+  # Progressive training on increasingly larger patches
+  # Stage 1: Small patches → Learn local patterns and artifacts
+  # Stage 2: Medium patches → Learn broader context
+  # Stage 3 (optional): Large patches → Refine on full context
+  
+  patch_sizes: [64, 128, 256, 512]      # Patch sizes for each curriculum stage
+  batch_sizes: [64, 64, 32, 4]          # Batch sizes for each stage (inversely proportional to patch size)
+  epochs_per_stage: [50, 50, 75, 10]    # Number of epochs to train at each stage
+  
+  # --------------------------------------------------------------------------
+  # Model Architecture
+  # --------------------------------------------------------------------------
+  embed_dim: 256                              # Embedding dimension for features
+  swin_model_name: "swin_tiny_patch4_window7_224"  # Swin Transformer variant
+  use_pretrained_swin: true                   # Use ImageNet pretrained weights
+  freeze_swin_layers: 0                       # Number of Swin layers to freeze (0 = all trainable)
+  
+  # --------------------------------------------------------------------------
+  # Dual Learning Loss Weights
+  # --------------------------------------------------------------------------
+  # Based on CODiff paper: L_total = λ_rec * L_rec + λ_crf * L_crf
+  reconstruction_loss_weight: 1.0   # Weight for implicit learning (image reconstruction)
+  crf_prediction_loss_weight: 0.005   # Weight for explicit learning (CRF prediction)
+  adaptive_weights: true             # AdaptiveDualLearningLoss vs DualLearningLoss
+  use_perceptual_loss: false        # Add perceptual loss LPIPS
+  charbonnier_eps: 1.0e-3             # Epsilon for Charbonnier loss smoothness
+
+
+  # --------------------------------------------------------------------------
+  # Optimization
+  # --------------------------------------------------------------------------
+  learning_rate: 1.0e-4           # Initial learning rate
+  min_lr: 1.0e-6                  # Minimum learning rate for scheduler
+  optimizer: "adamw"              # Optimizer type: 'adam' or 'adamw'
+  weight_decay: 1.0e-4            # Weight decay (L2 regularization)
+  scheduler: "cosine"             # LR scheduler: 'cosine', 'onecycle', or null
+  grad_clip: 1.0                  # Gradient clipping threshold (0 to disable)
+  
+  # --------------------------------------------------------------------------
+  # Checkpointing & Validation
+  # --------------------------------------------------------------------------
+  checkpoint_save_path: "./checkpoints/phase1_av1_p4/"
+  save_every_n_epochs: 1          # Save checkpoint every N epochs
+  validate_every_n_epochs: 1      # Run validation every N epochs (0 to disable)
+  keep_last_n_checkpoints: 3      # Number of recent checkpoints to keep (0 to keep all)
+
+# ------------------------------------------------------------------------------
+# System & Performance Settings
+# ------------------------------------------------------------------------------
+num_workers: 0                    # Number of data loading workers (adjust based on CPU cores)
+device: "mps"                     # Device: 'cuda', 'mps' (Apple Silicon), or 'cpu'
+mixed_precision: true            # Use mixed precision training (faster, less memory)
+deterministic: false              # Use deterministic algorithms (slower but reproducible)
+
+# Random seed for reproducibility (null for random seed)
+seed: 8
+
+# ------------------------------------------------------------------------------
+# Advanced Settings (Optional)
+# ------------------------------------------------------------------------------
+# Uncomment and modify as needed
+
+# Data augmentation
+# data_augmentation:
+#   horizontal_flip: true
+#   vertical_flip: true
+#   rotation: false
+#   color_jitter: false
+
+# Gradient accumulation (simulate larger batch size)
+# gradient_accumulation_steps: 1
+
+# Distributed training
+# distributed:
+#   enabled: false
+#   backend: "nccl"        # 'nccl' for NVIDIA, 'gloo' for CPU
+#   world_size: 1
+#   rank: 0
+
+# Early stopping
+# early_stopping:
+#   enabled: false
+#   patience: 10           # Stop if no improvement for N validation runs
+#   min_delta: 0.001       # Minimum change to qualify as improvement
+
+# Logging verbosity
+# logging:
+#   level: "INFO"          # DEBUG, INFO, WARNING, ERROR
+#   log_file: null         # Path to log file (null for console only)

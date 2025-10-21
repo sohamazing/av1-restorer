@@ -5,7 +5,7 @@
 # --- Project & Experiment Tracking ---
 project:
   name: "AV1-Compression-Artifact-Restorer"
-  experiment_name: "AV1-Restorer-Tiny-V2"
+  experiment_name: "AV1-Restorer-Small"
   log_to_wandb: true
 
 # --- Data Paths ---
@@ -25,16 +25,17 @@ dataset:
 
 # --- Training Strategy ---
 curriculum:
-  patch_sizes: [192, 256]      # Progressively train on larger image patches
-  batch_sizes: [16, 8]        # Adjust based on VRAM for each patch size
-  epochs_per_stage: [50, 50] # Number of epochs for each curriculum stage
+  # Smoother curriculum: Add intermediate size
+  patch_sizes: [128, 192, 256] # Progressively train on larger image patches
+  batch_sizes: [64, 32, 16] # Adjust based on VRAM for each patch size
+  epochs_per_stage: [60, 50, 40]  # Total 150 epochs
 
 # --- Model Architecture (AV1UNetRestorer) ---
 model:
-  size: "tiny" # Options: "tiny", "small", "base", "large"
+  size: "small" # Options: "tiny", "small", "base", "large"
 
-  tiny:   # ~5M params
-    channels: [32, 48, 64, 128, 256] # [24, 48, 64, 128, 256]
+  tiny:   # ~4M params
+    channels: [24, 48, 64, 128, 256] # [24, 48, 64, 128, 256]
     blocks: [2, 2, 2, 2, 4]
 
   small:  # ~10M params
@@ -52,22 +53,11 @@ model:
 
 # --- Loss Function (Configures the `CombinedLoss` class) ---
 loss:
-  # Using Charbonnier as the primary pixel loss. It's a robust L1 variant.
-  charbonnier:
+  l1:
     enabled: true
     weight: 1.0
     params:
-      eps: 0.001
-
-  l1:
-    enabled: false
-    weight: 1.0
-    params: {}
-
-  l2:
-    enabled: false
-    weight: 0.1
-    params: {}
+      eps: 0.001 # Epsilon for Charbonnier L1 smoothness
 
   perceptual:
     enabled: true
@@ -76,8 +66,8 @@ loss:
       network: 'vgg' # 'vgg' (faster) or 'lpips' (often better quality)
 
   ms_ssim:
-    enabled: true # Enable for better structural similarity
-    weight: 0.15
+    enabled: true # Enable for better structural similarity (only for patch > 160px)
+    weight: 0.2
     params: {}
 
   frequency:
@@ -89,7 +79,7 @@ loss:
 # --- Optimization ---
 optimizer:
   type: "adamw"      # 'adamw' is generally recommended
-  lr: 1.0e-4 # 2.0e-4         # Learning rate
+  lr: 5.0e-5 # 2.0e-4         # Learning rate
   weight_decay: 1.0e-4
   betas: [0.9, 0.999]
   use_ema: true      # Use Exponential Moving Average for stabler weights
@@ -106,13 +96,12 @@ training:
 
 # --- Checkpointing ---
 checkpoint:
-  dir: "./checkpoints/av1-restorer-tiny/"
+  dir: "./checkpoints/av1-restorer-small/"
   save_every_n_epochs: 1
-  keep_last_n: 3
 
 # --- System & Performance ---
 system:
   num_workers: 8
-  device: "mps"             # "cuda", "mps", or "cpu", or "auto"
+  device: "auto"             # "cuda", "mps", or "cpu"
   mixed_precision: false     # Recommended for NVIDIA/Apple GPUs
   seed: 8
