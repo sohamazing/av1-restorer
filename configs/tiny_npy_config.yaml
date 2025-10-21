@@ -10,12 +10,12 @@ project:
 
 # --- Data Paths ---
 data:
-  train_lq_root: "av1_data/train/lq"
-  train_hq_root: "av1_data/train/hq"
-  val_lq_root: "av1_data/val/lq"
-  val_hq_root: "av1_data/val/hq"
-  hq_ext: ".png"
-  lq_ext: ".avif"
+  train_lq_root: "~/gcs_data/av1_data_npy/train/lq"
+  train_hq_root: "~/gcs_data/av1_data_npy/train/hq"
+  val_lq_root: "~/gcs_data/av1_data_npy/val/lq"
+  val_hq_root: "~/gcs_data/av1_data_npy/val/hq"
+  hq_ext: ".png" # ".npy"
+  lq_ext: ".npy"
 
 # --- Dataset Settings ---
 dataset:
@@ -122,7 +122,7 @@ checkpoint:
 
 # --- System & Performance ---
 system:
-  num_workers: 6
+  num_workers: 8
   device: "cuda"             # "cuda", "mps", or "cpu", or "auto"
   mixed_precision: true     # Recommended for NVIDIA/Apple GPUs
   seed: 8
