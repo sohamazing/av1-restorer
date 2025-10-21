@@ -456,7 +456,8 @@ class AV1RestorerTrainer:
             num_workers=sys_cfg.get('num_workers', 4),
             pin_memory=pin_memory,
             drop_last=True,
-            persistent_workers=sys_cfg.get('num_workers', 4) > 0
+            persistent_workers=sys_cfg.get('num_workers', 4) > 0,
+            prefetch_factor=4,
         )
         
         val_loader = DataLoader(
@@ -466,7 +467,8 @@ class AV1RestorerTrainer:
             num_workers=sys_cfg.get('num_workers', 4),
             pin_memory=pin_memory,
             drop_last=False,
-            persistent_workers=sys_cfg.get('num_workers', 4) > 0
+            persistent_workers=sys_cfg.get('num_workers', 4) > 0,
+            prefetch_factor=2
         )
         
         logger.info(f"✓ Dataloaders created")
