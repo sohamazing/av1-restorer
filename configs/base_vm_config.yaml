@@ -5,7 +5,7 @@
 # --- Project & Experiment Tracking ---
 project:
   name: "AV1-Compression-Artifact-Restorer"
-  experiment_name: "AV1-Restorer-Tiny-VM"
+  experiment_name: "AV1-Restorer-Base-VM"
   log_to_wandb: true
 
 # --- Data Paths ---
@@ -25,18 +25,16 @@ dataset:
 
 # --- Training Strategy ---
 curriculum:
-  patch_sizes: [128, 256]      # Progressively train on larger image patches
-  batch_sizes: [64, 16]        # Adjust based on VRAM for each patch size
-  # patch_sizes: [192, 256]      # Progressively train on larger image patches
-  # batch_sizes: [24, 16]        # Adjust based on VRAM for each patch size
+  patch_sizes: [192, 256]      # Progressively train on larger image patches
+  batch_sizes: [16, 8]        # Adjust based on VRAM for each patch size
   epochs_per_stage: [50, 50] # Number of epochs for each curriculum stage
 
 # --- Model Architecture (AV1UNetRestorer) ---
 model:
-  size: "tiny" # Options: "tiny", "small", "base", "large"
+  size: "base" # Options: "tiny", "small", "base", "large"
 
-  tiny:   # ~5M params
-    channels: [32, 48, 64, 128, 256] # [24, 48, 64, 128, 256]
+  tiny:   # ~4M params
+    channels: [24, 48, 64, 128, 256] # [32, 48, 64, 128, 256]
     blocks: [2, 2, 2, 2, 4]
 
   small:  # ~10M params
@@ -72,26 +70,19 @@ loss:
     params: {}
 
   perceptual:
-    enabled: false
+    enabled: true
     weight: 0.1
-    # enabled: true
-    # weight: 0.001
     params:
       network: 'vgg' # 'vgg' (faster) or 'lpips' (often better quality)
 
   ms_ssim:
-    enabled: false # Enable for better structural similarity
+    enabled: true # Enable for better structural similarity
     weight: 0.15
     params: {}
-    # enabled: true # Enable for better structural similarity
-    # weight: 0.1
-    # params: {}
 
   frequency:
     enabled: true # Enable to focus on high-frequency details (textures/edges)
-    weight: 0.01
-    # enabled: false # Enable to focus on high-frequency details (textures/edges)
-    # weight: 0.05
+    weight: 0.05
     params:
       alpha: 0.8 # 1.0 focuses on magnitude; 0.5 on both magnitude & phase
 
@@ -115,7 +106,7 @@ training:
 
 # --- Checkpointing ---
 checkpoint:
-  dir: "./checkpoints/av1-restorer-tiny-vm/"
+  dir: "./checkpoints/av1-restorer-base/"
   save_every_n_epochs: 1
   keep_last_n: 3
 
@@ -123,5 +114,5 @@ checkpoint:
 system:
   num_workers: 8
   device: "cuda"             # "cuda", "mps", or "cpu", or "auto"
-  mixed_precision: true     # Recommended for NVIDIA/Apple GPUs
+  mixed_precision: false     # Recommended for NVIDIA/Apple GPUs
   seed: 8

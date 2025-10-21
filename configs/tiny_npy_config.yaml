@@ -27,6 +27,7 @@ dataset:
 curriculum:
   patch_sizes: [128, 256]      # Progressively train on larger image patches
   batch_sizes: [64, 16]        # Adjust based on VRAM for each patch size
+  # ms_ssim needs > 160px
   # patch_sizes: [192, 256]      # Progressively train on larger image patches
   # batch_sizes: [24, 16]        # Adjust based on VRAM for each patch size
   epochs_per_stage: [50, 50] # Number of epochs for each curriculum stage
@@ -88,10 +89,10 @@ loss:
     # params: {}
 
   frequency:
-    enabled: true # Enable to focus on high-frequency details (textures/edges)
-    weight: 0.01
-    # enabled: false # Enable to focus on high-frequency details (textures/edges)
-    # weight: 0.05
+    enabled: false # Enable to focus on high-frequency details (textures/edges)
+    weight: 0.05
+    # enabled: true # Enable to focus on high-frequency details (textures/edges)
+    # weight: 0.01
     params:
       alpha: 0.8 # 1.0 focuses on magnitude; 0.5 on both magnitude & phase
 
@@ -115,13 +116,13 @@ training:
 
 # --- Checkpointing ---
 checkpoint:
-  dir: "./checkpoints/av1-restorer-tiny-vm/"
+  dir: "./checkpoints/av1-restorer-tiny/"
   save_every_n_epochs: 1
   keep_last_n: 3
 
 # --- System & Performance ---
 system:
-  num_workers: 8
+  num_workers: 6
   device: "cuda"             # "cuda", "mps", or "cpu", or "auto"
   mixed_precision: true     # Recommended for NVIDIA/Apple GPUs
   seed: 8
