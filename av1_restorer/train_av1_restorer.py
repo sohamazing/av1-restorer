@@ -457,7 +457,7 @@ class AV1RestorerTrainer:
             pin_memory=pin_memory,
             drop_last=True,
             persistent_workers=sys_cfg.get('num_workers', 4) > 0,
-            prefetch_factor=4,
+            prefetch_factor=8,
         )
         
         val_loader = DataLoader(

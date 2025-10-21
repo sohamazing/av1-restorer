@@ -26,7 +26,7 @@ dataset:
 # --- Training Strategy ---
 curriculum:
   patch_sizes: [128, 256]      # Progressively train on larger image patches
-  batch_sizes: [32, 8]        # Adjust based on VRAM for each patch size
+  batch_sizes: [64, 16]        # Adjust based on VRAM for each patch size
   epochs_per_stage: [50, 50] # Number of epochs for each curriculum stage
 
 # --- Model Architecture (AV1UNetRestorer) ---
@@ -112,7 +112,7 @@ checkpoint:
 
 # --- System & Performance ---
 system:
-  num_workers: 8
+  num_workers: 6
   device: "cuda"             # "cuda", "mps", or "cpu", or "auto"
   mixed_precision: true     # Recommended for NVIDIA/Apple GPUs
   seed: 8
