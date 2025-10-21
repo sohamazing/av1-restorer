@@ -26,6 +26,8 @@ try:
 except ImportError:
     LPIPS_AVAILABLE = False
 
+from torchvision.models import vgg19, VGG19_Weights
+
 logger = logging.getLogger(__name__)
 
 
@@ -48,22 +50,24 @@ class CharbonnierLoss(nn.Module):
 
 class PerceptualLoss(nn.Module):
     """
-    VGG19 or LPIPS-based perceptual loss.
-
-    Args:
-        network (str): 'vgg' or 'lpips'. VGG is classic, LPIPS is often better.
+    VGG19 or LPIPS-based perceptual loss with proper input normalization.
     """
     def __init__(self, network: str = 'vgg'):
         super().__init__()
         self.network_type = network
+        
         if self.network_type == 'vgg':
-            vgg = torch.hub.load('pytorch/vision:v0.10.0', 'vgg19', pretrained=True).features
-            self.model = nn.Sequential(vgg[:35]).eval() # To relu4_4
+            # vgg = torch.hub.load('pytorch/vision:v0.10.0', 'vgg19', pretrained=True).features
+            vgg = vgg19(weights=VGG19_Weights.IMAGENET1K_V1).features
+            self.model = nn.Sequential(vgg[:35]).eval()  # To relu4_4
+            
+            # VGG normalization (ImageNet stats)
             self.register_buffer('mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
             self.register_buffer('std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+            
         elif self.network_type == 'lpips':
             if not LPIPS_AVAILABLE:
-                raise ImportError("LPIPS is not available. Please install with 'pip install lpips'")
+                raise ImportError("LPIPS is not available. Install with 'pip install lpips'")
             self.model = lpips.LPIPS(net='alex', spatial=False)
         else:
             raise ValueError(f"Unknown perceptual network: {network}. Choose 'vgg' or 'lpips'.")
@@ -72,15 +76,25 @@ class PerceptualLoss(nn.Module):
             param.requires_grad = False
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            pred: [B, 3, H, W] in [0, 1] range (already denormalized by CombinedLoss)
+            target: [B, 3, H, W] in [0, 1] range
+        """
         if self.network_type == 'vgg':
+            # Apply ImageNet normalization
             pred_norm = (pred - self.mean) / self.std
             target_norm = (target - self.mean) / self.std
+            
             pred_features = self.model(pred_norm)
             target_features = self.model(target_norm)
             return F.l1_loss(pred_features, target_features)
-        else: # LPIPS
-            # LPIPS expects input in [-1, 1] range
-            return self.model(pred, target).mean()
+            
+        else:  # LPIPS
+            # LPIPS expects input in [-1, 1] range, so convert from [0, 1]
+            pred_lpips = pred * 2.0 - 1.0
+            target_lpips = target * 2.0 - 1.0
+            return self.model(pred_lpips, target_lpips).mean()
 
 
 class FrequencyLoss(nn.Module):
@@ -105,16 +119,28 @@ class FrequencyLoss(nn.Module):
 
 
 # --- Main Combined Loss Manager ---
-
 class CombinedLoss(nn.Module):
     """A modular loss manager driven by a configuration dict for standard restoration."""
-    def __init__(self, loss_config: Dict[str, Dict]):
+    
+    def __init__(self, loss_config: Dict[str, Dict], norm_range: Tuple[float, float] = (-1, 1)):
+        """
+        Args:
+            loss_config: Loss configuration from YAML
+            norm_range: Normalization range from dataset config (e.g., (-1, 1) or (0, 1))
+        """
         super().__init__()
         self.losses = nn.ModuleDict()
         self.weights = {}
         self.loss_config = loss_config
+        self.norm_range = norm_range  # Store normalization range
+        
+        # Determine if we need to denormalize for certain losses
+        self.needs_denorm = (norm_range == (-1, 1))
 
         logger.info("Initializing CombinedLoss:")
+        logger.info(f"  Normalization range: {norm_range}")
+        logger.info(f"  Denormalization required: {self.needs_denorm}")
+        
         for name, config in loss_config.items():
             if not config.get('enabled', False):
                 continue
@@ -124,13 +150,13 @@ class CombinedLoss(nn.Module):
             self.weights[name] = weight
 
             if name == 'charbonnier':
-                self.losses['charbonnier'] = CharbonnierLoss(**params) # sqrt((pred - target)² + ε²)
-            elif name == 'l1':
-                self.losses['l1'] = nn.L1Loss(**params) # (pred - target)
+                self.losses['charbonnier'] = CharbonnierLoss(**params)
+            elif name == 'l1': 
+                self.losses['l1'] = nn.L1Loss(**params)
             elif name == 'l2' or name == 'mse':
-                self.losses[name] = nn.MSELoss(**params) # (pred - target)^2
+                self.losses[name] = nn.MSELoss(**params)
             elif name == 'perceptual':
-                self.losses['perceptual'] = PerceptualLoss(**params) # vgg or lpips
+                self.losses['perceptual'] = PerceptualLoss(**params)
             elif name == 'ms_ssim':
                 if not MSSSIM_AVAILABLE:
                     logger.warning("pytorch-msssim not installed. Skipping MS-SSIM loss.")
@@ -145,8 +171,23 @@ class CombinedLoss(nn.Module):
         if not self.losses:
             raise ValueError("No losses were enabled in the configuration.")
 
+    def _denormalize(self, x: torch.Tensor) -> torch.Tensor:
+        """Convert from [-1, 1] to [0, 1] if needed."""
+        if self.needs_denorm:
+            return (x + 1.0) / 2.0
+        return x
+
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """Calculates the total weighted loss and returns individual components for logging."""
+        """
+        Calculates the total weighted loss with proper normalization handling.
+        
+        Args:
+            pred: Predicted image in range specified by norm_range
+            target: Target image in range specified by norm_range
+        
+        Returns:
+            (total_loss, loss_dict)
+        """
         total_loss = torch.tensor(0.0, device=pred.device)
         loss_dict = {}
 
@@ -157,23 +198,38 @@ class CombinedLoss(nn.Module):
         # if torch.isnan(target).any() or torch.isinf(target).any():
         #     print("!!! DEBUG: `target` tensor is NaN or Inf BEFORE loss calculation!")
         # # ======================== DEBUGGING END ========================
+        
+        # Denormalize for losses that require [0, 1] range
+        pred_01 = None
+        target_01 = None
 
         for name, loss_fn in self.losses.items():
-            # --- ADD THIS BLOCK ---
-            # Dynamically normalize for LPIPS if needed
-            pred_for_loss, target_for_loss = pred, target
-            if name == 'perceptual' and self.loss_config['perceptual']['params'].get('network') == 'lpips':
-                # If input is [0,1], normalize to [-1,1] for LPIPS
-                if pred.min() >= 0.0 and pred.max() <= 1.0:
-                    pred_for_loss = pred * 2.0 - 1.0
-                    target_for_loss = target * 2.0 - 1.0
-            # --- END BLOCK ---
-            if name == 'ms_ssim':
-                val = loss_fn(torch.clamp(pred, 0, 1), torch.clamp(target, 0, 1))
-                loss = 1.0 - val
-                loss_dict['metric_ms_ssim'] = val
+            # Determine if this loss needs [0, 1] range
+            needs_01_range = name in ['perceptual', 'ms_ssim']
+            
+            if needs_01_range:
+                # Lazy denormalization (only when needed)
+                if pred_01 is None:
+                    pred_01 = self._denormalize(pred)
+                    target_01 = self._denormalize(target)
+                pred_for_loss = pred_01
+                target_for_loss = target_01
             else:
-                loss = loss_fn(pred, target)
+                # Use original range
+                pred_for_loss = pred
+                target_for_loss = target
+            
+            # Compute loss
+            if name == 'ms_ssim':
+                # MS-SSIM returns similarity (higher is better), so we use 1 - SSIM as loss
+                val = loss_fn(
+                    torch.clamp(pred_for_loss, 0, 1), 
+                    torch.clamp(target_for_loss, 0, 1)
+                )
+                loss = 1.0 - val
+                loss_dict['metric_ms_ssim'] = val  # Log the actual SSIM value
+            else:
+                loss = loss_fn(pred_for_loss, target_for_loss)
 
             # # ======================= DEBUGGING START =======================
             # # 2. Print each individual loss component's value.
@@ -336,3 +392,42 @@ class BaselineRelativeLoss(DualLearning):
             'improvement_recon': recon_improvement,
             'improvement_crf': crf_improvement,
         }
+
+# test CombinedLoss
+if __name__ == "__main__":
+    import torch
+    
+    # Test configuration
+    loss_config = {
+        'charbonnier': {'enabled': True, 'weight': 1.0, 'params': {'eps': 0.001}},
+        'perceptual': {'enabled': True, 'weight': 0.2, 'params': {'network': 'vgg'}},
+        'ms_ssim': {'enabled': True, 'weight': 0.15, 'params': {}},
+    }
+    
+    # Test with [-1, 1] range
+    print("Testing with norm_range=(-1, 1):")
+    loss_fn = CombinedLoss(loss_config, norm_range=(-1, 1))
+    
+    i_size = 256
+
+    pred = torch.randn(2, 3, i_size, i_size) * 0.5  # Simulate [-1, 1] range
+    target = torch.randn(2, 3, i_size, i_size) * 0.5
+    
+    loss, loss_dict = loss_fn(pred, target)
+    print(f"  Total loss: {loss.item():.6f}")
+    for k, v in loss_dict.items():
+        print(f"    {k}: {v.item():.6f}")
+    
+    # Test with [0, 1] range
+    print("\nTesting with norm_range=(0, 1):")
+    loss_fn = CombinedLoss(loss_config, norm_range=(0, 1))
+    
+    pred = torch.rand(2, 3, i_size, i_size)  # [0, 1] range
+    target = torch.rand(2, 3, i_size, i_size)
+    
+    loss, loss_dict = loss_fn(pred, target)
+    print(f"  Total loss: {loss.item():.6f}")
+    for k, v in loss_dict.items():
+        print(f"    {k}: {v.item():.6f}")
+    
+    print("\n✅ All tests passed!")

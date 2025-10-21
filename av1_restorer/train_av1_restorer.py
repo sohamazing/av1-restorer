@@ -245,7 +245,11 @@ class AV1RestorerTrainer:
     def _setup_loss(self) -> nn.Module:
         """Initialize loss function from config."""
         logger.info("Initializing loss function")
-        loss_fn = CombinedLoss(self.config['loss'])
+        
+        # CRITICAL: Pass norm_range from dataset config to loss function
+        norm_range = tuple(self.config['dataset'].get('norm_range', [-1, 1]))
+        loss_fn = CombinedLoss(self.config['loss'], norm_range=norm_range)
+        
         return loss_fn.to(self.device)
     
     def _setup_logging(self):
