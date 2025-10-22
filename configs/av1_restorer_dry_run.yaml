@@ -1,0 +1,120 @@
+# ==============================================================================
+# Dry Run Configuration for Universal AV1 Restorer (trin_av1_restorer.py)
+# ==============================================================================
+# This is a minimal config for testing the trainer script setup.
+# Runs 2 stages, 1 epoch each, using patches large enough for MS-SSIM testing.
+# Uses the list-of-dictionaries format for 'curriculum'.
+
+# ------------------------------------------------------------------------------
+# Project & Logging Settings
+# ------------------------------------------------------------------------------
+project:
+  name: "AV1-Restorer"                   # Project name
+  experiment_name: "universal_dry_run_test" # Updated name
+  log_to_wandb: false                   # Disable W&B logging for quick tests
+  # log_to_wandb: true
+
+# ------------------------------------------------------------------------------
+# Data Paths & Format (Ensure these paths are accessible for the test)
+# ------------------------------------------------------------------------------
+data:
+  # --- Training Data ---
+  train_lq_root: "~/av1_data/train/lq"
+  train_hq_root: "~/av1_data/train/hq"
+
+  # --- Validation Data ---
+  val_lq_root: "~/av1_data/val/lq"
+  val_hq_root: "~/av1_data/val/hq"
+
+  # --- File Extensions ---
+  lq_ext: ".avif"      # Use .avif for testing standard dataset loading
+  hq_ext: ".png"
+  # lq_ext: ".npy"     # Or use .npy if testing the fast dataset path
+  # hq_ext: ".npy"
+
+# ------------------------------------------------------------------------------
+# Dataset Parameters
+# ------------------------------------------------------------------------------
+dataset:
+  crf_range: [23, 63]    # Use full range even for dry run to test filtering
+  preset_range: [4, 4]   # Keep preset simple for testing
+  norm_range: [-1, 1]
+
+# ------------------------------------------------------------------------------
+# Training Curriculum (v3.0 Format) - UPDATED FOR MS-SSIM
+# ------------------------------------------------------------------------------
+# List of stage dictionaries. Each dictionary defines one stage.
+curriculum:
+  # --- Stage 1 ---
+  - patch_size: 224        # Minimum safe size for MS-SSIM
+    batch_size: 4          # Reduced batch size for larger patch
+    epochs: 1
+
+  # --- Stage 2 ---
+  - patch_size: 256        # Keep patch size same or slightly larger if needed
+    batch_size: 2          # Keep batch size small
+    epochs: 1
+
+# ------------------------------------------------------------------------------
+# Model Configuration
+# ------------------------------------------------------------------------------
+model:
+  type: "nano_unet"       # Test with one model type
+  size: "tiny"           # Use a small size for faster loading/testing
+
+# ------------------------------------------------------------------------------
+# Loss Function Configuration - ENABLE MORE LOSSES FOR TESTING
+# ------------------------------------------------------------------------------
+loss:
+  charbonnier: {enabled: true, weight: 1.0, params: {eps: 0.001}}
+  perceptual: {enabled: true, weight: 0.01, params: {network: 'vgg'}}
+  ms_ssim: {enabled: true, weight: 0.1, params: {}} # MS-SSIM enabled
+  l1: {enabled: false, weight: 1.0, params: {}}
+  l2: {enabled: false, weight: 1.0, params: {}}
+  frequency: {enabled: false, weight: 0.05, params: {alpha: 1.0}}
+
+# ------------------------------------------------------------------------------
+# Optimizer Configuration
+# ------------------------------------------------------------------------------
+optimizer:
+  type: "adamw"
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  betas: [0.9, 0.999]
+  use_ema: false
+  ema_decay: 0.9999
+
+# ------------------------------------------------------------------------------
+# Learning Rate Scheduler Configuration
+# ------------------------------------------------------------------------------
+scheduler:
+  type: "cosine"
+  min_lr: 1.0e-6
+  warmup_steps: 10       # Very short warmup for dry run
+
+# ------------------------------------------------------------------------------
+# Training Loop Parameters
+# ------------------------------------------------------------------------------
+training:
+  grad_clip_norm: 1.0
+  validate_every_n_epochs: 1 # Validate after each epoch (end of each stage)
+  num_val_samples_to_log: 2 # Log fewer samples
+  log_every_n_steps: 10     # Log more frequently for dry run
+
+# ------------------------------------------------------------------------------
+# Checkpoint Settings
+# ------------------------------------------------------------------------------
+checkpoint:
+  dir: "./checkpoints/universal_dry_run_test_ms_ssim/" # Updated dir
+  save_every_n_epochs: 0 # Disable periodic saving, only save at end/best
+
+# ------------------------------------------------------------------------------
+# System / Hardware Configuration
+# ------------------------------------------------------------------------------
+system:
+  num_workers: 2         # Reduce workers for faster startup/less overhead
+  device: "mps"          # Keep your target device
+  # device: "cuda"
+  # device: "cpu"
+  mixed_precision: true  # Keep AMP setting to test it
+  seed: 42

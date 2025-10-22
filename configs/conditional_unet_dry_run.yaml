@@ -1,0 +1,144 @@
+# ==============================================================================
+# Dry Run Configuration - Conditional U-Net Trainer (Legacy v2.1)
+# ==============================================================================
+# Purpose: Quick validation for train_av1_restorer.py (old format)
+# Usage:   python train_av1_restorer.py --config configs/conditional_unet_dry_run.yaml
+#
+# Key Difference from Universal Trainer:
+#   • Uses parallel lists under 'curriculum': patch_sizes, batch_sizes, epochs_per_stage
+#   • Specific to AV1UNetRestorer (conditional model with FiLM)
+#   • Each list index = one curriculum stage
+#
+# Expected runtime: 3-5 minutes on GPU
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Project & Logging
+# ------------------------------------------------------------------------------
+project:
+  name: "AV1-Conditional-UNet"
+  experiment_name: "conditional_dry_run_test"
+  log_to_wandb: false  # Disable for quick testing
+
+# ------------------------------------------------------------------------------
+# Data Paths
+# ------------------------------------------------------------------------------
+data:
+  # Training data
+  train_lq_root: "~/av1_data/train/lq"
+  train_hq_root: "~/av1_data/train/hq"
+  
+  # Validation data
+  val_lq_root: "~/av1_data/val/lq"
+  val_hq_root: "~/av1_data/val/hq"
+  
+  # File formats
+  lq_ext: ".avif"
+  hq_ext: ".png"
+
+# ------------------------------------------------------------------------------
+# Dataset Parameters
+# ------------------------------------------------------------------------------
+dataset:
+  crf_range: [23, 63]     # Full range (conditional model handles all)
+  preset_range: [4, 4]
+  norm_range: [-1, 1]
+
+# ------------------------------------------------------------------------------
+# Training Curriculum (Legacy Format: Parallel Lists)
+# ------------------------------------------------------------------------------
+curriculum:
+  # Each index across the lists defines one stage
+  patch_sizes: [224, 256]         # Stage 1: 224px, Stage 2: 256px
+  batch_sizes: [4, 2]             # Stage 1: batch 4, Stage 2: batch 2
+  epochs_per_stage: [1, 1]        # Both stages run 1 epoch
+
+# ------------------------------------------------------------------------------
+# Model Configuration (Conditional U-Net Only)
+# ------------------------------------------------------------------------------
+model:
+  size: "tiny"  # Options: tiny (~4M), small (~10M), base (~16M), large (~32M)
+
+# ------------------------------------------------------------------------------
+# Loss Functions
+# ------------------------------------------------------------------------------
+loss:
+  charbonnier:
+    enabled: true
+    weight: 1.0
+    params: {eps: 0.001}
+  
+  perceptual:
+    enabled: true
+    weight: 0.01
+    params: {network: 'vgg'}
+  
+  ms_ssim:
+    enabled: false  # Can enable if patch_size ≥ 224
+    weight: 0.1
+    params: {}
+  
+  l1:
+    enabled: false
+    weight: 1.0
+    params: {}
+  
+  frequency:
+    enabled: false
+    weight: 0.05
+    params: {alpha: 1.0}
+
+# ------------------------------------------------------------------------------
+# Optimizer
+# ------------------------------------------------------------------------------
+optimizer:
+  type: "adamw"
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  betas: [0.9, 0.999]
+
+# ------------------------------------------------------------------------------
+# Scheduler
+# ------------------------------------------------------------------------------
+scheduler:
+  type: "cosine"
+  min_lr: 1.0e-6
+
+# ------------------------------------------------------------------------------
+# Training Loop (Legacy Format)
+# ------------------------------------------------------------------------------
+training:
+  grad_clip_norm: 1.0
+  validate_every_n_epochs: 1
+  num_val_samples_to_log: 2
+  use_ema: false       # EMA settings are under 'training' in old script
+  ema_decay: 0.9999
+
+# ------------------------------------------------------------------------------
+# Checkpointing
+# ------------------------------------------------------------------------------
+checkpoint:
+  dir: "./checkpoints/conditional_dry_run_test/"
+  save_every_n_epochs: 0  # Only save at validation
+
+# ------------------------------------------------------------------------------
+# System Configuration
+# ------------------------------------------------------------------------------
+system:
+  num_workers: 2
+  device: "auto"
+  mixed_precision: true
+  seed: 42
+
+# ==============================================================================
+# Expected Output
+# ==============================================================================
+# Success indicators:
+#   ✓ Model: AV1UNetRestorer initialized (conditional with FiLM)
+#   ✓ Parameters: ~4M for tiny
+#   ✓ Forward pass includes (lq, crf, preset) inputs
+#   ✓ Stage 1: 1 epoch @ 224px
+#   ✓ Validation with visual samples
+#   ✓ Stage 2: 1 epoch @ 256px
+#   ✓ Checkpoints: best.pth, stage_01_complete.pth, stage_02_complete.pth
+# ==============================================================================

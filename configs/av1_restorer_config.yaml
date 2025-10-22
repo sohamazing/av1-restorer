@@ -1,0 +1,225 @@
+# ==============================================================================
+# Production Configuration - Universal AV1 Restorer Trainer
+# ==============================================================================
+# Purpose: Train specialized nano models for specific CRF ranges
+# Usage:   python train_av1_restorer.py --config configs/av1_restorer_config.yaml
+#
+# Training Strategy:
+#   • Specialized models per CRF bucket (better quality than universal)
+#   • Progressive curriculum: 256px → 512px patches
+#   • Optimized for real-time inference (30+ fps @ 1080p)
+#
+# Model Selection Guide:
+#   nano_unet:   Best quality/speed balance (RECOMMENDED)
+#   nano_resnet: Fastest (single-scale, no multi-scale features)
+#   nano_fbcnn:  FBCNN-inspired (gated processing)
+#   nano_mamba:  Experimental (SSM hybrid)
+#   unet:        Universal conditional model (slowest but handles all CRFs)
+#
+# Expected Training Time (RTX 3060):
+#   tiny:  2-4 hours
+#   small: 4-6 hours
+#   base:  6-10 hours
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Project & Logging
+# ------------------------------------------------------------------------------
+project:
+  name: "AV1-Restorer"
+  experiment_name: "nano_unet_small_crf34-43"  # Update for each CRF bucket
+  log_to_wandb: true  # Enable for experiment tracking
+
+# ------------------------------------------------------------------------------
+# Data Paths (Update to Your Dataset Location)
+# ------------------------------------------------------------------------------
+data:
+  # Training data (~800-2000 images recommended)
+  train_lq_root: "~/av1_data_npy/train/lq"
+  train_hq_root: "~/av1_data_npy/train/hq"
+  
+  # Validation data (~100-200 images recommended)
+  val_lq_root: "~/av1_data_npy/val/lq"
+  val_hq_root: "~/av1_data_npy/val/hq"
+  
+  # File formats (use .npy for 10-20× faster loading)
+  lq_ext: ".npy"
+  hq_ext: ".npy"
+  # lq_ext: ".avif"  # Use if you haven't pre-processed to .npy
+  # hq_ext: ".png"
+
+# ------------------------------------------------------------------------------
+# Dataset Parameters
+# ------------------------------------------------------------------------------
+dataset:
+  # CRF Specialization Strategy (train separate models for each):
+  #   Low:      [23, 33]  - Light artifacts, subtle restoration
+  #   Medium:   [34, 43]  - Moderate artifacts (MOST COMMON)
+  #   High:     [44, 53]  - Heavy artifacts
+  #   Extreme:  [54, 63]  - Severe artifacts
+  crf_range: [34, 43]     # Medium compression (recommended starting point)
+  
+  preset_range: [4, 4]    # AV1 preset 4 (balanced quality/speed)
+  norm_range: [-1, 1]     # Standard [-1, 1] normalization
+
+# ------------------------------------------------------------------------------
+# Training Curriculum
+# ------------------------------------------------------------------------------
+# Progressive training: start with small patches, increase resolution
+curriculum:
+  # Stage 1: Learn basic patterns on small patches
+  - patch_size: 256
+    batch_size: 32    # Adjust based on GPU VRAM (32 for 8-12GB, 16 for 6GB)
+    epochs: 150
+    # crf_range: [34, 43]  # Optional: per-stage CRF override
+  
+  # Stage 2: Refine on larger patches
+  - patch_size: 512
+    batch_size: 8     # Larger patches need more memory
+    epochs: 50
+  
+  # Optional Stage 3: Fine-tuning (uncomment if needed)
+  # - patch_size: 512
+  #   batch_size: 8
+  #   epochs: 25
+  #   crf_range: [38, 43]  # Focus on harder examples
+
+# ------------------------------------------------------------------------------
+# Model Configuration
+# ------------------------------------------------------------------------------
+model:
+  type: "nano_unet"  # Model architecture
+  # type: "nano_resnet"  # Alternative: faster but less accurate
+  # type: "nano_fbcnn"   # Alternative: FBCNN-inspired
+  # type: "unet"         # Alternative: large conditional model
+  
+  size: "small"      # Model size: tiny (0.8M), small (1.5M), base (2.5M)
+  # size: "tiny"     # Fastest, mobile-friendly
+  # size: "base"     # Best quality
+
+# ------------------------------------------------------------------------------
+# Loss Functions
+# ------------------------------------------------------------------------------
+loss:
+  # Primary pixel-wise loss (REQUIRED)
+  charbonnier:
+    enabled: true
+    weight: 1.0
+    params: {eps: 0.001}
+  
+  # Perceptual loss for better texture quality (RECOMMENDED)
+  perceptual:
+    enabled: true
+    weight: 0.01      # Adjust: 0.005-0.02 range
+    params:
+      network: 'vgg'  # 'vgg' (faster) or 'lpips' (better quality)
+  
+  # Multi-Scale SSIM for structural similarity (OPTIONAL, slight slowdown)
+  ms_ssim:
+    enabled: false
+    weight: 0.1
+    params: {}
+  
+  # Frequency domain loss for edge/texture detail (OPTIONAL)
+  frequency:
+    enabled: false
+    weight: 0.05
+    params: {alpha: 1.0}  # 1.0 = magnitude only, 0.5 = magnitude+phase
+  
+  # Standard L1/L2 losses (usually not needed with Charbonnier)
+  l1:
+    enabled: false
+    weight: 1.0
+    params: {}
+  
+  l2:
+    enabled: false
+    weight: 1.0
+    params: {}
+
+# ------------------------------------------------------------------------------
+# Optimizer
+# ------------------------------------------------------------------------------
+optimizer:
+  type: "adamw"           # AdamW with weight decay (recommended)
+  lr: 3.0e-4              # Learning rate (tune based on batch size)
+  weight_decay: 1.0e-4    # L2 regularization
+  betas: [0.9, 0.999]     # Adam beta parameters
+  
+  # Exponential Moving Average (improves generalization)
+  use_ema: true
+  ema_decay: 0.9999       # Higher = smoother (0.999-0.9999)
+
+# ------------------------------------------------------------------------------
+# Learning Rate Scheduler
+# ------------------------------------------------------------------------------
+scheduler:
+  type: "cosine"      # Cosine annealing with warmup
+  min_lr: 1.0e-6      # Minimum LR at end of training
+  warmup_steps: 1000  # Linear warmup steps (prevents early instability)
+
+# ------------------------------------------------------------------------------
+# Training Loop
+# ------------------------------------------------------------------------------
+training:
+  grad_clip_norm: 1.0             # Gradient clipping (prevents exploding gradients)
+  validate_every_n_epochs: 1      # Validation frequency (1 = every epoch)
+  num_val_samples_to_log: 4       # Visual samples for W&B
+  log_every_n_steps: 50           # Training metrics logging frequency
+
+# ------------------------------------------------------------------------------
+# Checkpointing
+# ------------------------------------------------------------------------------
+checkpoint:
+  dir: "./checkpoints/nano_unet_small_crf34-43/"  # Update for each experiment
+  save_every_n_epochs: 10  # Periodic checkpoint frequency (0 = disable)
+  
+  # Saved checkpoints:
+  #   best.pth              - Best validation loss
+  #   latest.pth            - Most recent
+  #   stage_XX_complete.pth - End of each curriculum stage
+  #   emergency_interrupt.pth - Saved on Ctrl+C
+
+# ------------------------------------------------------------------------------
+# System Configuration
+# ------------------------------------------------------------------------------
+system:
+  num_workers: 8          # Data loading workers (8-12 recommended for GPU)
+  device: "auto"          # Auto-detect: cuda > mps > cpu
+  # device: "cuda"        # Force specific device
+  # device: "mps"         # Apple Silicon
+  mixed_precision: true   # Enable AMP (2× speedup, minimal quality loss)
+  seed: 42                # Random seed for reproducibility
+
+# ==============================================================================
+# Training Tips
+# ==============================================================================
+# 1. First Training Run:
+#    - Start with dry_run config to validate setup
+#    - Use 'small' size and CRF [34, 43] (most common compression)
+#
+# 2. Monitoring Training:
+#    - Watch for loss plateaus (may need LR adjustment)
+#    - Check visual samples in W&B for quality assessment
+#    - Validation L1 improvement should be 30-60%
+#
+# 3. Hyperparameter Tuning:
+#    - If underfitting: increase model size, add more epochs
+#    - If overfitting: increase weight_decay, add augmentation
+#    - If slow convergence: increase learning rate (3e-4 → 5e-4)
+#
+# 4. Multi-CRF Training Strategy:
+#    a. Train model for CRF [34, 43]: nano_unet_small_crf34-43
+#    b. Train model for CRF [23, 33]: nano_unet_small_crf23-33
+#    c. Train model for CRF [44, 53]: nano_unet_small_crf44-53
+#    d. At inference, select model based on input CRF
+#
+# 5. Resume Training:
+#    python train_av1_restorer.py --config this_config.yaml --resume latest
+#    python train_av1_restorer.py --config this_config.yaml --resume best
+#
+# 6. Performance Expectations (RTX 3060, 1080p):
+#    tiny:  60+ fps
+#    small: 45+ fps
+#    base:  35+ fps
+# ==============================================================================

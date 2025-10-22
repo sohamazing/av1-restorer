@@ -434,7 +434,7 @@ class UniversalRestorerTrainer:
 
             # --- Caching Logic: Check cache ---
             val_cache_key = f"{data_cfg['val_lq_root']}_{tuple(dset_cfg['crf_range'])}"
-            cached_val_image_pairs = self.val_file_list_cache.get(val_cache_key)
+            cached_val_image_pairs = self.val_image_pairs_cache.get(val_cache_key)
             # --- End Caching Logic ---
             
             # Create validation dataset
@@ -453,7 +453,7 @@ class UniversalRestorerTrainer:
 
             # --- Caching Logic: Save file list if needed ---
             if cached_val_image_pairs is None and hasattr(val_dataset, 'image_pairs'):
-                self.val_file_list_cache[val_cache_key] = val_dataset.image_pairs
+                self.val_image_pairs_cache[val_cache_key] = val_dataset.image_pairs
             # --- End Caching Logic ---
             
             loader = DataLoader(val_dataset, batch_size=num_samples, shuffle=False)
