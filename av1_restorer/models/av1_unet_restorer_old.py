@@ -455,6 +455,104 @@ class AV1UNetRestorer(nn.Module):
         nn.init.zeros_(self.tail_pred.bias)
         logger.info("✓ Weights initialized (tail_pred zeroed for residual learning)")
 
+    # def forward_debug(self, lq_image: torch.Tensor, crf: torch.Tensor, preset: torch.Tensor) -> torch.Tensor:
+    #     """Full forward pass through the network."""
+        
+    #     # ===== DEBUG: Check inputs =====
+    #     print(f"\n=== FORWARD PASS DEBUG ===")
+    #     print(f"Input lq_image: shape={lq_image.shape}, range=[{lq_image.min():.3f}, {lq_image.max():.3f}], has_nan={torch.isnan(lq_image).any()}, has_inf={torch.isinf(lq_image).any()}")
+    #     print(f"Input crf: {crf.squeeze().tolist()}")
+    #     print(f"Input preset: {preset.squeeze().tolist()}")
+        
+    #     # ===== 1. GENERATE CONDITIONING VECTOR =====
+    #     cond = self.conditioning_embedder(crf, preset)
+    #     print(f"Conditioning: shape={cond.shape}, range=[{cond.min():.3f}, {cond.max():.3f}], has_nan={torch.isnan(cond).any()}")
+        
+    #     # ===== 2. ENCODER PATH =====
+    #     skip0 = self.head(lq_image)
+    #     print(f"After head: range=[{skip0.min():.3f}, {skip0.max():.3f}], has_nan={torch.isnan(skip0).any()}")
+        
+    #     e1 = self.encoder1['downsample'](skip0)
+    #     e1 = self.encoder1['body'](e1)
+    #     e1 = self.encoder1['film'](e1, cond)
+    #     skip1 = e1
+    #     print(f"After encoder1: range=[{skip1.min():.3f}, {skip1.max():.3f}], has_nan={torch.isnan(skip1).any()}")
+        
+    #     e2 = self.encoder2['downsample'](skip1)
+    #     e2 = self.encoder2['body'](e2)
+    #     e2 = self.encoder2['film'](e2, cond)
+    #     skip2 = e2
+    #     print(f"After encoder2: range=[{skip2.min():.3f}, {skip2.max():.3f}], has_nan={torch.isnan(skip2).any()}")
+        
+    #     e3 = self.encoder3['downsample'](skip2)
+    #     e3 = self.encoder3['body'](e3)
+    #     e3 = self.encoder3['film'](e3, cond)
+    #     skip3 = e3
+    #     print(f"After encoder3: range=[{skip3.min():.3f}, {skip3.max():.3f}], has_nan={torch.isnan(skip3).any()}")
+        
+    #     # ===== 3. BOTTLENECK =====
+    #     b = self.bottleneck_down(skip3)
+    #     b = F.gelu(self.bottleneck_bn(b))
+    #     print(f"After bottleneck_down: range=[{b.min():.3f}, {b.max():.3f}], has_nan={torch.isnan(b).any()}")
+        
+    #     b = self.bottleneck_pre_attn(b)
+    #     print(f"After bottleneck_pre_attn: range=[{b.min():.3f}, {b.max():.3f}], has_nan={torch.isnan(b).any()}")
+        
+    #     b = self.bottleneck_film1(b, cond)
+    #     print(f"After bottleneck_film1: range=[{b.min():.3f}, {b.max():.3f}], has_nan={torch.isnan(b).any()}")
+        
+    #     b = self.bottleneck_attn(b)
+    #     print(f"After bottleneck_attn: range=[{b.min():.3f}, {b.max():.3f}], has_nan={torch.isnan(b).any()}")
+        
+    #     b = self.bottleneck_film2(b, cond)
+    #     print(f"After bottleneck_film2: range=[{b.min():.3f}, {b.max():.3f}], has_nan={torch.isnan(b).any()}")
+        
+    #     b = self.bottleneck_post_attn(b)
+    #     print(f"After bottleneck_post_attn: range=[{b.min():.3f}, {b.max():.3f}], has_nan={torch.isnan(b).any()}")
+        
+    #     # ===== 4. DECODER PATH =====
+    #     d3 = self.decoder3['upsample'](b)
+    #     d3 = F.gelu(self.decoder3['upsample_bn'](d3))
+    #     d3 = torch.cat([d3, skip3], dim=1)
+    #     d3 = self.decoder3['fusion'](d3)
+    #     d3 = self.decoder3['body'](d3)
+    #     print(f"After decoder3: range=[{d3.min():.3f}, {d3.max():.3f}], has_nan={torch.isnan(d3).any()}")
+        
+    #     d2 = self.decoder2['upsample'](d3)
+    #     d2 = F.gelu(self.decoder2['upsample_bn'](d2))
+    #     d2 = torch.cat([d2, skip2], dim=1)
+    #     d2 = self.decoder2['fusion'](d2)
+    #     d2 = self.decoder2['body'](d2)
+    #     print(f"After decoder2: range=[{d2.min():.3f}, {d2.max():.3f}], has_nan={torch.isnan(d2).any()}")
+        
+    #     d1 = self.decoder1['upsample'](d2)
+    #     d1 = F.gelu(self.decoder1['upsample_bn'](d1))
+    #     d1 = torch.cat([d1, skip1], dim=1)
+    #     d1 = self.decoder1['fusion'](d1)
+    #     d1 = self.decoder1['body'](d1)
+    #     print(f"After decoder1: range=[{d1.min():.3f}, {d1.max():.3f}], has_nan={torch.isnan(d1).any()}")
+        
+    #     # ===== 5. OUTPUT TAIL =====
+    #     t = self.tail_up(d1)
+    #     t = F.gelu(self.tail_bn(t))
+    #     t = torch.cat([t, skip0], dim=1)
+    #     t = self.tail_fusion(t)
+    #     t = self.tail_body(t)
+    #     print(f"After tail_body: range=[{t.min():.3f}, {t.max():.3f}], has_nan={torch.isnan(t).any()}")
+        
+    #     residual = self.tail_pred(t)
+    #     print(f"Residual: range=[{residual.min():.3f}, {residual.max():.3f}], has_nan={torch.isnan(residual).any()}")
+        
+    #     # ===== 6. RESIDUAL LEARNING =====
+    #     restored = lq_image + residual
+    #     print(f"Before clamp: range=[{restored.min():.3f}, {restored.max():.3f}], has_nan={torch.isnan(restored).any()}")
+        
+    #     restored = torch.clamp(restored, self.clamp_min, self.clamp_max)
+    #     print(f"After clamp: range=[{restored.min():.3f}, {restored.max():.3f}], has_nan={torch.isnan(restored).any()}")
+    #     print(f"=== END FORWARD PASS ===\n")
+        
+    #     return restored
+
     def forward(self, lq_image: torch.Tensor, crf: torch.Tensor, preset: torch.Tensor) -> torch.Tensor:
         """
         Full forward pass through the network.

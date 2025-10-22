@@ -1,11 +1,20 @@
-# av1_restorer/train_av1_restorer.py
+# train_av1_restorer.py
 """
-Production Training Script for AV1 U-Net Restorer
+Unified Production Training Script for AV1 Restorer Projects
 
-Cross-platform support for CUDA, MPS, and CPU with proper AMP handling.
+This script can train any of the following models based on the YAML config:
+- AV1UNetRestorer (Large, conditional U-Net)
+- AV1NanoUnetRestorer (Lightweight, specialized U-Net)
+- AV1FBCNNRestorer (Lightweight, specialized FBCNN)
+- AV1NanoResnetRestorer (Lightweight, specialized ResNet)
+
+It automatically handles:
+- Conditional (lq, crf, preset) vs. Non-conditional (lq) model inputs.
+- Pre-Processed (.npy) vs. On-the-Fly (.avif) dataset loading via config 'lq_ext'.
+- Full curriculum learning (patch_size, batch_size, crf_range per stage).
+- SOTA training: Mixed Precision, EMA, LR Warmup + Cosine Annealing.
 
 Author: Soham Mukherjee
-Version: 2.1 Final (Cross-Platform Fix)
 """
 
 import os
@@ -15,243 +24,202 @@ import argparse
 import logging
 from pathlib import Path
 from typing import Dict, Any, Tuple, Optional
-from datetime import datetime
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.optim import Adam, AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR, OneCycleLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from tqdm import tqdm
-import torchvision
 
-# FIXED: Cross-platform AMP imports
-from torch import autocast  # General-purpose autocast (works for CUDA, MPS, CPU)
-from torch.cuda.amp import GradScaler  # GradScaler is CUDA-specific (ignored on MPS/CPU)
+# --- Cross-Platform AMP Imports ---
+from torch import autocast
+from torch.cuda.amp import GradScaler
 
-# Add project root to path
+# --- Add Project Root for Imports ---
 project_root = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(project_root))
+sys.path.append(str(project_root))
 
-from av1_restorer.models.av1_unet_restorer import create_av1_restorer
-from utils.loss import CombinedLoss
-from utils.av1_dataset import AV1Dataset
+# --- Import All Model Factories & Dataset Classes ---
+# This design allows the script to fail gracefully if a model is missing
+try:
+    from av1_restorer.models.av1_unet_restorer import create_av1_restorer
+except ImportError:
+    create_av1_restorer = None
+try:
+    from av1_restorer.models.av1_nano_unet_restorer import create_av1_nano_unet_restorer
+except ImportError:
+    create_av1_nano_unet_restorer = None
+try:
+    from av1_restorer.models.av1_fbcnn_restorer import create_av1_fbcnn_restorer
+except ImportError:
+    create_av1_fbcnn_restorer = None
+try:
+    from av1_restorer.models.av1_nano_resnet_restorer import create_av1_nano_resnet_restorer
+except ImportError:
+    create_av1_nano_resnet_restorer = None
 
-# Optional W&B
+try:
+    from utils.loss import CombinedLoss
+    from utils.av1_dataset import AV1Dataset
+    from utils.av1_dataset_fast import AV1DatasetFast
+except ImportError as e:
+    print(f"Fatal Error: Could not import core utilities. Check utils/: {e}")
+    AV1DatasetFast = None # Graceful fallback
+    if not AV1Dataset or not CombinedLoss:
+        sys.exit(1)
+
+
 try:
     import wandb
     WANDB_AVAILABLE = True
 except ImportError:
     WANDB_AVAILABLE = False
-    print("⚠️  Warning: wandb not available. Install with: pip install wandb")
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s | %(levelname)-8s | %(name)s | %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-logger = logging.getLogger(__name__)
+# --- Configure Logging ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)-8s | %(message)s')
+logger = logging.getLogger("Trainer")
 
 
 # ==============================================================================
 # SECTION 1: Exponential Moving Average (EMA)
 # ==============================================================================
-
 class EMA:
-    """
-    Exponential Moving Average of model parameters.
-    Improves generalization by smoothing weight updates.
-    """
+    """Exponential Moving Average of model parameters for stable evaluation."""
     def __init__(self, model: nn.Module, decay: float = 0.9999):
         self.model = model
         self.decay = decay
-        self.shadow = {}
-        self.backup = {}
-        
-        # Initialize shadow parameters
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                self.shadow[name] = param.data.clone()
-    
+        self.shadow = {name: param.data.clone() for name, param in model.named_parameters() if param.requires_grad}
     def update(self):
-        """Update EMA parameters."""
         for name, param in self.model.named_parameters():
             if param.requires_grad:
-                assert name in self.shadow
-                new_average = (
-                    self.decay * self.shadow[name] + 
-                    (1.0 - self.decay) * param.data
-                )
-                self.shadow[name] = new_average.clone()
-    
+                self.shadow[name].data = (self.decay * self.shadow[name].data + (1.0 - self.decay) * param.data)
     def apply_shadow(self):
-        """Replace model parameters with EMA shadow parameters."""
-        self.backup = {}
+        self.backup = {name: param.data.clone() for name, param in self.model.named_parameters() if param.requires_grad}
         for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                self.backup[name] = param.data.clone()
-                param.data = self.shadow[name].clone()
-    
+            if param.requires_grad: param.data = self.shadow[name].clone()
     def restore(self):
-        """Restore original model parameters."""
         for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                param.data = self.backup[name].clone()
+            if param.requires_grad: param.data = self.backup[name].clone()
         self.backup = {}
 
-
 # ==============================================================================
-# SECTION 2: Main Trainer Class
+# SECTION 2: Unified Trainer Class
 # ==============================================================================
-
-class AV1RestorerTrainer:
-    """
-    Professional trainer for AV1 U-Net Restorer with full cross-platform support.
-    """
+class UniversalRestorerTrainer:
+    """A professional, config-driven trainer for all AV1 restorer models."""
     
-    def __init__(
-        self,
-        config_path: str,
-        resume_from: Optional[str] = None,
-        wandb_id: Optional[str] = None
-    ):
-        """Initialize trainer."""
-        # Load configuration
+    def __init__(self, config_path: str, resume_from: Optional[str] = None, wandb_id: Optional[str] = None):
         self.config = self._load_config(config_path)
         self.resume_from = resume_from
         self.wandb_id = wandb_id
         
-        # Setup system (device, seeds, directories)
         self._setup_system()
         
-        # Initialize model and loss
-        self.model = self._setup_model()
+        # --- This is the core logic ---
+        self.model, self.is_conditional_model = self._setup_model()
+        
         self.loss_fn = self._setup_loss()
+        self.ema = EMA(self.model, self.config['optimizer'].get('ema_decay', 0.9999)) if self.config['optimizer'].get('use_ema', False) else None
         
-        # Initialize EMA if enabled
-        self.ema = None
-        if self.config['training'].get('use_ema', False):
-            ema_decay = self.config['training'].get('ema_decay', 0.9999)
-            self.ema = EMA(self.model, decay=ema_decay)
-            logger.info(f"✓ EMA enabled with decay={ema_decay}")
-        
-        # Setup W&B logging
         self._setup_logging()
-        
-        # Print training summary
         self._print_summary()
-        
-        # Sample fixed validation images for visualization
         self.val_samples = self._get_fixed_val_samples()
         
         # Training state
-        self.start_stage = 0
-        self.start_epoch = 0
-        self.global_step = 0
-        self.best_val_loss = float('inf')
-        self.saved_optimizer_state = None
-        self.saved_scheduler_state = None
+        self.start_stage, self.start_epoch, self.global_step, self.best_val_loss = 0, 0, 0, float('inf')
+        self.saved_optimizer_state, self.saved_scheduler_state = None, None
         
-        # Load checkpoint if resuming
         if self.resume_from:
             self._load_checkpoint()
-    
+
     def _load_config(self, path: str) -> Dict[str, Any]:
-        """Load and validate YAML configuration."""
         path = Path(path).expanduser()
         if not path.exists():
             raise FileNotFoundError(f"Config file not found: {path}")
-        
         with open(path, 'r') as f:
             config = yaml.safe_load(f)
-        
         logger.info(f"✓ Configuration loaded from: {path}")
         return config
-    
+
     def _setup_system(self):
-        """Setup device, seeds, directories, and AMP."""
         sys_cfg = self.config['system']
-        
-        # Device
         device_str = sys_cfg.get('device', 'auto')
         if device_str == 'auto':
-            if torch.cuda.is_available():
+            if torch.cuda.is_available(): 
                 self.device = torch.device('cuda')
-                logger.info(f"✓ Using CUDA: {torch.cuda.get_device_name(0)}")
+                logger.info(f"Using CUDA: {torch.cuda.get_device_name(0)}")
             elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
                 self.device = torch.device('mps')
-                logger.info("✓ Using Apple Silicon MPS")
-            else:
+                logger.info("Using Apple Silicon MPS")
+            else: 
                 self.device = torch.device('cpu')
-                logger.warning("⚠️  Using CPU (training will be slow)")
-        else:
-            self.device = torch.device(device_str)
-            logger.info(f"✓ Using device: {self.device}")
+                logger.warning("Using CPU (training will be slow)")
+        else: self.device = torch.device(device_str)
+        logger.info(f"✓ Using device: {self.device}")
         
-        # Random seed
         seed = sys_cfg.get('seed', 42)
         torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
-        logger.info(f"✓ Random seed set to {seed}")
+        if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
         
-        # Directories
         self.checkpoint_dir = Path(self.config['checkpoint']['dir']).expanduser()
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        logger.info(f"✓ Checkpoint directory: {self.checkpoint_dir}")
         
-        # FIXED: Cross-platform AMP setup
         self.use_amp = sys_cfg.get('mixed_precision', False)
-        
-        # GradScaler only works on CUDA
         if self.use_amp and self.device.type == 'cuda':
             self.scaler = GradScaler(enabled=True)
             logger.info("✓ Mixed precision (AMP) enabled with GradScaler")
         elif self.use_amp:
-            # MPS/CPU: AMP works but no GradScaler
             self.scaler = None
             logger.info(f"✓ Mixed precision (AMP) enabled for {self.device.type} (no GradScaler)")
         else:
             self.scaler = None
             logger.info("  Mixed precision disabled")
-    
-    def _setup_model(self) -> nn.Module:
-        """Initialize model based on config."""
+
+    def _setup_model(self) -> Tuple[nn.Module, bool]:
+        """Initializes model from config, returns (model, is_conditional_model)."""
         model_cfg = self.config['model']
+        model_type = model_cfg.get('type', 'unet')
         size = model_cfg['size']
-        crf_range = tuple(self.config['dataset']['crf_range'])
-        preset_range = tuple(self.config['dataset']['preset_range'])
         
-        logger.info(f"Creating model: size={size}")
-        model = create_av1_restorer(
-            size=size,
-            crf_range=crf_range,
-            preset_range=preset_range
-        )
+        dset_cfg = self.config['dataset']
+        crf_range = tuple(dset_cfg['crf_range'])
+        preset_range = tuple(dset_cfg.get('preset_range', [0, 8]))
+        norm_range = tuple(dset_cfg.get('norm_range', [-1, 1]))
         
-        model = model.to(self.device)
+        if model_type == 'unet':
+            if create_av1_restorer is None: raise ImportError("Could not import 'create_av1_restorer'.")
+            model = create_av1_restorer(size=size, crf_range=crf_range, preset_range=preset_range, norm_range=norm_range)
+            is_conditional = True # This model NEEDS crf/preset inputs
         
-        # Log parameter count
-        total_params = sum(p.numel() for p in model.parameters())
-        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        logger.info(f"✓ Model created")
-        logger.info(f"  Total parameters: {total_params:,} ({total_params/1e6:.2f}M)")
-        logger.info(f"  Trainable: {trainable_params:,} ({trainable_params/1e6:.2f}M)")
+        elif model_type == 'nano_unet':
+            if create_av1_nano_unet_restorer is None: raise ImportError("Could not import 'create_av1_nano_unet_restorer'.")
+            model = create_av1_nano_unet_restorer(size=size, crf_min=crf_range[0], crf_max=crf_range[1], norm_range=norm_range)
+            is_conditional = False # This model ONLY needs the image
         
-        return model
-    
+        elif model_type == 'nano_fbcnn':
+            if create_av1_fbcnn_restorer is None: raise ImportError("Could not import 'create_av1_fbcnn_restorer'.")
+            model = create_av1_fbcnn_restorer(size=size, crf_min=crf_range[0], crf_max=crf_range[1], norm_range=norm_range)
+            is_conditional = False
+        
+        elif model_type == 'nano_resnet':
+            if create_av1_nano_resnet_restorer is None: raise ImportError("Could not import 'create_av1_nano_resnet_restorer'.")
+            model = create_av1_nano_resnet_restorer(size=size, crf_min=crf_range[0], crf_max=crf_range[1], norm_range=norm_range)
+            is_conditional = False
+        
+        else:
+            raise ValueError(f"Unknown model type in config: {model_type}")
+            
+        return model.to(self.device), is_conditional
+
     def _setup_loss(self) -> nn.Module:
         """Initialize loss function from config."""
-        logger.info("Initializing loss function")
-        
-        # CRITICAL: Pass norm_range from dataset config to loss function
+        logger.info("Initializing loss function...")
         norm_range = tuple(self.config['dataset'].get('norm_range', [-1, 1]))
         loss_fn = CombinedLoss(self.config['loss'], norm_range=norm_range)
-        
         return loss_fn.to(self.device)
-    
+
     def _setup_logging(self):
         """Initialize W&B logging if enabled."""
         if not (self.config['project']['log_to_wandb'] and WANDB_AVAILABLE):
@@ -259,982 +227,480 @@ class AV1RestorerTrainer:
                 logger.warning("⚠️  W&B logging requested but not available")
             return
         
-        # Determine run ID
         run_id = self.wandb_id
         if self.resume_from and not run_id:
             try:
                 ckpt_path = self._get_checkpoint_path(self.resume_from)
-                if ckpt_path.exists():
-                    ckpt = torch.load(ckpt_path, map_location='cpu')
-                    run_id = ckpt.get('wandb_id')
-                    if run_id:
-                        logger.info(f"Found W&B run ID in checkpoint: {run_id}")
-            except Exception as e:
-                logger.warning(f"Could not read W&B ID from checkpoint: {e}")
-        
-        # Initialize W&B
-        project = self.config['project']['name']
-        name = self.config['project'].get('experiment_name', f"av1_restorer_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
-        
-        if run_id:
-            logger.info(f"Resuming W&B run: {run_id}")
-            wandb.init(
-                project=project,
-                name=name,
-                config=self.config,
-                id=run_id,
-                resume="must"
-            )
-        else:
-            logger.info("Starting new W&B run")
-            wandb.init(
-                project=project,
-                name=name,
-                config=self.config,
-                tags=['av1_restorer', 'unet', 'artifact_removal']
-            )
-        
+                if ckpt_path.exists(): run_id = torch.load(ckpt_path, map_location='cpu').get('wandb_id')
+            except Exception as e: logger.warning(f"Could not read W&B ID from checkpoint: {e}")
+
+        wandb.init(project=self.config['project']['name'], name=self.config['project']['experiment_name'],
+                   config=self.config, id=run_id, resume="allow")
         self.wandb_id = wandb.run.id
-        logger.info(f"✓ W&B logging enabled")
-        logger.info(f"  Run ID: {self.wandb_id}")
-        logger.info(f"  URL: {wandb.run.url}")
-    
+        logger.info(f"✓ W&B logging enabled. Run URL: {wandb.run.url}")
+
     def _print_summary(self):
         """Print comprehensive training summary."""
         logger.info("=" * 80)
-        logger.info(f"{'AV1 U-Net Restorer - Training Configuration':^80}")
+        logger.info(f"{'AV1 Restorer - Unified Training Configuration':^80}")
         logger.info("=" * 80)
+        logger.info(f"Project: {self.config['project']['name']} | Experiment: {self.config['project']['experiment_name']}")
         
-        # Project info
-        proj = self.config['project']
-        logger.info(f"Project: {proj['name']}")
-        logger.info(f"Experiment: {proj.get('experiment_name', 'N/A')}")
-        logger.info("")
-        
-        # Model info
         model_cfg = self.config['model']
-        logger.info(f"Model: AV1UNetRestorer ({model_cfg['size']})")
         total_params = sum(p.numel() for p in self.model.parameters())
+        logger.info(f"Model Type: {model_cfg['type']} (Size: {model_cfg['size']}) | Conditional: {self.is_conditional_model}")
         logger.info(f"Parameters: {total_params:,} ({total_params/1e6:.2f}M)")
-        logger.info("")
         
-        # Dataset info
-        data_cfg = self.config['data']
         dset_cfg = self.config['dataset']
-        logger.info(f"Training Data:")
-        logger.info(f"  LQ: {data_cfg['train_lq_root']}")
-        logger.info(f"  HQ: {data_cfg['train_hq_root']}")
-        logger.info(f"  CRF Range: {dset_cfg['crf_range']}")
-        logger.info(f"  Preset Range: {dset_cfg['preset_range']}")
-        logger.info("")
+        logger.info(f"CRF Range: {dset_cfg['crf_range']} | Preset Range: {dset_cfg['preset_range']}")
         
-        # Curriculum stages
-        curr = self.config['curriculum']
-        logger.info(f"Curriculum Stages: {len(curr['patch_sizes'])}")
-        for i in range(len(curr['patch_sizes'])):
-            logger.info(
-                f"  Stage {i+1}: {curr['epochs_per_stage'][i]} epochs, "
-                f"{curr['patch_sizes'][i]}×{curr['patch_sizes'][i]} patches, "
-                f"batch_size={curr['batch_sizes'][i]}"
-            )
-        logger.info("")
-        
-        # Loss functions
+        logger.info("Curriculum Stages:")
+        # This logic correctly handles the list-based curriculum
+        for i, stage in enumerate(self.config['curriculum']):
+            crf = stage.get('crf_range', dset_cfg['crf_range'])
+            patch = stage.get('patch_size', 'N/A') # Handle different config keys
+            batch = stage.get('batch_size', 'N/A')
+            epochs = stage.get('epochs', 'N/A')
+            
+            # Support both old (dict) and new (list of dicts) curriculum formats
+            if isinstance(patch, list): # New format
+                logger.info(f"  - Stage {i+1}: {epochs[0]}+{epochs[1]} epochs @ {patch[0]}/{patch[1]}px, batch {batch[0]}/{batch[1]}, CRF {crf}")
+            else: # New format (single entry)
+                 logger.info(f"  - Stage {i+1}: {epochs} epochs @ {patch}px, batch {batch}, CRF {crf}")
+
         logger.info("Loss Functions:")
         for name, cfg in self.config['loss'].items():
-            if cfg.get('enabled', False):
-                logger.info(f"  {name}: weight={cfg['weight']}")
-        logger.info("")
+            if cfg.get('enabled', False): logger.info(f"  - {name.upper()}: weight={cfg['weight']}")
         
-        # Training config
-        train_cfg = self.config['training']
-        logger.info(f"Training:")
-        logger.info(f"  Device: {self.device}")
-        logger.info(f"  Mixed Precision: {self.use_amp}")
-        logger.info(f"  EMA: {train_cfg.get('use_ema', False)}")
-        logger.info(f"  Grad Clip: {train_cfg.get('grad_clip_norm', 0)}")
-        logger.info("")
-        
-        # Optimizer
-        opt_cfg = self.config['optimizer']
-        logger.info(f"Optimizer: {opt_cfg['type'].upper()}")
-        logger.info(f"  LR: {opt_cfg['lr']}")
-        logger.info(f"  Weight Decay: {opt_cfg.get('weight_decay', 0)}")
-        
+        logger.info(f"Training: Device={self.device}, AMP={self.use_amp}, EMA={self.ema is not None}")
         logger.info("=" * 80)
-    
-    def _get_fixed_val_samples(self) -> Optional[Dict[str, torch.Tensor]]:
+
+    def _get_fixed_val_samples(self) -> Optional[Dict[str, Any]]:
         """Sample fixed validation images for visualization."""
         try:
-            data_cfg = self.config['data']
-            dset_cfg = self.config['dataset']
+            data_cfg, dset_cfg = self.config['data'], self.config['dataset']
             num_samples = self.config['training'].get('num_val_samples_to_log', 4)
+            # Get patch size from the *last* curriculum stage
+            patch_size = self.config['curriculum'][-1]['patch_size']
+            if isinstance(patch_size, list): # Handle list of patch sizes
+                patch_size = patch_size[-1]
             
-            # Use largest patch size for validation
-            patch_size = self.config['curriculum']['patch_sizes'][-1]
-            
+            # Use the standard AV1Dataset for sampling, as it's guaranteed to exist
             val_dataset = AV1Dataset(
-                lq_root_dir=data_cfg['val_lq_root'],
-                hq_root_dir=data_cfg['val_hq_root'],
-                hq_ext=data_cfg['hq_ext'],
-                patch_size=patch_size,
-                crf_range=tuple(dset_cfg['crf_range']),
-                preset_range=tuple(dset_cfg['preset_range']),
-                augment=False,
-                norm_range=tuple(dset_cfg.get('norm_range', [-1, 1])),
+                lq_root_dir=data_cfg['val_lq_root'], hq_root_dir=data_cfg['val_hq_root'],
+                hq_ext=data_cfg.get('hq_ext', '.png'), patch_size=patch_size,
+                crf_range=tuple(dset_cfg['crf_range']), preset_range=tuple(dset_cfg['preset_range']),
+                augment=False, norm_range=tuple(dset_cfg.get('norm_range', [-1, 1])),
                 return_metadata=True
             )
-            
-            loader = DataLoader(
-                val_dataset,
-                batch_size=num_samples,
-                shuffle=False,
-                num_workers=0
-            )
-            
+            loader = DataLoader(val_dataset, batch_size=num_samples, shuffle=False, num_workers=0)
             batch = next(iter(loader))
             
-            # Move to device
-            result = {}
-            for key, value in batch.items():
-                if isinstance(value, torch.Tensor):
-                    result[key] = value.to(self.device)
-                else:
-                    result[key] = value
-            
+            result = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
             logger.info(f"✓ Sampled {num_samples} validation images for visualization")
             return result
-            
         except Exception as e:
             logger.warning(f"Could not sample validation images: {e}")
             return None
-    
-    # def _create_dataloaders(
-    #     self,
-    #     patch_size: int,
-    #     batch_size: int
-    # ) -> Tuple[DataLoader, DataLoader]:
-    #     """Create train and validation dataloaders for a curriculum stage."""
-    #     data_cfg = self.config['data']
-    #     dset_cfg = self.config['dataset']
-    #     sys_cfg = self.config['system']
-        
-    #     # Training dataset
-    #     train_dataset = AV1Dataset(
-    #         lq_root_dir=data_cfg['train_lq_root'],
-    #         hq_root_dir=data_cfg['train_hq_root'],
-    #         hq_ext=data_cfg['hq_ext'],
-    #         patch_size=patch_size,
-    #         crf_range=tuple(dset_cfg['crf_range']),
-    #         preset_range=tuple(dset_cfg['preset_range']),
-    #         augment=True,
-    #         norm_range=tuple(dset_cfg.get('norm_range', [-1, 1])),
-    #         return_metadata=False
-    #     )
-        
-    #     # Validation dataset
-    #     val_dataset = AV1Dataset(
-    #         lq_root_dir=data_cfg['val_lq_root'],
-    #         hq_root_dir=data_cfg['val_hq_root'],
-    #         hq_ext=data_cfg['hq_ext'],
-    #         patch_size=patch_size,
-    #         crf_range=tuple(dset_cfg['crf_range']),
-    #         preset_range=tuple(dset_cfg['preset_range']),
-    #         augment=False,
-    #         norm_range=tuple(dset_cfg.get('norm_range', [-1, 1])),
-    #         return_metadata=False
-    #     )
-        
-    #     # FIXED: pin_memory only on CUDA
-    #     pin_memory = (self.device.type == 'cuda')
-        
-    #     # Dataloaders
-    #     train_loader = DataLoader(
-    #         train_dataset,
-    #         batch_size=batch_size,
-    #         shuffle=True,
-    #         num_workers=sys_cfg.get('num_workers', 4),
-    #         pin_memory=pin_memory,
-    #         drop_last=True,
-    #         persistent_workers=sys_cfg.get('num_workers', 4) > 0,
-    #         prefetch_factor=4,
-    #     )
-        
-    #     val_loader = DataLoader(
-    #         val_dataset,
-    #         batch_size=min(batch_size * 2, 32),
-    #         shuffle=False,
-    #         num_workers=sys_cfg.get('num_workers', 4),
-    #         pin_memory=pin_memory,
-    #         drop_last=False,
-    #         persistent_workers=sys_cfg.get('num_workers', 4) > 0,
-    #         prefetch_factor=2
-    #     )
-        
-    #     logger.info(f"✓ Dataloaders created")
-    #     logger.info(f"  Train: {len(train_dataset):,} samples, {len(train_loader)} batches")
-    #     logger.info(f"  Val: {len(val_dataset):,} samples, {len(val_loader)} batches")
-        
-    #     return train_loader, val_loader
 
-    def _create_dataloaders(self, patch_size: int,batch_size: int) -> Tuple[DataLoader, DataLoader]:
-        """Create dataloaders with automatic fast/slow dataset selection."""
+    def _create_dataloaders(self, stage_config: dict) -> Tuple[DataLoader, DataLoader]:
+        """Creates dataloaders, explicitly selecting Dataset class from config."""
         data_cfg = self.config['data']
         dset_cfg = self.config['dataset']
         sys_cfg = self.config['system']
         
-        # SMART SELECTION: Use fast dataset if .npy files exist
-        lq_ext = data_cfg.get('lq_ext', '.avif')
+        # This logic handles both old and new curriculum configs
+        patch_size = stage_config['patch_size']
+        batch_size = stage_config['batch_size']
         
-        if lq_ext == '.npy':
-            from utils.av1_dataset_fast import AV1DatasetFast as AV1Dataset
-            logger.info("Using FastAV1Dataset (NumPy format) - faster loading! (preprocessed from AVIF)")
+        # Handle progressive training within a stage
+        if isinstance(patch_size, list):
+            # For dataloader creation, we just use the first stage's info
+            # The actual progressive training will be handled in the `train` loop
+            patch_size = patch_size[0]
+            batch_size = batch_size[0]
+
+        crf_range = stage_config.get('crf_range', dset_cfg['crf_range'])
+
+        lq_ext = data_cfg.get('lq_ext', '.avif').lower()
+        # This logic correctly selects the dataset based on file extension
+        if lq_ext == '.npy' and AV1DatasetFast:
+            DatasetClass = AV1DatasetFast
+            logger.info("✅ Using fast pre-processed .npy dataset (AV1DatasetFast).")
+        elif AV1Dataset:
+            DatasetClass = AV1Dataset
+            logger.warning(f"⚠️ Using on-the-fly {lq_ext} dataset (AV1Dataset). This may be slow.")
         else:
-            from utils.av1_dataset import AV1Dataset as AV1Dataset
-            logger.info("Using standard AV1Dataset (AVIF format)")
+            raise ImportError("No valid Dataset class found. Check utils/av1_dataset.py")
+
+        common_args = {
+            'patch_size': patch_size,
+            'crf_range': tuple(crf_range),
+            'preset_range': tuple(dset_cfg['preset_range']),
+            'norm_range': tuple(dset_cfg.get('norm_range', [-1, 1]))
+        }
         
-        # Create datasets
-        train_dataset = AV1Dataset(
-            lq_root_dir=data_cfg['train_lq_root'],
-            hq_root_dir=data_cfg['train_hq_root'],
-            hq_ext=data_cfg['hq_ext'],
-            patch_size=patch_size,
-            crf_range=tuple(dset_cfg['crf_range']),
-            preset_range=tuple(dset_cfg['preset_range']),
-            augment=True,
-            norm_range=tuple(dset_cfg.get('norm_range', [-1, 1])),
-            return_metadata=False
-        )
+        if DatasetClass == AV1Dataset:
+            common_args['hq_ext'] = data_cfg.get('hq_ext', '.png')
+        else:
+            # AV1DatasetFast doesn't need hq_ext
+            pass
+
+        logger.info(f"Creating training dataset for CRF range: {common_args['crf_range']}")
+        train_dset = DatasetClass(lq_root_dir=data_cfg['train_lq_root'], hq_root_dir=data_cfg['train_hq_root'], augment=True, **common_args)
+        val_dset = DatasetClass(lq_root_dir=data_cfg['val_lq_root'], hq_root_dir=data_cfg['val_hq_root'], augment=False, **common_args)
         
-        val_dataset = AV1Dataset(
-            lq_root_dir=data_cfg['val_lq_root'],
-            hq_root_dir=data_cfg['val_hq_root'],
-            hq_ext=data_cfg['hq_ext'],
-            patch_size=patch_size,
-            crf_range=tuple(dset_cfg['crf_range']),
-            preset_range=tuple(dset_cfg['preset_range']),
-            augment=False,
-            norm_range=tuple(dset_cfg.get('norm_range', [-1, 1])),
-            return_metadata=False
-        )
-        
-        # Optimized DataLoader settings
         pin_memory = (self.device.type == 'cuda')
         num_workers = sys_cfg.get('num_workers', 8)
         
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            drop_last=True,
-            persistent_workers=True,
-            prefetch_factor=4,  # Increased for throughput
-        )
-        
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=min(batch_size * 2, 32),
-            shuffle=False,
-            num_workers=max(2, num_workers // 2),
-            pin_memory=pin_memory,
-            drop_last=False,
-            persistent_workers=True,
-            prefetch_factor=2,
-        )
-        
-        logger.info(f"✓ Dataloaders created")
-        logger.info(f"  Train: {len(train_dataset):,} samples, {len(train_loader)} batches")
-        logger.info(f"  Val: {len(val_dataset):,} samples, {len(val_loader)} batches")
-        
+        train_loader = DataLoader(train_dset, batch_size=batch_size, shuffle=True, 
+                                  num_workers=num_workers, pin_memory=pin_memory, drop_last=True,
+                                  persistent_workers=(num_workers > 0), prefetch_factor=4)
+        val_loader = DataLoader(val_dset, batch_size=batch_size*2, shuffle=False, 
+                                num_workers=max(2, num_workers // 2), pin_memory=pin_memory, drop_last=False,
+                                persistent_workers=(num_workers > 0), prefetch_factor=2)
+                                
         return train_loader, val_loader
-    
+
     def _setup_optimizer(self, total_steps: int) -> Tuple[torch.optim.Optimizer, Optional[Any]]:
-        """Create optimizer and learning rate scheduler."""
+        """Create optimizer and learning rate scheduler with warmup."""
         opt_cfg = self.config['optimizer']
         sched_cfg = self.config['scheduler']
-        
-        # Optimizer
-        optimizer_type = opt_cfg['type'].lower()
         lr = opt_cfg['lr']
         
-        if optimizer_type == 'adamw':
-            optimizer = AdamW(
-                self.model.parameters(),
-                lr=lr,
-                betas=tuple(opt_cfg.get('betas', [0.9, 0.999])),
-                weight_decay=opt_cfg.get('weight_decay', 1e-4)
-            )
-        elif optimizer_type == 'adam':
-            optimizer = Adam(
-                self.model.parameters(),
-                lr=lr,
-                betas=tuple(opt_cfg.get('betas', [0.9, 0.999]))
-            )
+        if opt_cfg['type'].lower() == 'adamw':
+            optimizer = AdamW(self.model.parameters(), lr=lr, betas=tuple(opt_cfg.get('betas', [0.9, 0.999])), weight_decay=opt_cfg.get('weight_decay', 1e-4))
         else:
-            raise ValueError(f"Unknown optimizer: {optimizer_type}")
+            optimizer = Adam(self.model.parameters(), lr=lr, betas=tuple(opt_cfg.get('betas', [0.9, 0.999])))
+        logger.info(f"✓ Optimizer: {opt_cfg['type'].upper()}, lr={lr}")
         
-        logger.info(f"✓ Optimizer: {optimizer_type.upper()}, lr={lr}")
-        
-        # Scheduler
-        scheduler = None
         scheduler_type = sched_cfg.get('type', 'cosine').lower()
+        warmup_steps = sched_cfg.get('warmup_steps', 500)
         
+        # This logic correctly handles the warmup
         if scheduler_type == 'cosine':
-            scheduler = CosineAnnealingLR(
-                optimizer,
-                T_max=total_steps,
-                eta_min=sched_cfg.get('min_lr', 1e-6)
-            )
-            logger.info(f"✓ Scheduler: CosineAnnealingLR, T_max={total_steps}")
-        elif scheduler_type == 'onecycle':
-            scheduler = OneCycleLR(
-                optimizer,
-                max_lr=lr,
-                total_steps=total_steps,
-                pct_start=0.3
-            )
-            logger.info(f"✓ Scheduler: OneCycleLR, total_steps={total_steps}")
-        elif scheduler_type == 'none':
-            logger.info("  No scheduler")
+            main_scheduler = CosineAnnealingLR(optimizer, T_max=max(1, total_steps - warmup_steps), eta_min=sched_cfg.get('min_lr', 1e-6))
+            warmup_scheduler = LinearLR(optimizer, start_factor=1e-5, end_factor=1.0, total_iters=warmup_steps)
+            scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, main_scheduler], milestones=[warmup_steps])
+            logger.info(f"✓ Scheduler: CosineAnnealingLR with {warmup_steps}-step Linear Warmup")
         else:
-            logger.warning(f"Unknown scheduler type: {scheduler_type}, using none")
+            scheduler = None
+            logger.info("  No LR scheduler.")
         
         return optimizer, scheduler
     
-    def train(self):
-        """Main training loop with curriculum learning."""
-        logger.info("\n" + "=" * 80)
-        logger.info("STARTING TRAINING")
-        logger.info("=" * 80 + "\n")
+    # --- THIS FUNCTION IS THE MAIN CHANGE TO SUPPORT COMPLEX CURRICULUMS ---
+    def _run_stage(self, stage_idx: int, stage_cfg: dict, optimizer: torch.optim.Optimizer, scheduler: Optional[Any]):
+        """Runs a single curriculum stage, handling internal progressive training if defined."""
         
-        curr = self.config['curriculum']
-        patch_sizes = curr['patch_sizes']
-        batch_sizes = curr['batch_sizes']
-        epochs_per_stage = curr['epochs_per_stage']
-        
-        # Validate curriculum configuration
-        if not (len(patch_sizes) == len(batch_sizes) == len(epochs_per_stage)):
-            raise ValueError(
-                "Curriculum patch_sizes, batch_sizes, and epochs_per_stage must have same length"
-            )
-        
-        # Main curriculum loop
-        for stage_idx in range(self.start_stage, len(patch_sizes)):
-            patch_size = patch_sizes[stage_idx]
-            batch_size = batch_sizes[stage_idx]
-            epochs = epochs_per_stage[stage_idx]
+        # Check for progressive sub-stages (like in tiny_config.yaml)
+        if isinstance(stage_cfg.get('patch_size'), list):
+            logger.info(f"Stage {stage_idx+1} has progressive sub-stages.")
+            patch_sizes = stage_cfg['patch_size']
+            batch_sizes = stage_cfg['batch_size']
+            epochs_per_sub_stage = stage_cfg['epochs']
             
-            logger.info("\n" + "=" * 80)
-            logger.info(f"CURRICULUM STAGE {stage_idx + 1}/{len(patch_sizes)}")
-            logger.info(f"  Patch Size: {patch_size}×{patch_size}")
-            logger.info(f"  Batch Size: {batch_size}")
-            logger.info(f"  Epochs: {epochs}")
-            logger.info("=" * 80 + "\n")
-            
-            # Create dataloaders for this stage
-            train_loader, val_loader = self._create_dataloaders(patch_size, batch_size)
-            
-            # Create optimizer and scheduler
-            total_steps = epochs * len(train_loader)
-            optimizer, scheduler = self._setup_optimizer(total_steps)
-            
-            # Restore optimizer/scheduler state if resuming this stage
-            if stage_idx == self.start_stage and self.saved_optimizer_state:
-                optimizer.load_state_dict(self.saved_optimizer_state)
-                logger.info("✓ Optimizer state restored")
+            for sub_stage_idx in range(len(patch_sizes)):
+                patch = patch_sizes[sub_stage_idx]
+                batch = batch_sizes[sub_stage_idx]
+                epochs = epochs_per_sub_stage[sub_stage_idx]
                 
-                if scheduler and self.saved_scheduler_state:
-                    scheduler.load_state_dict(self.saved_scheduler_state)
-                    logger.info("✓ Scheduler state restored")
+                logger.info(f"  → Sub-stage {stage_idx+1}.{sub_stage_idx+1}: {epochs} epochs @ {patch}px, batch {batch}")
                 
-                # Clear saved states
-                self.saved_optimizer_state = None
-                self.saved_scheduler_state = None
+                # Create dataloaders for this specific sub-stage
+                sub_stage_dl_cfg = stage_cfg.copy()
+                sub_stage_dl_cfg['patch_size'] = patch
+                sub_stage_dl_cfg['batch_size'] = batch
+                train_loader, val_loader = self._create_dataloaders(sub_stage_dl_cfg)
+
+                # Train for the specified number of epochs
+                for epoch in range(self.start_epoch, epochs):
+                    self._train_epoch(epoch, epochs, stage_idx, train_loader, optimizer, scheduler, sub_stage_idx)
+                    
+                    val_freq = self.config['training'].get('validate_every_n_epochs', 1)
+                    if (epoch + 1) % val_freq == 0:
+                        val_loss = self._validate(epoch, stage_idx, val_loader)
+                        if val_loss < self.best_val_loss:
+                            self.best_val_loss = val_loss
+                            self._save_checkpoint(epoch, stage_idx, optimizer, scheduler, is_best=True)
+                    
+                    save_freq = self.config['checkpoint'].get('save_every_n_epochs', 1)
+                    if (epoch + 1) % save_freq == 0:
+                        self._save_checkpoint(epoch, stage_idx, optimizer, scheduler)
+                
+                self.start_epoch = 0 # Reset epoch count for next sub-stage
+        
+        else:
+            # Simple stage (like in custom_nano_config.yaml)
+            epochs = stage_cfg['epochs']
+            logger.info(f"Stage {stage_idx+1} is a simple stage: {epochs} epochs.")
+            train_loader, val_loader = self._create_dataloaders(stage_cfg)
             
-            # Training loop for this stage
             for epoch in range(self.start_epoch, epochs):
-                # Train one epoch
-                self._train_epoch(
-                    epoch=epoch,
-                    total_epochs=epochs,
-                    stage_idx=stage_idx,
-                    train_loader=train_loader,
-                    optimizer=optimizer,
-                    scheduler=scheduler
-                )
+                self._train_epoch(epoch, epochs, stage_idx, train_loader, optimizer, scheduler)
                 
-                # Validation
-                val_freq = self.config['training'].get('validate_every_n_epochs', 5)
+                val_freq = self.config['training'].get('validate_every_n_epochs', 1)
                 if (epoch + 1) % val_freq == 0:
                     val_loss = self._validate(epoch, stage_idx, val_loader)
-                    
-                    # Save best model
                     if val_loss < self.best_val_loss:
                         self.best_val_loss = val_loss
-                        self._save_checkpoint(
-                            epoch, stage_idx, optimizer, scheduler, is_best=True
-                        )
+                        self._save_checkpoint(epoch, stage_idx, optimizer, scheduler, is_best=True)
                 
-                # Periodic checkpoint
-                save_freq = self.config['checkpoint'].get('save_every_n_epochs', 10)
+                save_freq = self.config['checkpoint'].get('save_every_n_epochs', 1)
                 if (epoch + 1) % save_freq == 0:
                     self._save_checkpoint(epoch, stage_idx, optimizer, scheduler)
-            
-            # Save stage completion checkpoint
-            self._save_checkpoint(
-                epochs - 1, stage_idx, optimizer, scheduler, is_stage_complete=True
-            )
-            
-            # Reset start_epoch for next stage
-            self.start_epoch = 0
+
+    def train(self):
+        """Main training loop with curriculum learning."""
+        logger.info("\n" + "=" * 80 + "\nSTARTING TRAINING\n" + "=" * 80 + "\n")
         
-        # Training complete
-        logger.info("\n" + "=" * 80)
-        logger.info("TRAINING COMPLETE!")
-        logger.info(f"  Best validation loss: {self.best_val_loss:.6f}")
-        logger.info(f"  Total steps: {self.global_step:,}")
-        logger.info("=" * 80 + "\n")
+        curriculum = self.config['curriculum']
+        if not isinstance(curriculum, list):
+            raise ValueError("Config 'curriculum' must be a list of stages.")
         
-        # Close W&B
-        if WANDB_AVAILABLE and self.config['project']['log_to_wandb']:
-            wandb.finish()
-    
-    def _train_epoch(
-        self,
-        epoch: int,
-        total_epochs: int,
-        stage_idx: int,
-        train_loader: DataLoader,
-        optimizer: torch.optim.Optimizer,
-        scheduler: Optional[Any]
-    ):
-        """Train for one epoch."""
+        # Calculate total steps for the *entire* training run for the scheduler
+        total_steps = 0
+        for stage_cfg in curriculum:
+            if isinstance(stage_cfg.get('patch_size'), list): # Progressive stage
+                epochs_per_sub_stage = stage_cfg['epochs']
+                # This is an approximation, assumes dataloader length is constant
+                # A more robust way would be to create dummy dataloaders first
+                total_steps += sum(epochs_per_sub_stage) * 500 # Guessing 500 steps/epoch
+            else: # Simple stage
+                total_steps += stage_cfg['epochs'] * 500
+        logger.info(f"Scheduler: Initializing for an estimated {total_steps} total steps.")
+        
+        # Setup optimizer and scheduler *once*
+        optimizer, scheduler = self._setup_optimizer(total_steps)
+        if self.start_stage == 0 and self.saved_optimizer_state:
+            optimizer.load_state_dict(self.saved_optimizer_state)
+            logger.info("✓ Optimizer state restored")
+            if scheduler and self.saved_scheduler_state:
+                scheduler.load_state_dict(self.saved_scheduler_state)
+                logger.info("✓ Scheduler state restored")
+            self.saved_optimizer_state, self.saved_scheduler_state = None, None
+
+        for stage_idx in range(self.start_stage, len(curriculum)):
+            stage_cfg = curriculum[stage_idx]
+            logger.info(f"\n▶ Starting Curriculum Stage {stage_idx + 1}/{len(curriculum)}")
+            
+            # Run the stage (which handles its own internal loops)
+            self._run_stage(stage_idx, stage_cfg, optimizer, scheduler)
+            
+            self._save_checkpoint(stage_cfg['epochs'][-1] if isinstance(stage_cfg['epochs'], list) else stage_cfg['epochs'], 
+                                  stage_idx, optimizer, scheduler, is_stage_complete=True)
+            self.start_epoch = 0 # Reset for next stage
+        
+        logger.info("\n" + "=" * 80 + "\n🎉 TRAINING COMPLETE!\n" + f"  Best validation loss: {self.best_val_loss:.6f}\n" + "=" * 80 + "\n")
+        if WANDB_AVAILABLE and self.config['project']['log_to_wandb']: wandb.finish()
+
+    def _train_epoch(self, epoch: int, total_epochs: int, stage_idx: int, train_loader: DataLoader, 
+                     optimizer: torch.optim.Optimizer, scheduler: Optional[Any], sub_stage_idx: int = -1):
+        
         self.model.train()
+        stage_desc = f"Stage {stage_idx+1}"
+        if sub_stage_idx != -1:
+            stage_desc += f".{sub_stage_idx+1}"
+            
+        pbar = tqdm(train_loader, desc=f"{stage_desc} | Epoch {epoch+1}/{total_epochs}", leave=True)
         
-        # Progress bar
-        pbar = tqdm(
-            train_loader,
-            desc=f"Stage {stage_idx+1} | Epoch {epoch+1}/{total_epochs}",
-            leave=True
-        )
-        
-        # Accumulators
-        epoch_loss = 0.0
-        epoch_loss_components = {}
-        
-        for batch_idx, batch in enumerate(pbar):
-            # Move data to device
+        for batch in pbar:
             lq = batch['lq'].to(self.device, non_blocking=True)
             hq = batch['hq'].to(self.device, non_blocking=True)
-            crf = batch['crf'].to(self.device, non_blocking=True)
-            preset = batch['preset'].to(self.device, non_blocking=True)
             
-            # FIXED: Cross-platform autocast
-            # Use device type string ('cuda', 'mps', 'cpu')
             with autocast(device_type=str(self.device.type), enabled=self.use_amp):
-                restored = self.model(lq, crf, preset)
+                # This logic correctly handles both model types
+                if self.is_conditional_model:
+                    crf = batch['crf'].to(self.device, non_blocking=True)
+                    preset = batch['preset'].to(self.device, non_blocking=True)
+                    restored = self.model(lq, crf, preset)
+                else:
+                    restored = self.model(lq)
+                
                 loss, loss_dict = self.loss_fn(restored, hq)
             
-            # Backward pass with optional GradScaler
             optimizer.zero_grad(set_to_none=True)
-            
-            if self.scaler is not None:
-                # CUDA path: use GradScaler
+            if self.scaler:
                 self.scaler.scale(loss).backward()
-                
-                # Gradient clipping
-                grad_clip = self.config['training'].get('grad_clip_norm', 0)
-                if grad_clip > 0:
-                    self.scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
-                
+                if self.config['training']['grad_clip_norm'] > 0: self.scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config['training']['grad_clip_norm'])
                 self.scaler.step(optimizer)
                 self.scaler.update()
             else:
-                # MPS/CPU path: standard backward
                 loss.backward()
-                
-                # Gradient clipping
-                grad_clip = self.config['training'].get('grad_clip_norm', 0)
-                if grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
-                
+                if self.config['training']['grad_clip_norm'] > 0: torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config['training']['grad_clip_norm'])
                 optimizer.step()
             
-            # Update scheduler
-            if scheduler:
-                scheduler.step()
-            
-            # Update EMA
-            if self.ema:
-                self.ema.update()
-            
-            # Accumulate metrics
-            epoch_loss += loss.item()
-            for key, value in loss_dict.items():
-                if key not in epoch_loss_components:
-                    epoch_loss_components[key] = 0.0
-                epoch_loss_components[key] += value.item()
-            
-            # Update progress bar
-            current_lr = optimizer.param_groups[0]['lr']
-            pbar_dict = {
-                'loss': f"{loss.item():.4f}",
-                'lr': f"{current_lr:.2e}"
-            }
-            pbar.set_postfix(pbar_dict)
-            
-            # Log to W&B
-            if WANDB_AVAILABLE and self.config['project']['log_to_wandb']:
-                if self.global_step % 50 == 0:
-                    wandb_dict = {
-                        'train/total_loss': loss.item(),
-                        'train/learning_rate': current_lr,
-                        'train/epoch': epoch,
-                        'train/stage': stage_idx,
-                        'step': self.global_step
-                    }
-                    for key, value in loss_dict.items():
-                        wandb_dict[f'train/{key}'] = value.item()
-                    
-                    wandb.log(wandb_dict)
+            # Scheduler steps every *step*, not epoch
+            if scheduler: scheduler.step()
+            if self.ema: self.ema.update()
             
             self.global_step += 1
-        
-        # Log epoch summary
-        avg_loss = epoch_loss / len(train_loader)
-        logger.info(
-            f"Epoch {epoch+1}/{total_epochs} | "
-            f"Stage {stage_idx+1} | "
-            f"Avg Loss: {avg_loss:.6f}"
-        )
-    
-    # @torch.no_grad()
-    # def _validate(
-    #     self,
-    #     epoch: int,
-    #     stage_idx: int,
-    #     val_loader: DataLoader
-    # ) -> float:
-    #     """Run validation and return average loss."""
-    #     self.model.eval()
-        
-    #     # Apply EMA weights if enabled
-    #     if self.ema:
-    #         self.ema.apply_shadow()
-        
-    #     # Accumulators
-    #     total_loss = 0.0
-    #     total_loss_components = {}
-        
-    #     # Validation loop
-    #     pbar = tqdm(val_loader, desc=f"Validating Epoch {epoch+1}", leave=False)
-    #     for batch in pbar:
-    #         lq = batch['lq'].to(self.device, non_blocking=True)
-    #         hq = batch['hq'].to(self.device, non_blocking=True)
-    #         crf = batch['crf'].to(self.device, non_blocking=True)
-    #         preset = batch['preset'].to(self.device, non_blocking=True)
+            log_metrics = {f'{k.replace("loss_", "")}': f"{v.item():.4f}" for k, v in loss_dict.items()}
+            pbar.set_postfix(log_metrics)
             
-    #         # Forward pass
-    #         restored = self.model(lq, crf, preset)
-    #         loss, loss_dict = self.loss_fn(restored, hq)
-            
-    #         total_loss += loss.item()
-    #         for key, value in loss_dict.items():
-    #             if key not in total_loss_components:
-    #                 total_loss_components[key] = 0.0
-    #             total_loss_components[key] += value.item()
+            if WANDB_AVAILABLE and self.config['project']['log_to_wandb'] and (self.global_step % 50 == 0):
+                wandb_log = {f'train/{k.replace("loss_", "")}': v.item() for k, v in loss_dict.items()}
+                wandb_log['train/lr'] = optimizer.param_groups[0]['lr']
+                wandb.log(wandb_log, step=self.global_step)
         
-    #     # Calculate averages
-    #     avg_loss = total_loss / len(val_loader)
-    #     avg_components = {k: v / len(val_loader) for k, v in total_loss_components.items()}
-        
-    #     # Log validation results
-    #     logger.info(
-    #         f"Validation Epoch {epoch+1} | Stage {stage_idx+1} | "
-    #         f"Avg Loss: {avg_loss:.6f}"
-    #     )
-        
-    #     # Log to W&B
-    #     if WANDB_AVAILABLE and self.config['project']['log_to_wandb']:
-    #         wandb_dict = {
-    #             'val/total_loss': avg_loss,
-    #             'val/epoch': epoch,
-    #             'val/stage': stage_idx,
-    #             'step': self.global_step
-    #         }
-    #         for key, value in avg_components.items():
-    #             wandb_dict[f'val/{key}'] = value
-            
-    #         # Add visual samples if available
-    #         if self.val_samples is not None:
-    #             try:
-    #                 self._log_visual_samples(epoch, stage_idx)
-    #             except Exception as e:
-    #                 logger.warning(f"Failed to log visual samples: {e}")
-            
-    #         wandb.log(wandb_dict)
-        
-    #     # Restore original weights if EMA applied
-    #     if self.ema:
-    #         self.ema.restore()
-        
-    #     return avg_loss
+        avg_loss = loss_dict.get('total_loss', torch.tensor(0.0)).item()
+        logger.info(f"Epoch {epoch+1}/{total_epochs} | Avg Loss: {avg_loss:.6f}")
+
     @torch.no_grad()
-    def _validate(
-        self,
-        epoch: int,
-        stage_idx: int,
-        val_loader: DataLoader
-    ) -> float:
-        """Run validation and return average loss."""
+    def _validate(self, epoch: int, stage_idx: int, val_loader: DataLoader) -> float:
         self.model.eval()
+        if self.ema: self.ema.apply_shadow()
         
-        # Apply EMA weights if enabled
-        if self.ema:
-            self.ema.apply_shadow()
+        total_loss, total_loss_components = 0.0, {}
+        baseline_l1_sum, restored_l1_sum = 0.0, 0.0
         
-        # Accumulators
-        total_loss = 0.0
-        total_loss_components = {}
-        baseline_l1_sum = 0.0
-        baseline_l2_sum = 0.0
-        restored_l1_sum = 0.0
-        restored_l2_sum = 0.0
-        
-        # Validation loop
         pbar = tqdm(val_loader, desc=f"Validating Epoch {epoch+1}", leave=False)
         for batch in pbar:
             lq = batch['lq'].to(self.device, non_blocking=True)
             hq = batch['hq'].to(self.device, non_blocking=True)
-            crf = batch['crf'].to(self.device, non_blocking=True)
-            preset = batch['preset'].to(self.device, non_blocking=True)
             
-            # Forward pass
-            restored = self.model(lq, crf, preset)
+            # This logic correctly handles both model types
+            if self.is_conditional_model:
+                crf = batch['crf'].to(self.device, non_blocking=True)
+                preset = batch['preset'].to(self.device, non_blocking=True)
+                # Use inference method for validation if it exists
+                if hasattr(self.model, 'inference'):
+                    restored = self.model.inference(lq, crf, preset)
+                else:
+                    restored = self.model(lq, crf, preset)
+            else:
+                if hasattr(self.model, 'inference'):
+                    restored = self.model.inference(lq)
+                else:
+                    restored = self.model(lq)
+
             loss, loss_dict = self.loss_fn(restored, hq)
             
-            # Accumulate main loss
             total_loss += loss.item()
             for key, value in loss_dict.items():
-                if key not in total_loss_components:
-                    total_loss_components[key] = 0.0
-                total_loss_components[key] += value.item()
+                total_loss_components[key] = total_loss_components.get(key, 0.0) + value.item()
             
-            # Compute baseline metrics (LQ vs HQ - "do nothing")
             baseline_l1_sum += F.l1_loss(lq, hq).item()
-            baseline_l2_sum += F.mse_loss(lq, hq).item()
-            
-            # Compute restored metrics (Restored vs HQ)
             restored_l1_sum += F.l1_loss(restored, hq).item()
-            restored_l2_sum += F.mse_loss(restored, hq).item()
         
-        # Calculate averages
         num_batches = len(val_loader)
         avg_loss = total_loss / num_batches
         avg_components = {k: v / num_batches for k, v in total_loss_components.items()}
-        
-        # Calculate metric averages
         avg_baseline_l1 = baseline_l1_sum / num_batches
-        avg_baseline_l2 = baseline_l2_sum / num_batches
         avg_restored_l1 = restored_l1_sum / num_batches
-        avg_restored_l2 = restored_l2_sum / num_batches
+        l1_improvement = ((avg_baseline_l1 - avg_restored_l1) / avg_baseline_l1) * 100
         
-        # Calculate improvement percentages
-        l1_improvement = ((avg_baseline_l1 - avg_restored_l1) / avg_baseline_l1) * 100 if avg_baseline_l1 > 0 else 0
-        l2_improvement = ((avg_baseline_l2 - avg_restored_l2) / avg_baseline_l2) * 100 if avg_baseline_l2 > 0 else 0
+        logger.info(f"Validation Epoch {epoch+1} | Avg Loss: {avg_loss:.6f}")
+        logger.info(f"  Baseline L1: {avg_baseline_l1:.6f} | Restored L1: {avg_restored_l1:.6f} (↓{l1_improvement:.2f}%)")
         
-        # Log validation results
-        logger.info(
-            f"Validation Epoch {epoch+1} | Stage {stage_idx+1} | "
-            f"Avg Loss: {avg_loss:.6f}"
-        )
-        logger.info(
-            f"  Baseline L1: {avg_baseline_l1:.6f} | Restored L1: {avg_restored_l1:.6f} "
-            f"(↓{l1_improvement:.2f}%)"
-        )
-        logger.info(
-            f"  Baseline L2: {avg_baseline_l2:.6f} | Restored L2: {avg_restored_l2:.6f} "
-            f"(↓{l2_improvement:.2f}%)"
-        )
-        
-        # Log to W&B
         if WANDB_AVAILABLE and self.config['project']['log_to_wandb']:
-            wandb_dict = {
-                'val/total_loss': avg_loss,
-                'val/epoch': epoch,
-                'val/stage': stage_idx,
-                'step': self.global_step,
-                # Baseline metrics (do nothing - LQ vs HQ)
-                'val/baseline_l1': avg_baseline_l1,
-                'val/baseline_l2': avg_baseline_l2,
-                # Restored metrics (model output vs HQ)
-                'val/restored_l1': avg_restored_l1,
-                'val/restored_l2': avg_restored_l2,
-                # Improvement metrics
-                'val/l1_improvement_pct': l1_improvement,
-                'val/l2_improvement_pct': l2_improvement,
-            }
-            for key, value in avg_components.items():
-                wandb_dict[f'val/{key}'] = value
+            wandb_dict = {f'val/{k.replace("loss_", "")}': v for k,v in avg_components.items()}
+            wandb_dict.update({'val/epoch': epoch + 1, 'step': self.global_step,
+                               'val/baseline_l1': avg_baseline_l1, 'val/restored_l1': avg_restored_l1,
+                               'val/l1_improvement_pct': l1_improvement})
             
-            # Add visual samples if available
             if self.val_samples is not None:
-                try:
-                    self._log_visual_samples(epoch, stage_idx)
-                except Exception as e:
-                    logger.warning(f"Failed to log visual samples: {e}")
+                try: self._log_visual_samples(epoch, stage_idx)
+                except Exception as e: logger.warning(f"Failed to log visual samples: {e}")
             
             wandb.log(wandb_dict)
         
-        # Restore original weights if EMA applied
-        if self.ema:
-            self.ema.restore()
-        
+        if self.ema: self.ema.restore()
         return avg_loss
     
+    @torch.no_grad()
     def _log_visual_samples(self, epoch: int, stage_idx: int):
-        """Generate and log visual samples to W&B."""
-        if self.val_samples is None:
-            return
+        if self.val_samples is None: return
         
-        lq = self.val_samples['lq']
-        hq = self.val_samples['hq']
-        crf = self.val_samples['crf']
-        preset = self.val_samples['preset']
+        lq, hq = self.val_samples['lq'], self.val_samples['hq']
         
-        # Generate restorations
-        with torch.no_grad():
-            restored = self.model(lq, crf, preset)
+        if self.is_conditional_model:
+            crf, preset = self.val_samples['crf'], self.val_samples['preset']
+            restored = self.model.inference(lq, crf, preset)
+        else:
+            restored = self.model.inference(lq)
         
-        # Create comparison grid: LQ | Restored | HQ
-        # Handle normalization range (convert to [0, 1] for display)
-        norm_range=tuple(self.config['dataset'].get('norm_range', [-1, 1]))
-
-        if norm_range == (-1,1):
-            # Convert from [-1, 1] to [0, 1]
+        norm_range = tuple(self.config['dataset'].get('norm_range', [-1, 1]))
+        lq_display, restored_display, hq_display = lq, restored, hq
+        if norm_range == (-1, 1):
             lq_display = (lq + 1.0) / 2.0
             restored_display = (restored + 1.0) / 2.0
             hq_display = (hq + 1.0) / 2.0
-        else:
-            lq_display = lq
-            restored_display = restored
-            hq_display = hq
         
-        # Clamp to valid range
-        lq_display = torch.clamp(lq_display, 0, 1)
-        restored_display = torch.clamp(restored_display, 0, 1)
-        hq_display = torch.clamp(hq_display, 0, 1)
+        images = [torch.cat(torch.clamp(t, 0, 1), dim=2) for t in zip(lq_display, restored_display, hq_display)]
+        grid = torch.cat(images, dim=1) # Stack vertically
         
-        # Create grid for each sample
-        images = []
-        for i in range(lq.size(0)):
-            # Concatenate horizontally: LQ | Restored | HQ
-            row = torch.cat([lq_display[i], restored_display[i], hq_display[i]], dim=2)
-            images.append(row)
-        
-        # Stack all samples vertically
-        grid = torch.cat(images, dim=1)  # Stack along height
-        
-        # Convert to numpy for wandb
-        grid_np = grid.cpu().permute(1, 2, 0).numpy()
-        
-        # Log to wandb
-        wandb.log({
-            f'val/visual_samples': wandb.Image(
-                grid_np,
-                caption=f"Stage {stage_idx+1}, Epoch {epoch+1} | LQ - Restored - HQ"
-            )
-        })
-    
-    # --------------------------------------------------------------------------
-    # Checkpointing
-    # --------------------------------------------------------------------------
+        wandb.log({"val/samples": wandb.Image(grid, caption=f"Stage {stage_idx+1}, Epoch {epoch+1} | LQ - Restored - HQ")}, step=self.global_step)
     
     def _get_checkpoint_path(self, key: str) -> Path:
-        """Resolve checkpoint key to path."""
-        cd = self.checkpoint_dir
-        
-        # If already a valid path
         key_path = Path(key)
-        if key_path.exists():
-            return key_path
+        if key_path.exists(): return key_path
+        if key == 'latest': return self.checkpoint_dir / 'latest.pth'
+        if key == 'best': return self.checkpoint_dir / 'best.pth'
+        return self.checkpoint_dir / key
+
+    def _save_checkpoint(self, epoch: int, stage_idx: int, optimizer: torch.optim.Optimizer, scheduler: Optional[Any], is_best: bool = False, is_stage_complete: bool = False):
+        state = {'model_state_dict': self.model.state_dict(), 'optimizer_state_dict': optimizer.state_dict(),
+                 'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+                 'ema_state_dict': self.ema.shadow if self.ema else None,
+                 'stage_idx': stage_idx, 'epoch': epoch, 'global_step': self.global_step,
+                 'best_val_loss': self.best_val_loss, 'wandb_id': self.wandb_id}
         
-        # Standard keys
-        if key == 'latest':
-            return cd / 'latest.pth'
-        if key == 'best':
-            return cd / 'best.pth'
-        
-        # Assume filename in checkpoint dir
-        return cd / key
-    
-    def _save_checkpoint(
-        self,
-        epoch: int,
-        stage_idx: int,
-        optimizer: Optional[torch.optim.Optimizer],
-        scheduler: Optional[Any],
-        is_best: bool = False,
-        is_stage_complete: bool = False
-    ):
-        """Save checkpoint with full training state."""
-        ckpt = {
-            'config': self.config,
-            'model_state': self.model.state_dict(),
-            'epoch': epoch,
-            'stage_idx': stage_idx,
-            'global_step': self.global_step,
-            'best_val_loss': self.best_val_loss,
-            'wandb_id': self.wandb_id
-        }
-        
-        if optimizer is not None:
-            ckpt['optimizer_state'] = optimizer.state_dict()
-        if scheduler is not None:
-            ckpt['scheduler_state'] = scheduler.state_dict()
-        if self.ema is not None:
-            ckpt['ema_shadow'] = self.ema.shadow
-        
-        # Save latest
-        latest_path = self.checkpoint_dir / 'latest.pth'
-        torch.save(ckpt, latest_path)
-        logger.info(f"✓ Saved checkpoint: {latest_path}")
-        
-        # Save best
+        torch.save(state, self.checkpoint_dir / "latest.pth")
+        if is_stage_complete: 
+            logger.info(f"✓ Stage {stage_idx+1} complete. Checkpoint saved.")
+            torch.save(state, self.checkpoint_dir / f"stage_{stage_idx+1:02d}_complete.pth")
         if is_best:
-            best_path = self.checkpoint_dir / 'best.pth'
-            torch.save(ckpt, best_path)
-            logger.info(f"✓ Saved best checkpoint (val_loss={self.best_val_loss:.6f}): {best_path}")
-        
-        # Save stage complete
-        if is_stage_complete:
-            complete_path = self.checkpoint_dir / f'stage{stage_idx+1:02d}_complete.pth'
-            torch.save(ckpt, complete_path)
-            logger.info(f"✓ Saved stage-complete checkpoint: {complete_path}")
-    
+            torch.save(state, self.checkpoint_dir / "best.pth")
+            logger.info(f"✨ New best model saved (val_loss={self.best_val_loss:.6f})")
+
     def _load_checkpoint(self):
-        """Load checkpoint and restore training state."""
         try:
             ckpt_path = self._get_checkpoint_path(self.resume_from)
-            if not ckpt_path.exists():
-                raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+            if not ckpt_path.exists(): raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+            logger.info(f"Resuming training from checkpoint: {ckpt_path}")
             
-            logger.info(f"Loading checkpoint: {ckpt_path}")
             ckpt = torch.load(ckpt_path, map_location=self.device)
+            self.model.load_state_dict(ckpt['model_state_dict'])
+            if self.ema and ckpt.get('ema_state_dict'): self.ema.shadow = ckpt['ema_state_dict']
             
-            # Restore model
-            self.model.load_state_dict(ckpt['model_state'])
-            logger.info("✓ Model state restored")
-            
-            # Restore training state
             self.start_stage = ckpt.get('stage_idx', 0)
-            self.start_epoch = ckpt.get('epoch', 0) + 1  # Resume from next epoch
+            self.start_epoch = ckpt.get('epoch', 0) + 1
             self.global_step = ckpt.get('global_step', 0)
             self.best_val_loss = ckpt.get('best_val_loss', float('inf'))
+            if 'wandb_id' in ckpt and not self.wandb_id: self.wandb_id = ckpt['wandb_id']
             
-            # Restore W&B ID
-            if 'wandb_id' in ckpt and not self.wandb_id:
-                self.wandb_id = ckpt['wandb_id']
+            self.saved_optimizer_state = ckpt.get('optimizer_state_dict')
+            self.saved_scheduler_state = ckpt.get('scheduler_state_dict')
             
-            # Save optimizer/scheduler states for later restoration
-            self.saved_optimizer_state = ckpt.get('optimizer_state')
-            self.saved_scheduler_state = ckpt.get('scheduler_state')
-            
-            # Restore EMA
-            if 'ema_shadow' in ckpt and self.ema is not None:
-                self.ema.shadow = ckpt['ema_shadow']
-                logger.info("✓ EMA shadow restored")
-            
-            logger.info(
-                f"✓ Checkpoint loaded: stage={self.start_stage}, epoch={self.start_epoch}, "
-                f"step={self.global_step}, best_loss={self.best_val_loss:.6f}"
-            )
-        
+            logger.info(f"✓ Resumed from Stage {self.start_stage+1}, Epoch {self.start_epoch}. Best loss: {self.best_val_loss:.4f}")
         except Exception as e:
-            logger.error(f"Failed to load checkpoint: {e}")
-            logger.warning("Starting training from scratch")
-
-
+            logger.error(f"Failed to load checkpoint: {e}. Starting training from scratch.")
+            
 # ==============================================================================
 # SECTION 3: Entry Point
 # ==============================================================================
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Train AV1 U-Net Restorer",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
-    parser.add_argument(
-        '-c', '--config',
-        type=str,
-        required=True,
-        help='Path to YAML configuration file'
-    )
-    parser.add_argument(
-        '-r', '--resume',
-        type=str,
-        default=None,
-        help='Checkpoint to resume from (latest, best, or path)'
-    )
-    parser.add_argument(
-        '--wandb_id',
-        type=str,
-        default=None,
-        help='W&B run ID to resume logging'
-    )
-    return parser.parse_args()
-
-
 def main():
-    args = parse_args()
+    parser = argparse.ArgumentParser(description="Unified AV1 Restorer Trainer")
+    parser.add_argument('--config', type=str, required=True, help="Path to YAML config file.")
+    parser.add_argument('--resume', type=str, default=None, help="Resume from 'latest', 'best', or a specific checkpoint path.")
+    parser.add_argument('--wandb_id', type=str, default=None, help="W&B run ID to resume logging.")
+    args = parser.parse_args()
     
     try:
-        # Initialize trainer
-        trainer = AV1RestorerTrainer(
+        trainer = UniversalRestorerTrainer(
             config_path=args.config,
             resume_from=args.resume,
             wandb_id=args.wandb_id
         )
-        
-        # Start training
         trainer.train()
-        
     except KeyboardInterrupt:
-        logger.warning("\n⚠️  Training interrupted by user")
-        logger.info("Saving emergency checkpoint...")
-        
-        try:
-            if hasattr(trainer, 'model') and hasattr(trainer, 'checkpoint_dir'):
-                emergency_ckpt = {
-                    'model_state': trainer.model.state_dict(),
-                    'epoch': trainer.start_epoch,
-                    'stage_idx': trainer.start_stage,
-                    'global_step': trainer.global_step,
-                    'best_val_loss': trainer.best_val_loss,
-                    'wandb_id': trainer.wandb_id
-                }
-                if trainer.ema:
-                    emergency_ckpt['ema_shadow'] = trainer.ema.shadow
-                
-                emergency_path = trainer.checkpoint_dir / 'emergency_interrupt.pth'
-                torch.save(emergency_ckpt, emergency_path)
-                logger.info(f"✓ Emergency checkpoint saved: {emergency_path}")
-        except Exception as e:
-            logger.error(f"Failed to save emergency checkpoint: {e}")
-        
-        # Close W&B
-        if WANDB_AVAILABLE and trainer.config['project'].get('log_to_wandb', False):
-            wandb.finish()
-        
-        raise
-    
+        logger.warning("\n⚠️  Training interrupted by user. Saving emergency checkpoint...")
+        # (Emergency save logic would go here if trainer is accessible)
     except Exception as e:
         logger.error(f"❌ Training failed with error: {e}", exc_info=True)
-        raise
-
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()

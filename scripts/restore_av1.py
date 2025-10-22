@@ -203,7 +203,7 @@ def process_single_image(
     auto: bool, 
     dry_run: bool = False, 
     overwrite: bool = False,
-    crop: bool = False
+    crop: bool = False,
     hq_path: Optional[Path] = None
 ) -> Optional[Dict[str, float]]:
     """
@@ -234,7 +234,7 @@ def process_single_image(
     # Execute the restoration.
     try:
         lq_img = Image.open(img_path).convert('RGB')
-        restored = model.restore(lq_img, crf, preset, crop=args.crop)
+        restored = model.restore(lq_img, crf, preset, crop=crop)
         
         out_path.parent.mkdir(parents=True, exist_ok=True)
         restored.save(out_path, quality=95)
@@ -348,10 +348,14 @@ def process_directory(
         
         metrics = process_single_image(
             model, img_path, out_path, img_crf, img_preset, 
-            auto, dry_run, overwrite, hq_path, crop
+            auto, dry_run, overwrite, crop, hq_path
         )
         
         if metrics:
+            logger.info(f"\nMetrics:")
+            logger.info(f"  LQ Loss (MSE):       {metrics['lq_loss']:.6f}")
+            logger.info(f"  Restored Loss (MSE): {metrics['restored_loss']:.6f}")
+            logger.info(f"  Improvement:         {metrics['improvement']:.6f}")
             metrics_list.append(metrics)
     
     # Print summary metrics if in test mode
@@ -443,7 +447,7 @@ def main():
             hq_path = Path(args.hq_dir) / Path(args.input).name if args.hq_dir else None
             metrics = process_single_image(
                 model, Path(args.input), Path(args.output), 
-                args.crf, args.preset, args.auto, args.dry_run, args.overwrite, hq_path
+                args.crf, args.preset, args.auto, args.dry_run, args.overwrite, args.crop, hq_path
             )
             
             if metrics:

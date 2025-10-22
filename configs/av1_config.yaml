@@ -1,0 +1,58 @@
+project:
+  name: "AV1-Compression-Artifact-Restorer"
+  experiment_name: "NanoFBCNN-CRF34-43"
+  log_to_wandb: true
+
+data:
+  train_lq_root: "~/av1_data/train/lq"
+  train_hq_root: "~/av1_data/train/hq"
+  val_lq_root: "~/av1_data/val/lq"
+  val_hq_root: "~/av1_data/val/hq"
+  lq_ext: ".npy" # ".avif"
+  hq_ext: ".npy" # ".png"
+
+dataset:
+  crf_range: [34, 43]
+  preset_range: [4, 4]
+  norm_range: [-1, 1]
+
+curriculum:
+  - patch_size: [256, 512]
+    batch_size: [32, 8]
+    epochs: [150, 50]
+
+model:
+  type: "nano_fbcnn"     # one of: unet / nano_unet / nano_fbcnn / nano_resnet
+  size: "small"
+
+loss:
+  charbonnier: { enabled: true, weight: 10.0, params: { eps: 0.001 } }
+  perceptual: { enabled: true, weight: 0.1, params: { network: 'vgg' } }
+  ms_ssim: { enabled: true, weight: 0.8 }
+
+optimizer:
+  type: "adamw"
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+  betas: [0.9, 0.999]
+  use_ema: true
+
+scheduler:
+  type: "cosine"
+  min_lr: 1.0e-6
+  warmup_steps: 1000
+
+training:
+  grad_clip_norm: 1.0
+  validate_every_n_epochs: 1
+  num_val_samples_to_log: 4
+
+checkpoint:
+  dir: "./checkpoints/nano-fbcnn-crf34-43/"
+  save_every_n_epochs: 10
+
+system:
+  num_workers: 8
+  device: "cuda"
+  mixed_precision: true
+  seed: 42
