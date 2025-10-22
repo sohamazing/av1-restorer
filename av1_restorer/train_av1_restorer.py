@@ -487,14 +487,14 @@ class AV1RestorerTrainer:
         lq_ext = data_cfg.get('lq_ext', '.avif')
         
         if lq_ext == '.npy':
-            from utils.av1_npy_dataset import AV1DatasetFast as DatasetClass
+            from utils.av1_dataset_fast import AV1DatasetFast as AV1Dataset
             logger.info("Using FastAV1Dataset (NumPy format) - faster loading! (preprocessed from AVIF)")
         else:
-            from utils.av1_dataset import AV1Dataset as DatasetClass
+            from utils.av1_dataset import AV1Dataset as AV1Dataset
             logger.info("Using standard AV1Dataset (AVIF format)")
         
         # Create datasets
-        train_dataset = DatasetClass(
+        train_dataset = AV1Dataset(
             lq_root_dir=data_cfg['train_lq_root'],
             hq_root_dir=data_cfg['train_hq_root'],
             hq_ext=data_cfg['hq_ext'],
@@ -506,7 +506,7 @@ class AV1RestorerTrainer:
             return_metadata=False
         )
         
-        val_dataset = DatasetClass(
+        val_dataset = AV1Dataset(
             lq_root_dir=data_cfg['val_lq_root'],
             hq_root_dir=data_cfg['val_hq_root'],
             hq_ext=data_cfg['hq_ext'],
