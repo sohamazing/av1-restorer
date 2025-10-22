@@ -21,6 +21,7 @@ av1_data/
 checkpoints/
 results/
 wandb/
+configs/
 *.log
 
 # Ignore temporary or backup files

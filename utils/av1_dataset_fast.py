@@ -45,53 +45,67 @@ class AV1DatasetFast(Dataset):
         self,
         lq_root_dir: str,
         hq_root_dir: str,
-        hq_ext: str,
+        hq_ext: str, # Keep hq_ext even if forced later, for signature consistency
         patch_size: int,
         crf_range: Optional[Tuple[int, int]] = None,
         preset_range: Optional[Tuple[int, int]] = None,
         augment: bool = True,
         norm_range: Tuple[int, int] = (0, 1),
-        return_metadata: bool = False
+        return_metadata: bool = False,
+        cached_image_pairs: Optional[list] = None
     ):
         # Validate and resolve paths
         self.lq_root = Path(lq_root_dir).expanduser().resolve()
         self.hq_root = Path(hq_root_dir).expanduser().resolve()
-        
+
         if not self.lq_root.exists():
             raise FileNotFoundError(f"LQ directory not found: {self.lq_root}")
         if not self.hq_root.exists():
             raise FileNotFoundError(f"HQ directory not found: {self.hq_root}")
-        
-        # Force .npy extension
+
+        # Force .npy extension for HQ as FastDataset expects preprocessed HQ too
         self.hq_ext = '.npy'
         self.patch_size = patch_size
         self.return_metadata = return_metadata
-        
+
         # Validate filtering ranges
         self.crf_range = self._validate_range(crf_range, self.VALID_CRF_RANGE, "CRF")
         self.preset_range = self._validate_range(preset_range, self.VALID_PRESET_RANGE, "Preset")
-        
+
         # Setup transforms
         self.augment_tf = self._get_augment_transforms() if augment else None
         self.final_tf = self._get_final_transform(norm_range)
-        
-        # Log configuration
-        logger.info("="*60)
-        logger.info("Initializing FastAV1Dataset (NumPy format)")
-        logger.info(f"  LQ Root:       {self.lq_root}")
-        logger.info(f"  HQ Root:       {self.hq_root}")
-        logger.info(f"  CRF Range:     {self.crf_range}")
-        logger.info(f"  Preset Range:  {self.preset_range}")
-        logger.info(f"  Patch Size:    {patch_size}×{patch_size}")
-        logger.info(f"  Augmentation:  {'Enabled' if augment else 'Disabled'}")
-        logger.info(f"  Normalization: {norm_range}")
-        logger.info("="*60)
-        
-        # Build dataset index
-        self.image_pairs = self._build_index()
-        
-        logger.info(f"✓ FastDataset ready with {len(self.image_pairs):,} pairs")
-        logger.info("="*60)
+
+        # --- Caching Logic ---
+        if cached_image_pairs is not None:
+            logger.debug(f"Using cached file list with {len(cached_image_pairs)} pairs for FastDataset.")
+            self.image_pairs = cached_image_pairs
+        else:
+            # --- Original Scanning/Filtering Logic ---
+            # Log configuration
+            logger.info("="*60)
+            logger.info("Initializing FastAV1Dataset (NumPy format)") # Keep specific log
+            logger.info(f"  LQ Root:       {self.lq_root}")
+            logger.info(f"  HQ Root:       {self.hq_root}")
+            logger.info(f"  CRF Range:     {self.crf_range}")
+            logger.info(f"  Preset Range:  {self.preset_range}")
+            logger.info(f"  Patch Size:    {patch_size}×{patch_size}")
+            logger.info(f"  Augmentation:  {'Enabled' if augment else 'Disabled'}")
+            logger.info(f"  Normalization: {norm_range}")
+            logger.info("="*60)
+
+            # Build dataset index (scans for .npy files now)
+            self.image_pairs = self._build_index()
+
+            logger.info(f"✓ FastDataset ready with {len(self.image_pairs):,} pairs")
+            logger.info("="*60)
+            # --- End of Original Logic ---
+
+        # Add a check here in case the cache was empty or scanning failed
+        if not self.image_pairs:
+            raise FileNotFoundError(
+                "No valid image pairs found for FastDataset. Check paths, ranges, naming, or cache."
+            )
     
     @staticmethod
     def _validate_range(rng: Optional[Tuple[int, int]], valid_rng: Tuple[int, int], name: str) -> Tuple[int, int]:

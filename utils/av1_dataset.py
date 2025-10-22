@@ -88,7 +88,8 @@ class AV1Dataset(Dataset):
         preset_range: Optional[Tuple[int, int]] = None,
         augment: bool = True,
         norm_range: Tuple[int, int] = (0, 1),
-        return_metadata: bool = False
+        return_metadata: bool = False,
+        cached_image_pairs: Optional[list] = None
     ):
         # Validate and resolve paths
         self.lq_root = Path(lq_root_dir).expanduser().resolve()
@@ -114,25 +115,36 @@ class AV1Dataset(Dataset):
         # Setup transforms
         self.augment_tf = self._get_augment_transforms() if augment else None
         self.final_tf = self._get_final_transform(norm_range)
+
+        if cached_image_pairs is not None:
+            # If a file list is provided, use it and skip scanning
+            logger.debug(f"Using cached file list with {len(cached_image_pairs)} pairs.")
+            self.image_pairs = cached_image_pairs
+        else:
+            # Log configuration
+            logger.info("="*60)
+            logger.info("Initializing AV1Dataset")
+            logger.info(f"  LQ Root:       {self.lq_root}")
+            logger.info(f"  HQ Root:       {self.hq_root}")
+            logger.info(f"  CRF Range:     {self.crf_range}")
+            logger.info(f"  Preset Range:  {self.preset_range}")
+            logger.info(f"  Patch Size:    {patch_size}×{patch_size}")
+            logger.info(f"  Augmentation:  {'Enabled' if augment else 'Disabled'}")
+            logger.info(f"  Normalization: {norm_range}")
+            logger.info("="*60)
+            
+            # Build dataset index
+            self.image_pairs = self._build_index()
+            
+            logger.info(f"✓ Dataset ready with {len(self.image_pairs):,} pairs")
+            logger.info("="*60)
+
+        # Add a check here in case the cache was empty or scanning failed
+        if not self.image_pairs:
+            raise FileNotFoundError(
+                "No valid image pairs found. Check paths, ranges, naming, or cache."
+            )
         
-        # Log configuration
-        logger.info("="*60)
-        logger.info("Initializing AV1Dataset")
-        logger.info(f"  LQ Root:       {self.lq_root}")
-        logger.info(f"  HQ Root:       {self.hq_root}")
-        logger.info(f"  CRF Range:     {self.crf_range}")
-        logger.info(f"  Preset Range:  {self.preset_range}")
-        logger.info(f"  Patch Size:    {patch_size}×{patch_size}")
-        logger.info(f"  Augmentation:  {'Enabled' if augment else 'Disabled'}")
-        logger.info(f"  Normalization: {norm_range}")
-        logger.info("="*60)
-        
-        # Build dataset index
-        self.image_pairs = self._build_index()
-        
-        logger.info(f"✓ Dataset ready with {len(self.image_pairs):,} pairs")
-        logger.info("="*60)
-    
     @staticmethod
     def _validate_range(
         rng: Optional[Tuple[int, int]], 
