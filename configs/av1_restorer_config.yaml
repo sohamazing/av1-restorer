@@ -27,7 +27,7 @@
 # ------------------------------------------------------------------------------
 project:
   name: "AV1-Restorer"
-  experiment_name: "nano_unet_small_crf34-43"  # Update for each CRF bucket
+  experiment_name: "nano_unet_small_crf34-43"  # Update for each CRF bucket (model_size_crf-range)
   log_to_wandb: true  # Enable for experiment tracking
 
 # ------------------------------------------------------------------------------
@@ -72,21 +72,20 @@ dataset:
 # Progressive training: start with small patches, increase resolution
 curriculum:
   # Stage 1: Learn basic patterns on small patches
-  - patch_size: 256
-    batch_size: 32    # Adjust based on GPU VRAM (32 for 8-12GB, 16 for 6GB)
-    epochs: 150
+  - patch_size: 128
+    batch_size: 128    # Adjust based on GPU VRAM 
+    epochs: 100
     # crf_range: [34, 43]  # Optional: per-stage CRF override
   
   # Stage 2: Refine on larger patches
-  - patch_size: 512
-    batch_size: 8     # Larger patches need more memory
+  - patch_size: 256
+    batch_size: 32     # Larger patches need more memory
     epochs: 50
   
-  # Optional Stage 3: Fine-tuning (uncomment if needed)
-  # - patch_size: 512
-  #   batch_size: 8
-  #   epochs: 25
-  #   crf_range: [38, 43]  # Focus on harder examples
+  # Stage 3: Fine-tuning (uncomment if needed)
+  - patch_size: 512
+    batch_size: 4
+    epochs: 20
 
 # ------------------------------------------------------------------------------
 # Model Configuration
@@ -114,7 +113,7 @@ loss:
   # Perceptual loss for better texture quality (RECOMMENDED)
   perceptual:
     enabled: true
-    weight: 0.01      # Adjust: 0.005-0.02 range
+    weight: 0.005      # Adjust: 0.005-0.02 range
     params:
       network: 'vgg'  # 'vgg' (faster) or 'lpips' (better quality)
   

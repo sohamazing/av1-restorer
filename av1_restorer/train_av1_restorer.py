@@ -1073,7 +1073,7 @@ class UniversalRestorerTrainer:
                 }
                 wandb_epoch_log['epoch/avg_total_loss'] = avg_epoch_loss
                 # Log these average values against the epoch number
-                wandb.log(wandb_epoch_log, step=self.global_step)   # epoch+1
+                wandb.log(wandb_epoch_log, step=self.global_step)   # ERROR: step=epoch+1
         else:
             logger.warning(f"Epoch {epoch+1}/{total_epochs_in_stage} | Train loader was empty. No training occurred.")
 
@@ -1181,18 +1181,18 @@ class UniversalRestorerTrainer:
             wandb_dict = {
                 'val/epoch': epoch + 1, # 1-based epoch number
                 'val/stage': stage_idx + 1, # 1-based stage number
-                'val/loss/total': avg_loss,
+                'val/avg_total_loss': avg_loss,
                 # Log individual loss components under 'val/loss/' group
-                **{f'val/loss/{k.replace("loss_", "")}': v for k, v in avg_components.items()},
+                **{f'val/avg_{k.replace("loss_", "")}': v for k, v in avg_components.items()},
                 # Baseline Metrics Group
-                'val/baseline/l1': avg_baseline_l1,
-                'val/baseline/l2': avg_baseline_l2,
+                'val/baseline_l1': avg_baseline_l1,
+                'val/baseline_l2': avg_baseline_l2,
                 # Restored Metrics Group
-                'val/restored/l1': avg_restored_l1,
-                'val/restored/l2': avg_restored_l2,
+                'val/restored_l1': avg_restored_l1,
+                'val/restored_l2': avg_restored_l2,
                 # Improvement Metrics Group
-                'val/improvement/l1_pct': l1_improvement,
-                'val/improvement/l2_pct': l2_improvement,
+                'val/improvement_l1': l1_improvement,
+                'val/improvement_l2': l2_improvement,
             }
 
             # Log visual samples (only if validation samples were successfully loaded)
