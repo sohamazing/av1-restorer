@@ -27,7 +27,7 @@
 # ------------------------------------------------------------------------------
 project:
   name: "AV1-Restorer"
-  experiment_name: "nano_unet_small_crf34-43"  # Update for each CRF bucket (model_size_crf-range)
+  experiment_name: "nano_unet_small_crf54-63"  # Update for each CRF bucket (model_size_crf-range)
   log_to_wandb: true  # Enable for experiment tracking
 
 # ------------------------------------------------------------------------------
@@ -61,7 +61,7 @@ dataset:
   #   Medium:   [34, 43]  - Moderate artifacts (MOST COMMON)
   #   High:     [44, 53]  - Heavy artifacts
   #   Extreme:  [54, 63]  - Severe artifacts
-  crf_range: [34, 43]     # Medium compression (recommended starting point)
+  crf_range: [54, 63]     # Medium compression (recommended starting point)
   
   preset_range: [4, 4]    # AV1 preset 4 (balanced quality/speed)
   norm_range: [-1, 1]     # Standard [-1, 1] normalization
@@ -174,8 +174,8 @@ training:
 # Checkpointing
 # ------------------------------------------------------------------------------
 checkpoint:
-  dir: "./checkpoints/nano_unet_small_crf34-43/"  # Update for each experiment
-  save_every_n_epochs: 10  # Periodic checkpoint frequency (0 = disable)
+  dir: "./checkpoints/nano_unet_small_crf54-63/"  # Update for each experiment
+  save_every_n_epochs: 1  # Periodic checkpoint frequency (0 = disable)
   
   # Saved checkpoints:
   #   best.pth              - Best validation loss

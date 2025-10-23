@@ -62,7 +62,7 @@ from tqdm import tqdm
 
 # Cross-platform AMP support
 from torch import autocast
-from torch.cuda.amp import GradScaler
+import torch.amp
 
 # Project imports
 project_root = Path(__file__).resolve().parent.parent
@@ -268,14 +268,14 @@ class UniversalRestorerTrainer:
         # Mixed precision (AMP)
         self.use_amp = sys_cfg.get('mixed_precision', False)
         if self.use_amp and self.device.type == 'cuda':
-            self.scaler = GradScaler()
+            self.scaler = torch.amp.GradScaler(device_type='cuda', enabled=True)
             logger.info("AMP: Enabled with GradScaler (CUDA)")
         elif self.use_amp:
             self.scaler = None
             logger.info(f"AMP: Enabled without GradScaler ({self.device.type})")
         else:
             self.scaler = None
-            logger.info("  AMP: Disabled")
+            logger.info("AMP: Disabled")
     
     def _setup_model(self) -> Tuple[nn.Module, bool]:
         """
@@ -519,11 +519,9 @@ class UniversalRestorerTrainer:
             'patch_size': patch_size,
             'crf_range': tuple(crf_range),
             'preset_range': tuple(dset_cfg['preset_range']),
-            'norm_range': tuple(dset_cfg.get('norm_range', [-1, 1]))
+            'norm_range': tuple(dset_cfg.get('norm_range', [-1, 1])),
+            'hq_ext': data_cfg.get('hq_ext', '.png')
         }
-        
-        if DatasetClass == AV1Dataset:
-            common_args['hq_ext'] = data_cfg.get('hq_ext', '.png')
         
         # Create datasets
         train_dset = DatasetClass(
@@ -545,9 +543,9 @@ class UniversalRestorerTrainer:
         # --- Caching Logic: Save file list if it was just created ---
         # Make sure your AV1Dataset stores the list in an attribute named 'image_pairs'
         if cached_train_image_pairs is None and hasattr(train_dset, 'image_pairs'):
-             self.train_image_pairs_cache[train_cache_key] = train_dset.image_pairs
+            self.train_image_pairs_cache[train_cache_key] = train_dset.image_pairs
         if cached_val_image_pairs is None and hasattr(val_dset, 'image_pairs'):
-             self.val_image_pairs_cache[val_cache_key] = val_dset.image_pairs
+            self.val_image_pairs_cache[val_cache_key] = val_dset.image_pairs
         # --- End Caching Logic ---
         
         # Dataloader config
@@ -676,7 +674,7 @@ class UniversalRestorerTrainer:
             estimated_total_steps = sum(
                 sum(s['epochs']) if isinstance(s['epochs'], list) else s['epochs']
                 for s in curriculum
-            ) * 500
+                ) * 500
             stage_loader_lengths = [500] * len(curriculum) # Fallback length estimate
 
         # --- Setup optimizer and scheduler ONCE ---
