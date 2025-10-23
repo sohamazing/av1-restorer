@@ -56,6 +56,7 @@ class AV1Dataset(Dataset):
         preset_range (tuple): (min_preset, max_preset), None for all
         augment (bool): Enable random flips
         norm_range (str): '[0,1]' or '[-1,1]'
+        crop (str): 'random' or 'center' or 'none'
         return_metadata (bool): Include file paths in output
     
     Example:
@@ -66,8 +67,9 @@ class AV1Dataset(Dataset):
         ...     patch_size=256,
         ...     crf_range=(23, 63),
         ...     preset_range=(4, 4),
-        ...     augment=True,
         ...     norm_range='[0,1]'
+        ...     augment=True,
+        ...     crop='random' 
         ... )
     """
     
@@ -76,7 +78,7 @@ class AV1Dataset(Dataset):
     
     # Valid AV1 parameter ranges
     VALID_CRF_RANGE = (0, 63)
-    VALID_PRESET_RANGE = (0, 13)  # libaom-av1 supports 0-13
+    VALID_PRESET_RANGE = (0, 8)  # libaom-av1 cpu_used: [0, 8], svt-av1 preset: [0, 13]
 
     def __init__(
         self,
@@ -86,8 +88,9 @@ class AV1Dataset(Dataset):
         patch_size: int,
         crf_range: Optional[Tuple[int, int]] = None,
         preset_range: Optional[Tuple[int, int]] = None,
-        augment: bool = True,
         norm_range: Tuple[int, int] = (0, 1),
+        augment: bool = True,
+        crop_mode: str = 'random',
         return_metadata: bool = False,
         cached_image_pairs: Optional[list] = None
     ):
@@ -111,6 +114,11 @@ class AV1Dataset(Dataset):
         self.preset_range = self._validate_range(
             preset_range, self.VALID_PRESET_RANGE, "Preset"
         )
+
+        valid_crop_modes = ['random', 'center', 'none']
+        if crop_mode not in valid_crop_modes:
+            raise ValueError(f"Invalid crop_mode: '{crop_mode}'. Choose from {valid_crop_modes}")
+        self.crop_mode = crop_mode
         
         # Setup transforms
         self.augment_tf = self._get_augment_transforms() if augment else None
@@ -129,6 +137,7 @@ class AV1Dataset(Dataset):
             logger.info(f"  CRF Range:     {self.crf_range}")
             logger.info(f"  Preset Range:  {self.preset_range}")
             logger.info(f"  Patch Size:    {patch_size}×{patch_size}")
+            logger.info(f"  Crop Mode:     {self.crop_mode}") # <-- Log crop mode
             logger.info(f"  Augmentation:  {'Enabled' if augment else 'Disabled'}")
             logger.info(f"  Normalization: {norm_range}")
             logger.info("="*60)
@@ -276,35 +285,49 @@ class AV1Dataset(Dataset):
             Optional: 'lq_path', 'base_name' if return_metadata=True
         """
         meta = self.image_pairs[idx]
-        
+
         try:
-            # Load images
             lq_img = Image.open(meta["lq"]).convert("RGB")
             hq_img = Image.open(meta["hq"]).convert("RGB")
-            
-            # Apply crop: random for training, deterministic center for validation
-            if self.augment_tf is not None:  # Training mode: apply identical random crop 
-                i, j, h, w = T.RandomCrop.get_params(
-                    lq_img, (self.patch_size, self.patch_size)
-                )
-            else:  # Validation mode: deterministic center crop
-                img_w, img_h = lq_img.size
-                i = (img_h - self.patch_size) // 2
-                j = (img_w - self.patch_size) // 2
-                h = w = self.patch_size
 
-            lq_patch = T.functional.crop(lq_img, i, j, h, w)
-            hq_patch = T.functional.crop(hq_img, i, j, h, w)
-            
-            # Apply identical augmentations
-            if self.augment_tf:
-                # Seed RNG for identical transforms
+            lq_patch, hq_patch = lq_img, hq_img # Start with full images
+
+            # --- APPLY CROPPING BASED ON self.crop_mode ---
+            if self.patch_size > 0: # Only crop if patch_size is valid
+                img_w, img_h = lq_img.size
+                # Ensure images are large enough for the crop
+                if img_w >= self.patch_size and img_h >= self.patch_size:
+                    if self.crop_mode == 'random':
+                        i, j, h, w = T.RandomCrop.get_params(
+                            lq_img, (self.patch_size, self.patch_size)
+                        )
+                        lq_patch = T.functional.crop(lq_img, i, j, h, w)
+                        hq_patch = T.functional.crop(hq_img, i, j, h, w)
+                    elif self.crop_mode == 'center':
+                        i = (img_h - self.patch_size) // 2
+                        j = (img_w - self.patch_size) // 2
+                        h = w = self.patch_size
+                        lq_patch = T.functional.crop(lq_img, i, j, h, w)
+                        hq_patch = T.functional.crop(hq_img, i, j, h, w)
+                    # elif self.crop_mode == 'none':
+                    #     pass # Keep full image if mode is 'none'
+                else:
+                    logger.warning(
+                        f"Image {meta['base']} ({img_w}x{img_h}) is smaller than "
+                        f"patch size {self.patch_size}. Skipping crop for this item."
+                    )
+            # --- END CROPPING LOGIC ---
+
+
+            # --- APPLY AUGMENTATION (FLIPS) INDEPENDENTLY ---
+            if self.augment and self.augment_tf: # Check self.augment here
                 seed = torch.randint(0, 2**32, (1,)).item()
                 torch.manual_seed(seed)
                 lq_patch = self.augment_tf(lq_patch)
                 torch.manual_seed(seed)
                 hq_patch = self.augment_tf(hq_patch)
-            
+            # --- END AUGMENTATION ---
+
             # Convert to tensors
             lq_tensor = self.final_tf(lq_patch)
             hq_tensor = self.final_tf(hq_patch)
@@ -395,8 +418,9 @@ if __name__ == "__main__":
         patch_size=256,
         crf_range=(23, 63),
         preset_range=(4, 4),
+        norm_range=(-1, 1),
+        crop_mode='center',
         augment=True,
-        norm_range='[0,1]',
         return_metadata=False
     )
     

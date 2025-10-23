@@ -49,8 +49,9 @@ class AV1DatasetFast(Dataset):
         patch_size: int,
         crf_range: Optional[Tuple[int, int]] = None,
         preset_range: Optional[Tuple[int, int]] = None,
-        augment: bool = True,
         norm_range: Tuple[int, int] = (0, 1),
+        crop_mode: str = 'random',
+        augment: bool = True,
         return_metadata: bool = False,
         cached_image_pairs: Optional[list] = None
     ):
@@ -72,6 +73,11 @@ class AV1DatasetFast(Dataset):
         self.crf_range = self._validate_range(crf_range, self.VALID_CRF_RANGE, "CRF")
         self.preset_range = self._validate_range(preset_range, self.VALID_PRESET_RANGE, "Preset")
 
+        valid_crop_modes = ['random', 'center', 'none']
+        if crop_mode not in valid_crop_modes:
+            raise ValueError(f"Invalid crop_mode: '{crop_mode}'. Choose from {valid_crop_modes}")
+        self.crop_mode = crop_mode
+
         # Setup transforms
         self.augment_tf = self._get_augment_transforms() if augment else None
         self.final_tf = self._get_final_transform(norm_range)
@@ -85,13 +91,14 @@ class AV1DatasetFast(Dataset):
             # Log configuration
             logger.info("="*60)
             logger.info("Initializing FastAV1Dataset (NumPy format)") # Keep specific log
-            logger.info(f"  LQ Root:       {self.lq_root}")
-            logger.info(f"  HQ Root:       {self.hq_root}")
-            logger.info(f"  CRF Range:     {self.crf_range}")
-            logger.info(f"  Preset Range:  {self.preset_range}")
-            logger.info(f"  Patch Size:    {patch_size}×{patch_size}")
-            logger.info(f"  Augmentation:  {'Enabled' if augment else 'Disabled'}")
-            logger.info(f"  Normalization: {norm_range}")
+            logger.info(f"  LQ Root:        {self.lq_root}")
+            logger.info(f"  HQ Root:        {self.hq_root}")
+            logger.info(f"  CRF Range:      {self.crf_range}")
+            logger.info(f"  Preset Range:   {self.preset_range}")
+            logger.info(f"  Patch Size:     {patch_size}×{patch_size}")
+            logger.info(f"  Crop Mode:      {self.crop_mode}") # <-- Log crop mode
+            logger.info(f"  Augment(Flips): {'Enabled' if augment else 'Disabled'}")
+            logger.info(f"  Normalization:  {norm_range}")
             logger.info("="*60)
 
             # Build dataset index (scans for .npy files now)
@@ -215,51 +222,78 @@ class AV1DatasetFast(Dataset):
         return len(self.image_pairs)
     
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        """Load sample from .npy files (fast!)."""
+        """Load sample from .npy files. Apply crops and transforms"""
         meta = self.image_pairs[idx]
-        
         try:
-            # Load NumPy arrays directly (10x faster than AVIF decode)
-            lq_array = np.load(meta["lq"])  # [H, W, 3] uint8
-            hq_array = np.load(meta["hq"])  # [H, W, 3] uint8
-            
-            # Convert to PIL for transforms
+            # Load NumPy arrays directly
+            # Ensure arrays are loaded as uint8 [H, W, 3]
+            lq_array = np.load(meta["lq"])
+            hq_array = np.load(meta["hq"])
+
+            # Convert to PIL for compatibility with torchvision transforms
             lq_img = Image.fromarray(lq_array)
             hq_img = Image.fromarray(hq_array)
-            
-            # Apply identical random crop
-            i, j, h, w = T.RandomCrop.get_params(lq_img, (self.patch_size, self.patch_size))
-            lq_patch = T.functional.crop(lq_img, i, j, h, w)
-            hq_patch = T.functional.crop(hq_img, i, j, h, w)
-            
-            # Apply identical augmentations
-            if self.augment_tf:
+
+            lq_patch, hq_patch = lq_img, hq_img # Start with full images
+
+            # --- APPLY CROPPING BASED ON self.crop_mode ---
+            if self.patch_size > 0: # Only crop if patch_size is valid
+                img_w, img_h = lq_img.size
+                # Ensure images are large enough for the crop
+                if img_w >= self.patch_size and img_h >= self.patch_size:
+                    if self.crop_mode == 'random':
+                        i, j, h, w = T.RandomCrop.get_params(
+                            lq_img, (self.patch_size, self.patch_size)
+                        )
+                        lq_patch = T.functional.crop(lq_img, i, j, h, w)
+                        hq_patch = T.functional.crop(hq_img, i, j, h, w)
+                    elif self.crop_mode == 'center':
+                        i = (img_h - self.patch_size) // 2
+                        j = (img_w - self.patch_size) // 2
+                        h = w = self.patch_size
+                        lq_patch = T.functional.crop(lq_img, i, j, h, w)
+                        hq_patch = T.functional.crop(hq_img, i, j, h, w)
+                    # elif self.crop_mode == 'none':
+                    #     pass # Keep full image if mode is 'none'
+                else:
+                    # Log warning but continue with the smaller image (no crop applied)
+                    logger.warning(
+                        f"FastDataset: Image {meta['base']} ({img_w}x{img_h}) is smaller than "
+                        f"patch size {self.patch_size}. Skipping crop for this item."
+                    )
+            # --- END CROPPING LOGIC ---
+
+            # --- APPLY AUGMENTATION (FLIPS) INDEPENDENTLY ---
+            if self.augment and self.augment_tf: # Check self.augment flag
                 seed = torch.randint(0, 2**32, (1,)).item()
                 torch.manual_seed(seed)
                 lq_patch = self.augment_tf(lq_patch)
                 torch.manual_seed(seed)
                 hq_patch = self.augment_tf(hq_patch)
-            
-            # Convert to tensors
+            # --- END AUGMENTATION ---
+
+            # Convert PIL patches to tensors and normalize
             lq_tensor = self.final_tf(lq_patch)
             hq_tensor = self.final_tf(hq_patch)
-            
+
             result = {
                 "lq": lq_tensor,
                 "hq": hq_tensor,
                 "crf": torch.tensor([meta["crf"]], dtype=torch.float32),
                 "preset": torch.tensor([meta["preset"]], dtype=torch.float32),
             }
-            
+
             if self.return_metadata:
                 result["lq_path"] = str(meta["lq"])
                 result["base_name"] = meta["base"]
-            
+
             return result
-            
+
         except Exception as e:
-            logger.warning(f"Error loading at index {idx}: {e}. Resampling.")
-            return self.__getitem__(torch.randint(0, len(self), (1,)).item())
+            logger.warning(f"Error loading FastDataset sample at index {idx} ({meta['lq']}): {e}. Resampling.")
+            # Load random sample to prevent training crash
+            random_idx = torch.randint(0, len(self), (1,)).item()
+            return self.__getitem__(random_idx)
     
     # Utility methods (same as AV1Dataset)
     def get_crf_distribution(self) -> Dict[int, int]:

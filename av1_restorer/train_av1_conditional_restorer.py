@@ -485,6 +485,7 @@ class ConditionalUNetTrainer:
             lq_root_dir=data_cfg['train_lq_root'],
             hq_root_dir=data_cfg['train_hq_root'],
             cached_image_pairs=cached_train_image_pairs,
+            crop_mode='random',
             augment=True,
             **common_args
         )
@@ -493,6 +494,7 @@ class ConditionalUNetTrainer:
             lq_root_dir=data_cfg['val_lq_root'],
             hq_root_dir=data_cfg['val_hq_root'],
             cached_image_pairs=cached_val_image_pairs,
+            crop_mode='center',
             augment=False,
             **common_args
         )

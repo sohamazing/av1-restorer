@@ -493,6 +493,7 @@ class NonConditionalTrainer:
             lq_root_dir=data_cfg['train_lq_root'],
             hq_root_dir=data_cfg['train_hq_root'],
             cached_image_pairs=cached_train,
+            crop_mode='random',
             augment=True,
             **common_args
         )
@@ -501,6 +502,7 @@ class NonConditionalTrainer:
             lq_root_dir=data_cfg['val_lq_root'],
             hq_root_dir=data_cfg['val_hq_root'],
             cached_image_pairs=cached_val,
+            crop_mode='center',
             augment=False,
             **common_args
         )
@@ -514,15 +516,25 @@ class NonConditionalTrainer:
         pin_memory = (self.device.type == 'cuda')
         
         train_loader = DataLoader(
-            train_dset, batch_size=batch_size, shuffle=True,
-            num_workers=num_workers, pin_memory=pin_memory, drop_last=True,
-            persistent_workers=(num_workers > 0), prefetch_factor=4 if num_workers > 0 else None
+            train_dset, 
+            batch_size=batch_size, 
+            shuffle=True, 
+            drop_last=True,
+            num_workers=num_workers, 
+            pin_memory=pin_memory, 
+            persistent_workers=(num_workers > 0), 
+            prefetch_factor=4 if num_workers > 0 else None
         )
         
         val_loader = DataLoader(
-            val_dset, batch_size=batch_size * 2, shuffle=False,
-            num_workers=max(2, num_workers // 2), pin_memory=pin_memory, drop_last=False,
-            persistent_workers=(num_workers > 0), prefetch_factor=2 if num_workers > 0 else None
+            val_dset, 
+            batch_size=batch_size * 2, 
+            shuffle=False, 
+            drop_last=False,
+            num_workers=max(2, num_workers // 2), 
+            pin_memory=pin_memory, 
+            persistent_workers=(num_workers > 0), 
+            prefetch_factor=2 if num_workers > 0 else None
         )
         
         logger.info(f"Dataloaders: {len(train_dset):,} train, {len(val_dset):,} val")
