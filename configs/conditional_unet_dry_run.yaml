@@ -16,8 +16,8 @@
 # Project & Logging
 # ------------------------------------------------------------------------------
 project:
-  name: "AV1-Conditional-UNet"
-  experiment_name: "conditional_dry_run_test"
+  name: "AV1-Restorer"
+  experiment_name: "conditional_unet_dry_run"
   log_to_wandb: false  # Disable for quick testing
 
 # ------------------------------------------------------------------------------
@@ -118,7 +118,7 @@ training:
 # Checkpointing
 # ------------------------------------------------------------------------------
 checkpoint:
-  dir: "./checkpoints/conditional_dry_run_test/"
+  dir: "./checkpoints/conditional_unet_dry_run/"
   save_every_n_epochs: 0  # Only save at validation
 
 # ------------------------------------------------------------------------------

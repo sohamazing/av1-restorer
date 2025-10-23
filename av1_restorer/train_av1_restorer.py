@@ -1073,7 +1073,7 @@ class UniversalRestorerTrainer:
                 }
                 wandb_epoch_log['epoch/avg_total_loss'] = avg_epoch_loss
                 # Log these average values against the epoch number
-                wandb.log(wandb_epoch_log, step=epoch + 1)
+                wandb.log(wandb_epoch_log, step=self.global_step)   # epoch+1
         else:
             logger.warning(f"Epoch {epoch+1}/{total_epochs_in_stage} | Train loader was empty. No training occurred.")
 

@@ -26,8 +26,8 @@
 # Project & Logging
 # ------------------------------------------------------------------------------
 project:
-  name: "AV1-Conditional-UNet"
-  experiment_name: "conditional_unet_base_fullrange"
+  name: "AV1-Restorer"
+  experiment_name: "conditional_unet_base"
   log_to_wandb: true  # Recommended for long training runs
 
 # ------------------------------------------------------------------------------
@@ -35,16 +35,22 @@ project:
 # ------------------------------------------------------------------------------
 data:
   # Training data (1000-3000 images recommended for universal model)
-  train_lq_root: "~/av1_data/train/lq"
-  train_hq_root: "~/av1_data/train/hq"
+  train_lq_root: "./av1_data/train/lq"
+  train_hq_root: "./av1_data/train/hq"
   
   # Validation data (200-500 images recommended)
-  val_lq_root: "~/av1_data/val/lq"
-  val_hq_root: "~/av1_data/val/hq"
-  
+  val_lq_root: "./av1_data/val/lq"
+  val_hq_root: "./av1_data/val/hq"
+
   # File formats
-  lq_ext: ".avif"  # Use .npy for faster loading if available
+  lq_ext: ".avif"
   hq_ext: ".png"
+
+  # # Use .npy for faster loading if available (however, .npy with gcsfuse is slower)
+  # train_lq_root: "~/gcs_data/av1_data/train/lq"
+  # train_hq_root: "~/gcs_data/av1_data/train/hq"
+  # val_lq_root: "~/gcs_data/av1_data/val/lq"
+  # val_hq_root: "~/gcs_data/av1_data_npy/val/hq"
   # lq_ext: ".npy"
   # hq_ext: ".npy"
 
@@ -160,7 +166,7 @@ scheduler:
 # ------------------------------------------------------------------------------
 training:
   grad_clip_norm: 1.0                # Gradient clipping (stability)
-  validate_every_n_epochs: 5         # Less frequent for long training
+  validate_every_n_epochs: 1         # Less frequent for long training
   num_val_samples_to_log: 4          # W&B visual samples
   
   # EMA settings (under 'training' in old script format)
@@ -171,8 +177,8 @@ training:
 # Checkpointing
 # ------------------------------------------------------------------------------
 checkpoint:
-  dir: "./checkpoints/conditional_unet_base_fullrange/"
-  save_every_n_epochs: 10  # Periodic saves (long training = more frequent)
+  dir: "./checkpoints/conditional_unet_base/"
+  save_every_n_epochs: 1  # Periodic saves (long training = more frequent)
 
 # ------------------------------------------------------------------------------
 # System Configuration

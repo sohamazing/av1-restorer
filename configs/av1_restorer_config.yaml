@@ -35,18 +35,22 @@ project:
 # ------------------------------------------------------------------------------
 data:
   # Training data (~800-2000 images recommended)
-  train_lq_root: "~/av1_data_npy/train/lq"
-  train_hq_root: "~/av1_data_npy/train/hq"
+  # train_lq_root: "~/av1_data_npy/train/lq"
+  # train_hq_root: "~/av1_data_npy/train/hq"
+  train_lq_root: "./av1_data/train/lq"
+  train_hq_root: "./av1_data/train/hq"
   
   # Validation data (~100-200 images recommended)
-  val_lq_root: "~/av1_data_npy/val/lq"
-  val_hq_root: "~/av1_data_npy/val/hq"
+  # val_lq_root: "~/av1_data_npy/val/lq"
+  # val_hq_root: "~/av1_data_npy/val/hq"
+  val_lq_root: "./av1_data/val/lq"
+  val_hq_root: "./av1_data/val/hq"
   
   # File formats (use .npy for 10-20× faster loading)
-  lq_ext: ".npy"
-  hq_ext: ".npy"
-  # lq_ext: ".avif"  # Use if you haven't pre-processed to .npy
-  # hq_ext: ".png"
+  # lq_ext: ".npy"
+  # hq_ext: ".npy"
+  lq_ext: ".avif"  # Use if you haven't pre-processed to .npy
+  hq_ext: ".png"
 
 # ------------------------------------------------------------------------------
 # Dataset Parameters
@@ -185,9 +189,9 @@ checkpoint:
 # ------------------------------------------------------------------------------
 system:
   num_workers: 8          # Data loading workers (8-12 recommended for GPU)
-  device: "auto"          # Auto-detect: cuda > mps > cpu
+  # device: "auto"          # Auto-detect: cuda > mps > cpu
   # device: "cuda"        # Force specific device
-  # device: "mps"         # Apple Silicon
+  device: "mps"         # Apple Silicon
   mixed_precision: true   # Enable AMP (2× speedup, minimal quality loss)
   seed: 42                # Random seed for reproducibility
 
@@ -215,7 +219,7 @@ system:
 #    d. At inference, select model based on input CRF
 #
 # 5. Resume Training:
-#    python train_av1_restorer.py --config this_config.yaml --resume latest
+#    python train_av1_restorer.py --config this_config.yaml --resume latest --wand_id xxxxxx
 #    python train_av1_restorer.py --config this_config.yaml --resume best
 #
 # 6. Performance Expectations (RTX 3060, 1080p):

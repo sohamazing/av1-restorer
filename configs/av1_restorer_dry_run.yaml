@@ -1,120 +1,168 @@
 # ==============================================================================
-# Dry Run Configuration for Universal AV1 Restorer (trin_av1_restorer.py)
+# Dry Run Configuration - Universal AV1 Restorer Trainer
 # ==============================================================================
-# This is a minimal config for testing the trainer script setup.
-# Runs 2 stages, 1 epoch each, using patches large enough for MS-SSIM testing.
-# Uses the list-of-dictionaries format for 'curriculum'.
+# Purpose: Quick validation of training pipeline setup
+# Usage:   python train_av1_restorer.py --config configs/av1_restorer_dry_run.yaml
+#
+# This minimal config runs 2 short stages to verify:
+#   ✓ Dataset loading and caching
+#   ✓ Model initialization
+#   ✓ Forward/backward passes
+#   ✓ Loss computation (including MS-SSIM)
+#   ✓ Validation loop
+#   ✓ Checkpointing
+#   ✓ Resume functionality (test with --resume latest)
+#
+# Expected runtime: 2-5 minutes on GPU, 10-15 minutes on CPU
+# ==============================================================================
 
 # ------------------------------------------------------------------------------
-# Project & Logging Settings
+# Project & Logging
 # ------------------------------------------------------------------------------
 project:
-  name: "AV1-Restorer"                   # Project name
-  experiment_name: "universal_dry_run_test" # Updated name
-  log_to_wandb: false                   # Disable W&B logging for quick tests
-  # log_to_wandb: true
+  name: "AV1-Restorer"
+  experiment_name: "dry_run"
+  log_to_wandb: false  # Disable W&B for faster testing
 
 # ------------------------------------------------------------------------------
-# Data Paths & Format (Ensure these paths are accessible for the test)
+# Data Paths (Update these to match your setup)
 # ------------------------------------------------------------------------------
 data:
-  # --- Training Data ---
+  # Training data
   train_lq_root: "~/av1_data/train/lq"
   train_hq_root: "~/av1_data/train/hq"
-
-  # --- Validation Data ---
+  
+  # Validation data
   val_lq_root: "~/av1_data/val/lq"
   val_hq_root: "~/av1_data/val/hq"
-
-  # --- File Extensions ---
-  lq_ext: ".avif"      # Use .avif for testing standard dataset loading
+  
+  # File formats
+  lq_ext: ".avif"  # Standard AVIF loading (slow but compatible)
   hq_ext: ".png"
-  # lq_ext: ".npy"     # Or use .npy if testing the fast dataset path
+  # lq_ext: ".npy"  # Uncomment for fast pre-processed data
   # hq_ext: ".npy"
 
 # ------------------------------------------------------------------------------
 # Dataset Parameters
 # ------------------------------------------------------------------------------
 dataset:
-  crf_range: [23, 63]    # Use full range even for dry run to test filtering
-  preset_range: [4, 4]   # Keep preset simple for testing
-  norm_range: [-1, 1]
+  crf_range: [23, 63]     # Full range (filters at dataset level)
+  preset_range: [4, 4]    # Single preset for simplicity
+  norm_range: [-1, 1]     # Standard normalization
 
 # ------------------------------------------------------------------------------
-# Training Curriculum (v3.0 Format) - UPDATED FOR MS-SSIM
+# Training Curriculum (New Format: List of Stage Dictionaries)
 # ------------------------------------------------------------------------------
-# List of stage dictionaries. Each dictionary defines one stage.
 curriculum:
-  # --- Stage 1 ---
-  - patch_size: 224        # Minimum safe size for MS-SSIM
-    batch_size: 4          # Reduced batch size for larger patch
+  # Stage 1: Small patches, quick test
+  - patch_size: 224       # Minimum safe size for MS-SSIM (needs ≥160px)
+    batch_size: 4
     epochs: 1
-
-  # --- Stage 2 ---
-  - patch_size: 256        # Keep patch size same or slightly larger if needed
-    batch_size: 2          # Keep batch size small
+    # crf_range: [34, 43]  # Optional: Override global CRF range per stage
+  
+  # Stage 2: Larger patches to test memory/tiling
+  - patch_size: 256
+    batch_size: 2
     epochs: 1
 
 # ------------------------------------------------------------------------------
 # Model Configuration
 # ------------------------------------------------------------------------------
 model:
-  type: "nano_unet"       # Test with one model type
-  size: "tiny"           # Use a small size for faster loading/testing
+  type: "nano_unet"  # Fast, lightweight model for testing
+  # type: "unet"     # Test conditional model (requires crf/preset inputs)
+  size: "tiny"       # Smallest variant for fastest loading
 
 # ------------------------------------------------------------------------------
-# Loss Function Configuration - ENABLE MORE LOSSES FOR TESTING
+# Loss Functions (Enable multiple to test all components)
 # ------------------------------------------------------------------------------
 loss:
-  charbonnier: {enabled: true, weight: 1.0, params: {eps: 0.001}}
-  perceptual: {enabled: true, weight: 0.01, params: {network: 'vgg'}}
-  ms_ssim: {enabled: true, weight: 0.1, params: {}} # MS-SSIM enabled
-  l1: {enabled: false, weight: 1.0, params: {}}
-  l2: {enabled: false, weight: 1.0, params: {}}
-  frequency: {enabled: false, weight: 0.05, params: {alpha: 1.0}}
+  charbonnier:
+    enabled: true
+    weight: 1.0
+    params: {eps: 0.001}
+  
+  perceptual:
+    enabled: true   # Test VGG perceptual loss
+    weight: 0.01
+    params: {network: 'vgg'}
+  
+  ms_ssim:
+    enabled: true   # Test MS-SSIM (requires patch_size ≥ 160)
+    weight: 0.1
+    params: {}
+  
+  l1:
+    enabled: false
+    weight: 1.0
+    params: {}
+  
+  frequency:
+    enabled: false  # Optionally test FFT loss
+    weight: 0.05
+    params: {alpha: 1.0}
 
 # ------------------------------------------------------------------------------
-# Optimizer Configuration
+# Optimizer
 # ------------------------------------------------------------------------------
 optimizer:
   type: "adamw"
   lr: 1.0e-4
   weight_decay: 1.0e-4
   betas: [0.9, 0.999]
-  use_ema: false
+  use_ema: false    # Disable EMA for faster dry run
   ema_decay: 0.9999
 
 # ------------------------------------------------------------------------------
-# Learning Rate Scheduler Configuration
+# Learning Rate Scheduler
 # ------------------------------------------------------------------------------
 scheduler:
   type: "cosine"
   min_lr: 1.0e-6
-  warmup_steps: 10       # Very short warmup for dry run
+  warmup_steps: 10  # Very short warmup for dry run
 
 # ------------------------------------------------------------------------------
-# Training Loop Parameters
+# Training Loop
 # ------------------------------------------------------------------------------
 training:
   grad_clip_norm: 1.0
-  validate_every_n_epochs: 1 # Validate after each epoch (end of each stage)
-  num_val_samples_to_log: 2 # Log fewer samples
-  log_every_n_steps: 10     # Log more frequently for dry run
+  validate_every_n_epochs: 1   # Validate at end of each stage
+  num_val_samples_to_log: 2    # Minimal samples for faster logging
+  log_every_n_steps: 5         # Frequent logging to catch issues
 
 # ------------------------------------------------------------------------------
-# Checkpoint Settings
+# Checkpointing
 # ------------------------------------------------------------------------------
 checkpoint:
-  dir: "./checkpoints/universal_dry_run_test_ms_ssim/" # Updated dir
-  save_every_n_epochs: 0 # Disable periodic saving, only save at end/best
+  dir: "./checkpoints/dry_run/"
+  save_every_n_epochs: 0  # Only save at validation/end (no periodic saves)
 
 # ------------------------------------------------------------------------------
-# System / Hardware Configuration
+# System Configuration
 # ------------------------------------------------------------------------------
 system:
-  num_workers: 2         # Reduce workers for faster startup/less overhead
-  device: "mps"          # Keep your target device
+  num_workers: 2         # Reduce workers for faster startup
+  device: "auto"         # Auto-detect: cuda > mps > cpu
+  # device: "mps"        # Force specific device if needed
   # device: "cuda"
   # device: "cpu"
-  mixed_precision: true  # Keep AMP setting to test it
+  mixed_precision: true  # Test AMP
   seed: 42
+
+# ==============================================================================
+# Expected Output
+# ==============================================================================
+# If successful, you should see:
+#   ✓ Config loaded
+#   ✓ Device detected (CUDA/MPS/CPU)
+#   ✓ Model initialized (~0.8M params for nano_unet tiny)
+#   ✓ Dataset indexed (with caching logs)
+#   ✓ Training Stage 1: 1 epoch progress bar
+#   ✓ Validation metrics logged
+#   ✓ Training Stage 2: 1 epoch progress bar
+#   ✓ Final validation
+#   ✓ Checkpoints saved: best.pth, stage_01_complete.pth, stage_02_complete.pth
+#
+# Test resume with:
+#   python train_av1_restorer.py --config configs/av1_restorer_dry_run.yaml --resume latest
+# ==============================================================================
