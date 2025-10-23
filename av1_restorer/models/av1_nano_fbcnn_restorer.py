@@ -256,7 +256,7 @@ class AV1FBCNNRestorer(nn.Module):
 # SECTION 3: Model Factory
 # ==============================================================================
 
-def create_av1_fbcnn_restorer(
+def create_av1_nano_fbcnn_restorer(
     size: str = 'small', 
     crf_min: int = 23, 
     crf_max: int = 33, 

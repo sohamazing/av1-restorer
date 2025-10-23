@@ -17,7 +17,7 @@ Author: Soham Mukherjee
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple, List
+from typing import Tuple, List, Union
 
 import logging
 logger = logging.getLogger(__name__)
@@ -179,6 +179,50 @@ class SimpleSelfAttention(nn.Module):
 # ==============================================================================
 # SECTION 2: Conditioning Modules
 # ==============================================================================
+class CRFConditioningEmbedder(nn.Module):
+    """
+    Embeds ONLY CRF values into a conditioning vector.
+    
+    Args:
+        crf_min, crf_max: CRF normalization range (default: 23-63)
+    
+    Output: [B, 128] CRF embedding
+    """
+    def __init__(
+        self,
+        crf_min: float = 23.0,
+        crf_max: float = 63.0,
+    ):
+        super().__init__()
+        self.crf_min = crf_min
+        self.crf_max = crf_max
+        
+        # CRF embedder: 1 -> 64 -> 128
+        self.crf_embedder = nn.Sequential(
+            nn.Linear(1, 64),
+            nn.GELU(),
+            nn.Linear(64, 128)
+        )
+    
+    def forward(self, crf: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            crf: [B, 1] range [crf_min, crf_max]
+        
+        Returns:
+            [B, 128] combined embedding
+        """
+        # Normalize to [0, 1]
+        crf_range = self.crf_max - self.crf_min
+        crf_norm = (crf - self.crf_min) / crf_range if crf_range > 0 else torch.zeros_like(crf)
+        
+        # Embed
+        crf_emb = self.crf_embedder(crf_norm)  # [B, 128]
+
+        # CRITICAL: Clamp embeddings
+        crf_emb = torch.clamp(crf_emb, -10.0, 10.0)
+        
+        return crf_emb
 
 class ConditioningEmbedder(nn.Module):
     """
@@ -293,7 +337,362 @@ class FiLMLayer(nn.Module):
 # SECTION 3: Main U-Net Architecture
 # ==============================================================================
 
-class AV1UNetRestorer(nn.Module):
+class AV1ConditionalUNetCRF(nn.Module):
+    """
+    CRF-ONLY Conditional U-Net.
+    
+    This version is identical to AV1ConditionalUNet but ONLY conditions
+    on CRF, removing all 'preset' dependencies.
+    
+    cond_dim is 128 (from CRF) instead of 192 (CRF + Preset).
+    """
+    
+    def __init__(self, config: dict):
+        super().__init__()
+        
+        ch = config['channels']  # e.g., [24, 48, 96, 192, 256]
+        blocks = config['blocks']  # e.g., [2, 2, 3, 3, 6]
+        crf_range = config.get('crf_range', (23, 63))
+        norm_range = tuple(config.get('norm_range', (0, 1)))
+        self.clamp_min, self.clamp_max = norm_range
+        cond_dim = 128  # Fixed: 128 (CRF-only)
+            
+        logger.info("="*60)
+        logger.info("Initializing AV1ConditionalUNetCRF") # <-- MODIFIED
+        logger.info(f"  Channels: {ch}")
+        logger.info(f"  Blocks: {blocks}")
+        logger.info(f"  CRF Range: {crf_range}")
+        logger.info(f"  Norm Range: [{self.clamp_min}, {self.clamp_max}]")
+        logger.info("="*60)
+        
+        # ===== CONDITIONING SYSTEM =====
+        # --- MODIFIED ---
+        self.conditioning_embedder = CRFConditioningEmbedder(
+            crf_min=crf_range[0],
+            crf_max=crf_range[1]
+        )
+        # --- END MODIFIED ---
+        
+        # ===== INPUT HEAD (Level 0) =====
+        self.head = nn.Sequential(
+            nn.Conv2d(3, ch[0], kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(ch[0]),
+            nn.GELU(),
+            *[EfficientResBlock(ch[0]) for _ in range(blocks[0])]
+        )
+        
+        # ===== ENCODER =====
+        # All FiLM layers are now created with cond_dim=128
+        self.encoder1 = self._build_encoder_level(ch[0], ch[1], blocks[1], cond_dim)
+        self.encoder2 = self._build_encoder_level(ch[1], ch[2], blocks[2], cond_dim)
+        self.encoder3 = self._build_encoder_level(ch[2], ch[3], blocks[3], cond_dim)
+        
+        # ===== BOTTLENECK =====
+        self.bottleneck_down = nn.Conv2d(ch[3], ch[4], kernel_size=3, stride=2, padding=1, bias=False)
+        self.bottleneck_bn = nn.BatchNorm2d(ch[4])
+        
+        self.bottleneck_pre_attn = nn.Sequential(
+            *[EfficientResBlock(ch[4]) for _ in range(blocks[4] // 2)]
+        )
+        self.bottleneck_film1 = FiLMLayer(cond_dim, ch[4]) # cond_dim=128
+        
+        self.bottleneck_attn = SimpleSelfAttention(ch[4])
+        
+        self.bottleneck_film2 = FiLMLayer(cond_dim, ch[4]) # cond_dim=128
+        self.bottleneck_post_attn = nn.Sequential(
+            *[EfficientResBlock(ch[4]) for _ in range(blocks[4] // 2)]
+        )
+        
+        # ===== DECODER =====
+        self.decoder3 = self._build_decoder_level(ch[4], ch[3], blocks[3])
+        self.decoder2 = self._build_decoder_level(ch[3], ch[2], blocks[2])
+        self.decoder1 = self._build_decoder_level(ch[2], ch[1], blocks[1])
+        
+        # ===== OUTPUT TAIL =====
+        self.tail_up = nn.ConvTranspose2d(ch[1], ch[0], kernel_size=2, stride=2, bias=False)
+        self.tail_bn = nn.BatchNorm2d(ch[0])
+        self.tail_fusion = nn.Conv2d(ch[0] * 2, ch[0], kernel_size=1, bias=False)
+        self.tail_body = nn.Sequential(
+            *[EfficientResBlock(ch[0]) for _ in range(blocks[0])]
+        )
+        self.tail_pred = nn.Conv2d(ch[0], 3, kernel_size=3, padding=1)
+        
+        self._init_weights()
+        
+        total_params = sum(p.numel() for p in self.parameters())
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        logger.info(f"✓ Model initialized (CRF-Only)")
+        logger.info(f"  Total parameters: {total_params:,} ({total_params/1e6:.2f}M)")
+        logger.info(f"  Trainable parameters: {trainable_params:,} ({trainable_params/1e6:.2f}M)")
+        logger.info("="*60)
+
+    # _build_encoder_level, _build_decoder_level, _init_weights are inherited
+    # We can just copy them for simplicity, or rely on inheritance.
+    # For a self-contained class, let's copy them.
+    
+    def _build_encoder_level(self, in_ch: int, out_ch: int, num_blocks: int, cond_dim: int) -> nn.ModuleDict:
+        return nn.ModuleDict({
+            'downsample': nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=2, padding=1, bias=False),
+                nn.BatchNorm2d(out_ch),
+                nn.GELU()
+            ),
+            'body': nn.Sequential(
+                *[EfficientResBlock(out_ch) for _ in range(num_blocks)]
+            ),
+            'film': FiLMLayer(cond_dim, out_ch) # cond_dim will be 128
+        })
+
+    def _build_decoder_level(self, in_ch: int, out_ch: int, num_blocks: int) -> nn.ModuleDict:
+        return nn.ModuleDict({
+            'upsample': nn.ConvTranspose2d(in_ch, out_ch, kernel_size=2, stride=2, bias=False),
+            'upsample_bn': nn.BatchNorm2d(out_ch),
+            'fusion': nn.Sequential(
+                nn.Conv2d(out_ch * 2, out_ch, kernel_size=1, bias=False),
+                nn.BatchNorm2d(out_ch),
+                nn.GELU()
+            ),
+            'body': nn.Sequential(
+                *[EfficientResBlock(out_ch) for _ in range(num_blocks)]
+            )
+        })
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d) or isinstance(m, nn.ConvTranspose2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=0.5)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        
+        nn.init.zeros_(self.tail_pred.weight)
+        nn.init.zeros_(self.tail_pred.bias)
+        logger.info("✓ Weights initialized (tail_pred zeroed for residual learning)")
+
+    # --- MODIFIED forward ---
+    def forward(self, lq_image: torch.Tensor, crf: torch.Tensor) -> torch.Tensor:
+        """
+        Full forward pass through the network (CRF-Only).
+        
+        Args:
+            lq_image: [B, 3, H, W] Low-quality compressed image
+            crf: [B, 1] CRF value, range [23, 63]
+        
+        Returns:
+            [B, 3, H, W] Restored image
+        """
+        # ===== 1. GENERATE CONDITIONING VECTOR =====
+        cond = self.conditioning_embedder(crf)  # [B, 128] <-- MODIFIED
+        
+        # ===== 2. ENCODER PATH =====
+        skip0 = self.head(lq_image)
+        
+        e1 = self.encoder1['downsample'](skip0)
+        e1 = self.encoder1['body'](e1)
+        e1 = self.encoder1['film'](e1, cond)
+        skip1 = e1
+        
+        e2 = self.encoder2['downsample'](skip1)
+        e2 = self.encoder2['body'](e2)
+        e2 = self.encoder2['film'](e2, cond)
+        skip2 = e2
+        
+        e3 = self.encoder3['downsample'](skip2)
+        e3 = self.encoder3['body'](e3)
+        e3 = self.encoder3['film'](e3, cond)
+        skip3 = e3
+        
+        # ===== 3. BOTTLENECK =====
+        b = self.bottleneck_down(skip3)
+        b = F.gelu(self.bottleneck_bn(b))
+        
+        b = self.bottleneck_pre_attn(b)
+        b = self.bottleneck_film1(b, cond)
+        
+        b = self.bottleneck_attn(b)
+        
+        b = self.bottleneck_film2(b, cond)
+        b = self.bottleneck_post_attn(b)
+        
+        # ===== 4. DECODER PATH =====
+        d3 = self.decoder3['upsample'](b)
+        d3 = F.gelu(self.decoder3['upsample_bn'](d3))
+        d3 = torch.cat([d3, skip3], dim=1)
+        d3 = self.decoder3['fusion'](d3)
+        d3 = self.decoder3['body'](d3)
+        
+        d2 = self.decoder2['upsample'](d3)
+        d2 = F.gelu(self.decoder2['upsample_bn'](d2))
+        d2 = torch.cat([d2, skip2], dim=1)
+        d2 = self.decoder2['fusion'](d2)
+        d2 = self.decoder2['body'](d2)
+        
+        d1 = self.decoder1['upsample'](d2)
+        d1 = F.gelu(self.decoder1['upsample_bn'](d1))
+        d1 = torch.cat([d1, skip1], dim=1)
+        d1 = self.decoder1['fusion'](d1)
+        d1 = self.decoder1['body'](d1)
+        
+        # ===== 5. OUTPUT TAIL =====
+        t = self.tail_up(d1)
+        t = F.gelu(self.tail_bn(t))
+        t = torch.cat([t, skip0], dim=1)
+        t = self.tail_fusion(t)
+        t = self.tail_body(t)
+        residual = self.tail_pred(t)
+        
+        # ===== 6. RESIDUAL LEARNING =====
+        restored = lq_image + residual
+        restored = torch.clamp(restored, self.clamp_min, self.clamp_max)
+        
+        return restored
+
+    # --- MODIFIED inference ---
+    @torch.no_grad()
+    def inference(
+        self,
+        lq_image: torch.Tensor,
+        crf: torch.Tensor,
+        tile_size: int = 512,
+        tile_overlap: int = 64,
+        center_crop: bool = False
+    ) -> torch.Tensor:
+        """
+        Memory-efficient tiled inference (CRF-Only).
+        
+        Args:
+            lq_image: [B, 3, H, W] Input image
+            crf: [B, 1] CRF value
+            tile_size: ...
+            tile_overlap: ...
+            center_crop: ...
+        
+        Returns:
+            [B, 3, H, W] Restored image
+        """
+        self.eval()
+        B, C, H, W = lq_image.shape
+        
+        # ===== MODE 1: CENTER CROP ONLY =====
+        if center_crop:
+            crop_h = min(tile_size, H)
+            crop_w = min(tile_size, W)
+            start_h = (H - crop_h) // 2
+            start_w = (W - crop_w) // 2
+            center_tile = lq_image[:, :, start_h:start_h+crop_h, start_w:start_w+crop_w]
+            
+            pad_h = (32 - crop_h % 32) % 32
+            pad_w = (32 - crop_w % 32) % 32
+            
+            if pad_h > 0 or pad_w > 0:
+                center_tile = F.pad(center_tile, (0, pad_w, 0, pad_h), mode='reflect')
+                output = self.forward(center_tile, crf) # <-- MODIFIED
+                output = output[:, :, :crop_h, :crop_w]
+            else:
+                output = self.forward(center_tile, crf) # <-- MODIFIED
+            return output
+        
+        # ===== MODE 2: SMALL IMAGE (FITS IN SINGLE TILE) =====
+        if H <= tile_size and W <= tile_size:
+            pad_h = (32 - H % 32) % 32
+            pad_w = (32 - W % 32) % 32
+            
+            if pad_h > 0 or pad_w > 0:
+                lq_padded = F.pad(lq_image, (0, pad_w, 0, pad_h), mode='reflect')
+                output = self.forward(lq_padded, crf) # <-- MODIFIED
+                return output[:, :, :H, :W]
+            else:
+                return self.forward(lq_image, crf) # <-- MODIFIED
+        
+        # ===== MODE 3: LARGE IMAGE (REQUIRES TILING) =====
+        logger.info(f"Tiled inference: {H}×{W} image → {tile_size}×{tile_size} tiles (overlap: {tile_overlap}px)")
+        
+        output = torch.zeros_like(lq_image)
+        weight = torch.zeros_like(lq_image)
+        
+        stride = tile_size - tile_overlap
+        h_tiles = (H + stride - 1) // stride
+        w_tiles = (W + stride - 1) // stride
+        
+        for i in range(h_tiles):
+            for j in range(w_tiles):
+                h_start = i * stride
+                w_start = j * stride
+                h_end = min(h_start + tile_size, H)
+                w_end = min(w_start + tile_size, W)
+                
+                tile = lq_image[:, :, h_start:h_end, w_start:w_end]
+                tile_h, tile_w = tile.shape[2:]
+                
+                pad_h = (32 - tile_h % 32) % 32
+                pad_w = (32 - tile_w % 32) % 32
+                
+                if pad_h > 0 or pad_w > 0:
+                    tile_padded = F.pad(tile, (0, pad_w, 0, pad_h), mode='reflect')
+                    restored_tile = self.forward(tile_padded, crf) # <-- MODIFIED
+                    restored_tile = restored_tile[:, :, :tile_h, :tile_w]
+                else:
+                    restored_tile = self.forward(tile, crf) # <-- MODIFIED
+                
+                blend = self._create_blend_mask(
+                    tile_h, tile_w, tile_overlap,
+                    is_top=(i == 0), is_bottom=(h_end >= H),
+                    is_left=(j == 0), is_right=(w_end >= W),
+                    device=lq_image.device
+                )
+                
+                output[:, :, h_start:h_end, w_start:w_end] += restored_tile * blend
+                weight[:, :, h_start:h_end, w_start:w_end] += blend
+        
+        output = output / (weight + 1e-8)
+        return output
+
+    # _create_blend_mask is identical, so we can copy it
+    def _create_blend_mask(
+        self,
+        tile_h: int,
+        tile_w: int,
+        overlap: int,
+        is_top: bool,
+        is_bottom: bool,
+        is_left: bool,
+        is_right: bool,
+        device: torch.device
+    ) -> torch.Tensor:
+        
+        blend = torch.ones(1, 1, tile_h, tile_w, device=device)
+        fade = min(overlap // 2, 32)
+        
+        if not is_top:
+            fade_h = min(fade, tile_h)
+            ramp = torch.linspace(0, 1, fade_h, device=device).view(-1, 1)
+            blend[:, :, :fade_h, :] *= ramp
+        
+        if not is_bottom:
+            fade_h = min(fade, tile_h)
+            ramp = torch.linspace(1, 0, fade_h, device=device).view(-1, 1)
+            blend[:, :, -fade_h:, :] *= ramp
+        
+        if not is_left:
+            fade_w = min(fade, tile_w)
+            ramp = torch.linspace(0, 1, fade_w, device=device).view(1, -1)
+            blend[:, :, :, :fade_w] *= ramp
+        
+        if not is_right:
+            fade_w = min(fade, tile_w)
+            ramp = torch.linspace(1, 0, fade_w, device=device).view(1, -1)
+            blend[:, :, :, -fade_w:] *= ramp
+            
+        return blend
+
+
+class AV1ConditionalUNet(nn.Module):
     """
     Complete AV1 artifact removal U-Net with FiLM conditioning.
     
@@ -332,7 +731,7 @@ class AV1UNetRestorer(nn.Module):
         cond_dim = 192  # Fixed: 128 (CRF) + 64 (Preset)
             
         logger.info("="*60)
-        logger.info("Initializing AV1UNetRestorer")
+        logger.info("Initializing AV1ConditionalUNet")
         logger.info(f"  Channels: {ch}")
         logger.info(f"  Blocks: {blocks}")
         logger.info(f"  CRF Range: {crf_range}")
@@ -737,7 +1136,7 @@ class AV1UNetRestorer(nn.Module):
         return blend
 
 # ==============================================================================
-# SECTION 4: Model Factory
+# SECTION 4: Unified Model Factory
 # ==============================================================================
 
 def create_av1_restorer(
@@ -745,20 +1144,22 @@ def create_av1_restorer(
     crf_range: Tuple[int, int] = (23, 63),
     preset_range: Tuple[int, int] = (0, 8),
     norm_range: Tuple[int, int] = (-1, 1)
-) -> AV1UNetRestorer:
+) -> Union[AV1ConditionalUNet, AV1ConditionalUNetCRF]: # <-- Updated return type hint
     """
-    Factory function to create AV1UNetRestorer with predefined configurations.
+    Unified factory function for Conditional AV1 U-Net Restorers.
+
+    Automatically creates either:
+        - AV1ConditionalUNet (CRF+Preset): If preset_range has different min/max.
+        - AV1ConditionalUNetCRF: If preset_range has the same min/max.
+
     Args:
-        size: Model size variant
-          - 'tiny': ~4M params, fastest
-          - 'small': ~8M params, balanced
-          - 'base': ~12M params, recommended (default)
-          - 'large': ~20M params, best quality
+        size: Model size variant ('tiny', 'small', 'base', 'large')
         crf_range: (min, max) for CRF normalization
-        preset_range: (min, max) for Preset normalization
+        preset_range: (min, max) for Preset normalization (determines model type)
+        norm_range: (min, max) for output clamping
 
     Returns:
-        Initialized AV1UNetRestorer model
+        Initialized AV1ConditionalUNet or AV1ConditionalUNetCRF model.
     """
 
     configs = {
@@ -783,13 +1184,29 @@ def create_av1_restorer(
     if size not in configs:
         raise ValueError(f"Unknown size '{size}'. Choose from: {list(configs.keys())}")
 
-    config = configs[size]
+    # --- Prepare base config ---
+    config = configs[size].copy() # Use .copy() to avoid modifying the template
     config['crf_range'] = crf_range
-    config['preset_range'] = preset_range
     config['norm_range'] = norm_range
+    # preset_range is handled below
 
-    logger.info(f"Creating AV1UNetRestorer (size={size})")
-    return AV1UNetRestorer(config)
+    # --- Logic to select model type ---
+    if preset_range[0] == preset_range[1]:
+        # CRF-Only Mode
+        logger.info(
+            f"Preset range is single value ({preset_range[0]}). "
+            f"Creating AV1ConditionalUNetCRF (size={size})"
+        )
+        # Note: preset_range is NOT added to config for CRFOnly constructor
+        return AV1ConditionalUNetCRF(config)
+    else:
+        # Standard CRF + Preset Mode
+        logger.info(
+            f"Preset range is variable {preset_range}. "
+            f"Creating AV1ConditionalUNet (size={size})"
+        )
+        config['preset_range'] = preset_range # Add preset_range for standard constructor
+        return AV1ConditionalUNet(config)
 
 # ==============================================================================
 # SECTION 5: Example Usage & Testing
@@ -798,46 +1215,49 @@ def create_av1_restorer(
 if __name__ == "__main__":
     import logging
     logging.basicConfig(level=logging.INFO)
-    # Create model
-    model = create_av1_restorer(size='large', crf_range=(23, 63), preset_range=(0, 8))
-    model.eval()
+    model_size = 'tiny' # 'small', 'base', 'large'
 
-    # Test forward pass
-    batch_size = 2
-    lq = torch.randn(batch_size, 3, 256, 256)  # Random input
-    crf = torch.tensor([[35.0], [50.0]])  # Different CRF values
-    preset = torch.tensor([[4.0], [5.0]])  # Same preset
+    # --- Test Case 1: Standard CRF + Preset ---
+    print("\n--- Testing Standard Model (CRF + Preset) ---")
+    model_std = create_av1_restorer(
+        size=model_size,
+        crf_range=(23, 63),
+        preset_range=(0, 8), # Variable preset range
+        norm_range=(-1, 1)
+    )
+    print(f"Instantiated model type: {type(model_std).__name__}")
+    # (Optional: Add forward pass test for model_std if needed)
 
-    print(f"\nInput shapes:")
+    # --- Test Case 2: CRF-Only ---
+    print("\n--- Testing CRF-Only Model ---")
+    model_crf_only = create_av1_restorer(
+        size=model_size,
+        crf_range=(44, 53),
+        preset_range=(4, 4), # Single value preset range
+        norm_range=(0, 1)
+    )
+    print(f"Instantiated model type: {type(model_crf_only).__name__}")
+
+    # Test forward pass for CRF-Only model
+    batch_size = 1
+    lq = torch.randn(batch_size, 3, 128, 128)
+    crf = torch.tensor([[48.0]])
+
+    print(f"\nCRF-Only Input shapes:")
     print(f"  LQ: {lq.shape}")
     print(f"  CRF: {crf.shape} - values: {crf.squeeze().tolist()}")
-    print(f"  Preset: {preset.shape} - values: {preset.squeeze().tolist()}")
 
     with torch.no_grad():
-        restored = model(lq, crf, preset)
+        model_crf_only.eval() # Ensure model is in eval mode for testing
+        restored = model_crf_only(lq, crf) # Correctly call with only lq, crf
 
-    print(f"\nOutput:")
+    print(f"\nCRF-Only Output:")
     print(f"  Shape: {restored.shape}")
     print(f"  Range: [{restored.min():.3f}, {restored.max():.3f}]")
 
-    # Test tiled inference
-    print(f"\nTesting tiled inference on large image...")
-    lq_large = torch.randn(1, 3, 1024, 1024)
-    crf_large = torch.tensor([[40.0]])
-    preset_large = torch.tensor([[4.0]])
-
-    with torch.no_grad():
-        restored_large = model.inference(lq_large, crf_large, preset_large, tile_size=512, tile_overlap=32)
-
-    print(f"  Large input: {lq_large.shape}")
-    print(f"  Large output: {restored_large.shape}")
-    print(f"  Memory efficient: ✓")
-
-    # Count parameters
-    total = sum(p.numel() for p in model.parameters())
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"\nModel Statistics:")
-    print(f"  Total parameters: {total:,} ({total/1e6:.2f}M)")
-    print(f"  Trainable: {trainable:,} ({trainable/1e6:.2f}M)")
-    print(f"  Model size (FP32): ~{total * 4 / 1e6:.1f} MB")
-    print(f"  Model size (FP16): ~{total * 2 / 1e6:.1f} MB")
+    # --- Parameter Count Check (Example using the CRF-Only model) ---
+    print("\n--- Parameter Count Check (using CRF-Only 'tiny' model) ---")
+    total_params = sum(p.numel() for p in model_crf_only.parameters())
+    trainable_params = sum(p.numel() for p in model_crf_only.parameters() if p.requires_grad)
+    print(f"  Total parameters: {total_params:,} ({total_params/1e6:.2f}M)")
+    print(f"  Trainable parameters: {trainable_params:,} ({trainable_params/1e6:.2f}M)")

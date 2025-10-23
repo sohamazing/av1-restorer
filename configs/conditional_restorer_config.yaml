@@ -1,0 +1,212 @@
+# ==============================================================================
+# Config Template: Conditional AV1 U-Net Restorer
+# ==============================================================================
+# Script: train_conditional_unet.py
+# Purpose: Train the main conditional U-Net model (AV1ConditionalUNet or
+#          AV1ConditionalUNetCRF). This single model handles a wide range
+#          of CRF values (and optionally Presets) by using them as conditional inputs.
+# Mode Selection:
+#   - CRF+Preset Mode: Set dataset.preset_range to a range (e.g., [0, 8]).
+#   - CRF-Only Mode:   Set dataset.preset_range to a single value (e.g., [4, 4]).
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Project & Experiment Tracking (W&B)
+# ------------------------------------------------------------------------------
+project:
+  # Weights & Biases project name. Group experiments under this project.
+  name: "AV1-Restorer"
+  # A descriptive name for this specific training run.
+  # Recommendation: model-size_crf-range_conditioning-mode (e.g., base_crf23-63_full or base_crf23-63_crf-only)
+  experiment_name: "unet_base_crf23-63_full" # UPDATE: Reflect size, CRF range, mode.
+  # Set to true to log metrics, checkpoints, and samples to W&B.
+  log_to_wandb: true
+
+# ------------------------------------------------------------------------------
+# Data Paths (UPDATE TO YOUR DATASET LOCATIONS)
+# ------------------------------------------------------------------------------
+data:
+  # Path to the directory containing low-quality training images/NPYs.
+  train_lq_root: "./av1_data/train/lq"
+  # Path to the directory containing corresponding high-quality training images/NPYs.
+  train_hq_root: "./av1_data/train/hq"
+  # Path to the directory containing low-quality validation images/NPYs.
+  val_lq_root: "./av1_data/val/lq"
+  # Path to the directory containing corresponding high-quality validation images/NPYs.
+  val_hq_root: "./av1_data/val/hq"
+
+  # File extension for low-quality inputs. Use ".npy" if preprocessed for speed (highly recommended).
+  lq_ext: ".avif" # or ".npy"
+  # File extension for high-quality targets. Use ".npy" if preprocessed.
+  hq_ext: ".png" # or ".npy"
+
+# ------------------------------------------------------------------------------
+# Dataset Parameters
+# ------------------------------------------------------------------------------
+dataset:
+  # The full range of CRF values the model should learn to handle during training.
+  # For a general model, use the full expected range (e.g., 23-63).
+  crf_range: [23, 63]
+
+  # *** IMPORTANT: Controls which model variant is trained. ***
+  # - Set to a range with different min/max (e.g., [0, 8]) to train the standard CRF+Preset model.
+  #   The dataset loader will filter samples based on this range.
+  # - Set to a single value (e.g., [4, 4]) to train the CRF-Only model variant.
+  #   The dataset loader will filter samples to only include this preset.
+  preset_range: [0, 8] # UPDATE: Change to e.g., [4, 4] for CRF-Only training.
+
+  # Normalization applied to images before entering the model.
+  # [-1, 1] is common for GANs and many modern networks using activations like Tanh/LeakyReLU.
+  # [0, 1] is simpler, often used with Sigmoid outputs (though less common now).
+  norm_range: [-1, 1] # or [0, 1]
+
+# ------------------------------------------------------------------------------
+# Training Curriculum (Progressive Learning)
+# ------------------------------------------------------------------------------
+# Define stages with increasing patch sizes and potentially adjusted batch sizes/epochs.
+# Helps the model learn coarse features first, then refine details.
+curriculum:
+  # Stage 1: Smaller patches, typically larger batch size. Focus on basic structure.
+  - patch_size: 128
+    # Adjust based on GPU VRAM. U-Net models require more memory than Nano variants.
+    batch_size: 64 # Example, tune based on hardware (e.g., 16, 32, 64)
+    epochs: 150      # Number of epochs for this stage.
+
+  # Stage 2: Larger patches, smaller batch size. Focus on finer details.
+  - patch_size: 256
+    batch_size: 16    # Reduce significantly due to quadratic memory increase with patch size.
+    epochs: 100
+
+  # Stage 3: (Optional) Final fine-tuning on largest patches. Very small batch size.
+  # - patch_size: 512
+  #   batch_size: 4     # May require gradient accumulation or very large VRAM.
+  #   epochs: 50
+
+# ------------------------------------------------------------------------------
+# Model Configuration (Generator - Conditional U-Net Only)
+# ------------------------------------------------------------------------------
+model:
+  # Must be "unet" for this script. The factory function in the model file
+  # handles selecting the AV1ConditionalUNet or AV1ConditionalUNetCRF variant
+  # based on the `dataset.preset_range` setting above.
+  type: "unet"
+
+  # Select model size (complexity/parameter count).
+  # Affects speed, quality, VRAM usage, and training time.
+  # Options: "tiny", "small", "base", "large"
+  size: "base"
+
+# ------------------------------------------------------------------------------
+# Loss Function Configuration
+# ------------------------------------------------------------------------------
+# Define reconstruction losses and their weights. Total loss = sum(weight * component_loss).
+loss:
+  # Charbonnier Loss (Robust L1 variant)
+  charbonnier:
+    enabled: true     # Enable/disable this loss component.
+    weight: 1.0       # Contribution weight. Often the primary loss, set to 1.0.
+    params: {eps: 0.001} # Small epsilon for numerical stability near zero error.
+
+  # Perceptual Loss (VGG or LPIPS features)
+  perceptual:
+    enabled: true
+    weight: 0.01      # Tune carefully (e.g., 0.001 to 0.1). U-Net might tolerate higher weight than Nano.
+    params:
+      network: 'vgg'  # 'vgg' (faster, ImageNet features) or 'lpips' (learned perceptual metric).
+
+  # Multi-Scale Structural Similarity Index (Focuses on structure across scales)
+  ms_ssim:
+    enabled: false    # Can slow down training slightly.
+    weight: 0.1       # Contribution weight if enabled.
+    params: {}        # Uses default parameters.
+
+  # Frequency Domain Loss (e.g., L1 on FFT magnitudes)
+  frequency:
+    enabled: false
+    weight: 0.05      # Contribution weight if enabled.
+    params: {alpha: 1.0} # alpha=1.0 for magnitude only, 0.0 for phase only.
+
+  # Standard L1 / L2 (MSE) Losses (Usually disable if using Charbonnier)
+  l1: {enabled: false, weight: 1.0, params: {}}
+  l2: {enabled: false, weight: 1.0, params: {}}
+
+# ------------------------------------------------------------------------------
+# Optimizer Configuration (For the U-Net Generator)
+# ------------------------------------------------------------------------------
+optimizer: # NOTE: This section becomes 'optimizer_G' in the GAN config.
+  type: "adamw"         # AdamW recommended for transformer-like elements or general robustness.
+  lr: 1.0e-4          # Starting learning rate. U-Net often needs lower LR than smaller models. Tune based on batch size/stability.
+  weight_decay: 1.0e-4  # L2 regularization strength.
+  betas: [0.9, 0.999]   # Standard Adam momentum parameters.
+
+  # Exponential Moving Average (EMA) for model weights.
+  use_ema: true
+  ema_decay: 0.9999     # Decay factor (0.999 to 0.9999 common).
+
+# ------------------------------------------------------------------------------
+# Learning Rate Scheduler Configuration
+# ------------------------------------------------------------------------------
+scheduler: # NOTE: This section becomes 'scheduler_G' in the GAN config.
+  type: "cosine"      # Cosine annealing schedule.
+  min_lr: 1.0e-7      # Lower minimum LR allows for longer fine-tuning.
+  warmup_steps: 1000  # Initial steps for linear LR warmup. Stabilizes start of training.
+
+# ------------------------------------------------------------------------------
+# Training Loop Control
+# ------------------------------------------------------------------------------
+training:
+  # Gradient clipping norm. Prevents exploding gradients. 0 to disable.
+  grad_clip_norm: 1.0
+  # Frequency of validation runs (in epochs).
+  validate_every_n_epochs: 1
+  # Number of validation image samples (LQ/Restored/HQ triplets) logged to W&B.
+  num_val_samples_to_log: 4
+  # Frequency of logging training loss components to W&B (in steps/batches).
+  log_every_n_steps: 50
+
+# ------------------------------------------------------------------------------
+# Checkpointing Configuration
+# ------------------------------------------------------------------------------
+checkpoint:
+  # Directory where model checkpoints will be saved.
+  dir: "./checkpoints/unet_base_crf23-63_full/" # UPDATE: Match experiment name or use a common base.
+  # Frequency to save the 'latest.pth' checkpoint (in epochs). 0 disables.
+  save_every_n_epochs: 1
+
+# ------------------------------------------------------------------------------
+# System & Hardware Configuration
+# ------------------------------------------------------------------------------
+system:
+  # Number of CPU workers for parallel data loading.
+  num_workers: 8        # Adjust based on CPU cores, RAM, and potential bottlenecks.
+  # Target device ('auto', 'cuda', 'mps', 'cpu').
+  device: "auto"
+  # Enable Automatic Mixed Precision (AMP) for speedup on compatible hardware.
+  mixed_precision: true
+  # Seed for random number generation for reproducibility.
+  seed: 42
+
+# ==============================================================================
+# Training Strategy for Conditional U-Net
+# ==============================================================================
+#  Why Use Conditional U-Net?
+#    • Single model handles CRF 23-63 (no need for multiple models)
+#    • More data-efficient (learns cross-CRF patterns)
+#    • Flexible at inference (can adapt to any CRF)
+#    • Best for research or when CRF is unknown
+#
+#  Monitoring Training:
+#    • Watch CRF distribution in validation (should be uniform)
+#    • Check that model improves across all CRF ranges
+#    • Validation L1 improvement: 40-70% (higher than nano)
+#    • Use W&B to track per-CRF performance
+#
+#  Hyperparameter Tuning:
+#    • If model overfits: increase weight_decay (1e-4 → 5e-4)
+#    • If slow convergence: increase LR (1e-4 → 2e-4)
+#    • If quality plateaus: add frequency or MS-SSIM loss
+#    • If training unstable: decrease LR, increase grad_clip_norm
+#
+#  Resume Training:
+#    python train_av1_restorer.py --config this_config.yaml --resume best --wand_id xxxxxx
+# ==============================================================================

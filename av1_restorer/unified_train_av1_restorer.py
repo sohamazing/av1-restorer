@@ -2,6 +2,8 @@
 """
 Universal Training Script for AV1 Artifact Removal Models
 
+# DEPRECIATED (use train_av1_conditional_restorer.py or train_av1_nano_restorer.py)
+
 ==============================================================================
 SUPPORTED MODELS
 ==============================================================================

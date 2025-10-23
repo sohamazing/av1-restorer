@@ -1,0 +1,212 @@
+# ==============================================================================
+# Config Template: Non-Conditional AV1 Restorer (Nano Models)
+# ==============================================================================
+# Script: train_non_conditional.py
+# Purpose: Train specialized lightweight models (NanoUNet, FBCNN, ResNet, Mamba)
+#          for specific CRF ranges. These models do *not* use conditioning
+#          during the forward pass, making them faster but less flexible.
+# Strategy: Train one model per target CRF bucket (e.g., 23-33, 34-43, etc.).
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Project & Experiment Tracking (W&B)
+# ------------------------------------------------------------------------------
+project:
+  # Weights & Biases project name. Group experiments under this project.
+  name: "AV1-Restorer"
+  # A descriptive name for this specific training run.
+  # Recommendation: model-type_model-size_crf-range
+  experiment_name: "nano_unet_base_crf54-63" # UPDATE FOR EACH EXPERIMENT
+  # Set to true to log metrics, checkpoints, and samples to W&B.
+  log_to_wandb: true
+
+# ------------------------------------------------------------------------------
+# Data Paths (UPDATE TO YOUR DATASET LOCATIONS)
+# ------------------------------------------------------------------------------
+data:
+  # Path to the directory containing low-quality training images/NPYs.
+  train_lq_root: "./av1_data/train/lq"
+  # Path to the directory containing corresponding high-quality training images/NPYs.
+  train_hq_root: "./av1_data/train/hq"
+  # Path to the directory containing low-quality validation images/NPYs.
+  val_lq_root: "./av1_data/val/lq"
+  # Path to the directory containing corresponding high-quality validation images/NPYs.
+  val_hq_root: "./av1_data/val/hq"
+
+  # File extension for low-quality inputs. Use ".npy" if preprocessed for speed.
+  lq_ext: ".avif" # or ".npy"
+  # File extension for high-quality targets. Use ".npy" if preprocessed.
+  hq_ext: ".png" # or ".npy"
+
+# ------------------------------------------------------------------------------
+# Dataset Parameters
+# ------------------------------------------------------------------------------
+dataset:
+  # *** IMPORTANT: Define the CRF range this specific model will specialize in. ***
+  # The dataset loader will *only* load samples within this range.
+  # Suggested ranges for specialization: [23, 33], [34, 43], [44, 53], [54, 63]
+  crf_range: [54, 63] # UPDATE: Target CRF specialization range for this run.
+
+  # AV1 encoding preset range used for *filtering* the dataset.
+  # Keep wide (e.g., [0, 8]) to include more data, unless you specifically
+  # trained only for certain presets (e.g., [4, 4]).
+  # This does NOT affect model conditioning for non-conditional models.
+  preset_range: [4, 4]
+
+  # Normalization applied to images before entering the model.
+  norm_range: [-1, 1] # or [0, 1]
+
+# ------------------------------------------------------------------------------
+# Training Curriculum (Progressive Learning)
+# ------------------------------------------------------------------------------
+# Stages allow starting with smaller patches (faster, learns coarse features)
+# and progressing to larger patches (refines details, needs more VRAM).
+curriculum:
+  # Stage 1: Initial training on smaller patches.
+  - patch_size: 192
+    batch_size: 24   # Adjust based on GPU VRAM (e.g., 64, 128, 256)
+    epochs: 100       # Number of epochs for this stage.
+    # Optional: Override `dataset.crf_range` just for this stage.
+    # crf_range: [54, 63]
+
+  # Stage 2: Refinement on larger patches.
+  - patch_size: 256
+    batch_size: 16    # Reduce batch size significantly for larger patches.
+    epochs: 50
+
+  # Stage 3: (Optional) Final fine-tuning on even larger patches.
+  # - patch_size: 512
+  #   batch_size: 8     # Very small batch size likely needed.
+  #   epochs: 20
+
+# ------------------------------------------------------------------------------
+# Model Configuration (Generator - Non-Conditional Nano Models Only)
+# ------------------------------------------------------------------------------
+model:
+  # Select the non-conditional architecture to train.
+  # 'nano_unet' offers a good balance of speed and quality.
+  # 'nano_resnet' is fastest but may lack detail restoration.
+  type: "nano_unet"
+  # type: "nano_resnet"
+  # type: "nano_fbcnn"
+  # type: "nano_mamba"
+
+  # Select the model size (complexity/parameter count).
+  # Affects speed, quality, and VRAM usage.
+  size: "base" # Options: "tiny", "small", "base"
+
+# ------------------------------------------------------------------------------
+# Loss Function Configuration
+# ------------------------------------------------------------------------------
+# Define reconstruction losses and their weights. Total loss = sum(weight * component_loss).
+loss:
+  # Charbonnier Loss (Robust L1 variant, often better than L1/L2)
+  charbonnier:
+    enabled: true     # Set to true to include this loss component.
+    weight: 1.0       # Contribution weight to the total loss.
+    params: {eps: 0.001} # Small epsilon for numerical stability.
+
+  # Perceptual Loss (VGG or LPIPS features, improves texture/realism)
+  perceptual:
+    enabled: true
+    weight: 0.01     # Tune carefully (e.g., 0.001 to 0.1). Higher values prioritize texture.
+    params:
+      network: 'vgg'  # 'vgg' (faster) or 'lpips' (potentially better).
+
+  # Multi-Scale Structural Similarity Index (Focuses on structure)
+  ms_ssim:
+    enabled: true    # Can be computationally heavier.
+    weight: 0.1
+    params: {}        # No specific params for default MS-SSIM.
+
+  # Frequency Domain Loss (e.g., L1 on FFT magnitudes, enhances edges)
+  frequency:
+    enabled: true
+    weight: 0.05  # Start low, monitor for NaN
+    params:
+      loss_func_type: 'l1'         # L1 is most stable
+      alpha: 1.0                    # 1.0 = magnitude ONLY (no phase)
+      use_phase: false              # DISABLE phase loss (unstable)
+      use_log_magnitude: true       # Log space is more stable
+      eps: 1.0e-6                   # Epsilon for numerical stability
+
+
+  # Standard L1 / L2 (MSE) Losses
+  l1: {enabled: false, weight: 1.0, params: {}}
+  l2: {enabled: false, weight: 1.0, params: {}}
+
+# ------------------------------------------------------------------------------
+# Optimizer Configuration (For the Generator)
+# ------------------------------------------------------------------------------
+optimizer: # In GAN script, this section becomes 'optimizer_G'
+  type: "adamw"         # AdamW (Adam with decoupled weight decay) is generally recommended.
+  lr: 2.0e-4          # Starting learning rate. Tune based on batch size and stability.
+  weight_decay: 1.0e-4  # L2 regularization strength. 0 disables it.
+  betas: [0.9, 0.999]   # Adam/AdamW momentum parameters.
+
+  # Exponential Moving Average (EMA) for model weights.
+  # Often improves validation performance and stability. Applied during validation/inference.
+  use_ema: true
+  ema_decay: 0.9999     # Decay factor (closer to 1 = slower update, more smoothing).
+
+# ------------------------------------------------------------------------------
+# Learning Rate Scheduler Configuration
+# ------------------------------------------------------------------------------
+scheduler: # In GAN script, this section becomes 'scheduler_G'
+  # Defines how the learning rate changes over time.
+  type: "cosine"      # Cosine annealing: Smoothly decreases LR to min_lr.
+  min_lr: 1.0e-6      # Final minimum learning rate.
+  warmup_steps: 1000  # Number of initial steps with linear LR increase from near-zero. Stabilizes early training.
+
+# ------------------------------------------------------------------------------
+# Training Loop Control
+# ------------------------------------------------------------------------------
+training:
+  # Gradient clipping norm. Helps prevent exploding gradients. 0 disables clipping.
+  grad_clip_norm: 1.0
+  # How often to run validation (in epochs). 1 means validate after every epoch.
+  validate_every_n_epochs: 1
+  # Number of validation samples to log as images to W&B each validation run.
+  num_val_samples_to_log: 4
+  # How often to log training loss components to W&B (in steps/batches).
+  log_every_n_steps: 50
+
+# ------------------------------------------------------------------------------
+# Checkpointing Configuration
+# ------------------------------------------------------------------------------
+checkpoint:
+  # Directory where checkpoints (model weights, optimizer state, etc.) are saved.
+  dir: "./checkpoints/nano_unet_base_crf54-63/" # UPDATE: Match experiment name or use a common base.
+  # How often to save the 'latest.pth' checkpoint (in epochs). 0 disables periodic saves.
+  # 'best.pth' and stage completion checkpoints are saved regardless of this setting.
+  save_every_n_epochs: 1
+
+# ------------------------------------------------------------------------------
+# System & Hardware Configuration
+# ------------------------------------------------------------------------------
+system:
+  # Number of CPU worker processes for data loading. Adjust based on CPU cores and RAM.
+  num_workers: 8
+  # Target device. 'auto' tries cuda -> mps -> cpu. Can force e.g., "cuda:0", "mps", "cpu".
+  device: "auto"
+  # Enable Automatic Mixed Precision (AMP). Uses float16/bfloat16 for faster training on compatible GPUs.
+  mixed_precision: true
+  # Seed for random number generators (PyTorch, NumPy, Python random) for reproducibility.
+  seed: 42
+
+
+#  - Hyperparameter Tuning:
+#    - If underfitting: increase model size, add more epochs
+#    - If overfitting: increase weight_decay, add augmentation
+#    - If slow convergence: increase learning rate (3e-4 → 5e-4)
+#
+#  - Multi-CRF Training Strategy:
+#    a. Train model for CRF [34, 43]: nano_unet_small_crf34-43
+#    b. Train model for CRF [23, 33]: nano_unet_small_crf23-33
+#    c. Train model for CRF [44, 53]: nano_unet_small_crf44-53
+#    d. At inference, select model based on input CRF
+#
+#  - Resume Training:
+#    python train_av1_restorer.py --config this_config.yaml --resume latest --wand_id xxxxxx
+#    python train_av1_restorer.py --config this_config.yaml --resume best
+# ==============================================================================

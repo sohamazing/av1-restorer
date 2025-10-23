@@ -1,0 +1,128 @@
+# ==============================================================================
+# Dry Run Config: Conditional AV1 U-Net Restorer
+# ==============================================================================
+# Script: train_conditional_unet.py
+# Purpose: Quickly validate the setup for training the conditional U-Net model.
+# Usage:   python train_conditional_unet.py --config configs/dry_run_conditional_unet.yaml
+#
+# Tests Verified:
+#   ✓ Dataset loading (.avif/.npy) and caching
+#   ✓ Conditional model initialization (CRF-Only or CRF+Preset based on preset_range)
+#   ✓ Forward/backward passes with correct conditioning inputs
+#   ✓ Loss computation
+#   ✓ Basic curriculum progression (1 epoch per stage)
+#   ✓ Validation loop
+#   ✓ Checkpointing (latest, best, stage_complete)
+#   ✓ AMP and EMA functionality (EMA disabled for speed)
+#
+# Expected runtime: ~3-5 minutes on GPU (U-Net is larger than Nano)
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Project & Logging
+# ------------------------------------------------------------------------------
+project:
+  name: "AV1-Restorer"
+  experiment_name: "dry_run_unet_crf_only" # UPDATE if testing CRF+Preset mode
+  log_to_wandb: false # Disable W&B for speed.
+
+# ------------------------------------------------------------------------------
+# Data Paths (UPDATE if necessary)
+# ------------------------------------------------------------------------------
+data:
+  train_lq_root: "./av1_data/train/lq" # Or point to a tiny subset
+  train_hq_root: "./av1_data/train/hq"
+  val_lq_root: "./av1_data/val/lq"
+  val_hq_root: "./av1_data/val/hq"
+  lq_ext: ".avif" # or ".npy"
+  hq_ext: ".png" # or ".npy"
+
+# ------------------------------------------------------------------------------
+# Dataset Parameters
+# ------------------------------------------------------------------------------
+dataset:
+  # Use full CRF range to test conditional aspect.
+  crf_range: [23, 63]
+
+  # *** CHOOSE MODE ***
+  # Set to a single value to test CRF-Only mode and model selection.
+  preset_range: [4, 4]
+  # OR: Set to a range to test CRF+Preset mode.
+  # preset_range: [0, 8]
+
+  norm_range: [-1, 1]
+
+# ------------------------------------------------------------------------------
+# Training Curriculum (Minimal)
+# ------------------------------------------------------------------------------
+curriculum:
+  # Stage 1: Small patches.
+  - patch_size: 128
+    batch_size: 4       # Small batch size for U-Net.
+    epochs: 1
+  # Stage 2: Slightly larger patches.
+  - patch_size: 160
+    batch_size: 2
+    epochs: 1
+
+# ------------------------------------------------------------------------------
+# Model Configuration (Conditional U-Net Only)
+# ------------------------------------------------------------------------------
+model:
+  type: "unet"          # Must be "unet".
+  size: "tiny"          # Use smallest U-Net variant for speed.
+
+# ------------------------------------------------------------------------------
+# Loss Function Configuration (Enable multiple for testing)
+# ------------------------------------------------------------------------------
+loss:
+  charbonnier: {enabled: true, weight: 1.0, params: {eps: 0.001}}
+  perceptual: {enabled: true, weight: 0.01, params: {network: 'vgg'}}
+  ms_ssim: {enabled: false, weight: 0.1, params: {}} # Disable if patch < 160px
+  frequency: {enabled: false, weight: 0.05, params: {alpha: 1.0}}
+  l1: {enabled: false, weight: 1.0, params: {}}
+  l2: {enabled: false, weight: 1.0, params: {}}
+
+# ------------------------------------------------------------------------------
+# Optimizer Configuration
+# ------------------------------------------------------------------------------
+optimizer: # Becomes optimizer_G in GAN script
+  type: "adamw"
+  lr: 1.0e-4
+  weight_decay: 0
+  betas: [0.9, 0.999]
+  use_ema: false      # Disable EMA for speed.
+  ema_decay: 0.9999
+
+# ------------------------------------------------------------------------------
+# Learning Rate Scheduler Configuration
+# ------------------------------------------------------------------------------
+scheduler: # Becomes scheduler_G in GAN script
+  type: "cosine"
+  min_lr: 1.0e-6
+  warmup_steps: 5     # Minimal warmup.
+
+# ------------------------------------------------------------------------------
+# Training Loop Control
+# ------------------------------------------------------------------------------
+training:
+  grad_clip_norm: 0         # Disable clipping.
+  validate_every_n_epochs: 1 # Validate after each stage.
+  num_val_samples_to_log: 2
+  log_every_n_steps: 5
+
+# ------------------------------------------------------------------------------
+# Checkpointing Configuration
+# ------------------------------------------------------------------------------
+checkpoint:
+  dir: "./checkpoints/dry_run_conditional/" # Separate directory.
+  save_every_n_epochs: 0 # Only save best/stage completion.
+
+# ------------------------------------------------------------------------------
+# System & Hardware Configuration
+# ------------------------------------------------------------------------------
+system:
+  num_workers: 2
+  device: "auto"
+  mixed_precision: true # Test AMP.
+  seed: 42

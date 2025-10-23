@@ -282,10 +282,17 @@ class AV1Dataset(Dataset):
             lq_img = Image.open(meta["lq"]).convert("RGB")
             hq_img = Image.open(meta["hq"]).convert("RGB")
             
-            # Apply identical random crop
-            i, j, h, w = T.RandomCrop.get_params(
-                lq_img, (self.patch_size, self.patch_size)
-            )
+            # Apply crop: random for training, deterministic center for validation
+            if self.augment_tf is not None:  # Training mode: apply identical random crop 
+                i, j, h, w = T.RandomCrop.get_params(
+                    lq_img, (self.patch_size, self.patch_size)
+                )
+            else:  # Validation mode: deterministic center crop
+                img_w, img_h = lq_img.size
+                i = (img_h - self.patch_size) // 2
+                j = (img_w - self.patch_size) // 2
+                h = w = self.patch_size
+
             lq_patch = T.functional.crop(lq_img, i, j, h, w)
             hq_patch = T.functional.crop(hq_img, i, j, h, w)
             

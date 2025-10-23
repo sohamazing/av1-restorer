@@ -1,0 +1,129 @@
+# ==============================================================================
+# Dry Run Config: Non-Conditional AV1 Restorer (Nano Models)
+# ==============================================================================
+# Script: train_non_conditional.py
+# Purpose: Quickly validate the setup for training non-conditional models.
+# Usage:   python train_non_conditional.py --config configs/dry_run_non_conditional.yaml
+#
+# Tests Verified:
+#   ✓ Dataset loading (.avif/.npy) and caching
+#   ✓ Non-conditional model initialization (e.g., nano_unet)
+#   ✓ Forward/backward pass without conditioning inputs
+#   ✓ Loss computation (e.g., Charbonnier, Perceptual)
+#   ✓ Basic curriculum progression (1 epoch per stage)
+#   ✓ Validation loop (Generator only)
+#   ✓ Checkpointing (latest, best, stage_complete)
+#   ✓ AMP and EMA functionality (EMA disabled for speed)
+#
+# Expected runtime: ~2-5 minutes on GPU
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Project & Logging
+# ------------------------------------------------------------------------------
+project:
+  name: "AV1-Restorer"
+  experiment_name: "dry_run_nano_unet"
+  log_to_wandb: false # Disable W&B for speed during dry run.
+
+# ------------------------------------------------------------------------------
+# Data Paths (UPDATE if necessary)
+# ------------------------------------------------------------------------------
+data:
+  # Use small subsets or full paths if indexing is fast enough.
+  train_lq_root: "./av1_data/train/lq" # Or point to a tiny subset for faster init
+  train_hq_root: "./av1_data/train/hq"
+  val_lq_root: "./av1_data/val/lq"
+  val_hq_root: "./av1_data/val/hq"
+  # Test with standard AVIF loading or switch to NPY if preprocessed.
+  lq_ext: ".avif"
+  hq_ext: ".png"
+  # lq_ext: ".npy"
+  # hq_ext: ".npy"
+
+# ------------------------------------------------------------------------------
+# Dataset Parameters
+# ------------------------------------------------------------------------------
+dataset:
+  # Use a specific, narrow CRF range just for testing dataset filtering.
+  crf_range: [44, 53] # Example high CRF range
+  # Preset range for filtering (doesn't affect model). Keep wide.
+  preset_range: [0, 8]
+  norm_range: [-1, 1]
+
+# ------------------------------------------------------------------------------
+# Training Curriculum (Minimal)
+# ------------------------------------------------------------------------------
+# Two short stages to test progressive learning transitions.
+curriculum:
+  # Stage 1: Smallest reasonable patch size, minimal epochs.
+  - patch_size: 128
+    batch_size: 4       # Small batch size for quick iteration.
+    epochs: 1           # Only one epoch.
+  # Stage 2: Slightly larger patch, minimal epochs.
+  - patch_size: 160     # Increase slightly to test change.
+    batch_size: 2       # Reduce batch size.
+    epochs: 1
+
+# ------------------------------------------------------------------------------
+# Model Configuration (Tiny Non-Conditional Model)
+# ------------------------------------------------------------------------------
+model:
+  type: "nano_unet"     # Use a representative non-conditional model.
+  size: "tiny"          # Use the smallest size for fastest loading/iteration.
+
+# ------------------------------------------------------------------------------
+# Loss Function Configuration (Enable multiple for testing)
+# ------------------------------------------------------------------------------
+loss:
+  charbonnier: {enabled: true, weight: 1.0, params: {eps: 0.001}}
+  perceptual: {enabled: true, weight: 0.01, params: {network: 'vgg'}} # Test perceptual
+  # ms_ssim: {enabled: false, weight: 0.1, params: {}} # Disable if patch < 160px
+  frequency: {enabled: false, weight: 0.05, params: {alpha: 1.0}}
+  l1: {enabled: false, weight: 1.0, params: {}}
+  l2: {enabled: false, weight: 1.0, params: {}}
+
+# ------------------------------------------------------------------------------
+# Optimizer Configuration
+# ------------------------------------------------------------------------------
+optimizer: # Corresponds to optimizer_G in GAN script
+  type: "adamw"
+  lr: 1.0e-4        # Use a reasonable default LR.
+  weight_decay: 0   # Disable WD for dry run simplicity.
+  betas: [0.9, 0.999]
+  use_ema: false      # Disable EMA for faster dry run.
+  ema_decay: 0.9999
+
+# ------------------------------------------------------------------------------
+# Learning Rate Scheduler Configuration
+# ------------------------------------------------------------------------------
+scheduler: # Corresponds to scheduler_G in GAN script
+  type: "cosine"
+  min_lr: 1.0e-6
+  warmup_steps: 5     # Minimal warmup for testing.
+
+# ------------------------------------------------------------------------------
+# Training Loop Control
+# ------------------------------------------------------------------------------
+training:
+  grad_clip_norm: 0         # Disable grad clipping for simplicity.
+  validate_every_n_epochs: 1 # Validate after each epoch (which is end of stage here).
+  num_val_samples_to_log: 2  # Log minimal visual samples.
+  log_every_n_steps: 5       # Log frequently during the short epoch.
+
+# ------------------------------------------------------------------------------
+# Checkpointing Configuration
+# ------------------------------------------------------------------------------
+checkpoint:
+  dir: "./checkpoints/dry_run_non_conditional/" # Separate directory for dry run.
+  # Only save 'best.pth' and stage completion checkpoints during validation.
+  save_every_n_epochs: 0
+
+# ------------------------------------------------------------------------------
+# System & Hardware Configuration
+# ------------------------------------------------------------------------------
+system:
+  num_workers: 2        # Reduce workers for faster startup in dry run.
+  device: "auto"        # Test auto-detection.
+  mixed_precision: true # Test AMP functionality.
+  seed: 42

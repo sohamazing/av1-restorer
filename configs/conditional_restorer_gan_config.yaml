@@ -1,0 +1,153 @@
+# ==============================================================================
+# Config Template: Conditional AV1 U-Net Restorer (GAN Training)
+# ==============================================================================
+# Script: train_conditional_unet_gan.py
+# Purpose: Train the conditional U-Net model using adversarial training
+#          with a PatchGAN discriminator for potentially improved perceptual quality.
+# Mode Selection (Generator): Determined by dataset.preset_range (see below).
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Project & Experiment Tracking (W&B)
+# ------------------------------------------------------------------------------
+project:
+  name: "AV1-Restorer" # Distinct project name for GAN experiments.
+  # Descriptive name. Include GAN, size, conditioning mode.
+  experiment_name: "unet_gan_base_crf23-63_full" # UPDATE: Reflect GAN settings.
+  log_to_wandb: true
+
+# ------------------------------------------------------------------------------
+# Data Paths (UPDATE TO YOUR DATASET LOCATIONS)
+# ------------------------------------------------------------------------------
+data:
+  train_lq_root: "./av1_data/train/lq"
+  train_hq_root: "./av1_data/train/hq"
+  val_lq_root: "./av1_data/val/lq"
+  val_hq_root: "./av1_data/val/hq"
+  lq_ext: ".avif" # or ".npy"
+  hq_ext: ".png" # or ".npy"
+
+# ------------------------------------------------------------------------------
+# Dataset Parameters
+# ------------------------------------------------------------------------------
+dataset:
+  crf_range: [23, 63] # Full range for the conditional generator.
+
+  # *** IMPORTANT: Controls Generator variant selection. ***
+  # - [0, 8] -> Trains standard CRF+Preset Generator.
+  # - [4, 4] -> Trains CRF-Only Generator.
+  preset_range: [0, 8] # UPDATE: For CRF-Only Generator.
+
+  norm_range: [-1, 1] # [-1, 1] or [0, 1]
+
+# ------------------------------------------------------------------------------
+# Training Curriculum (Progressive Learning)
+# ------------------------------------------------------------------------------
+# GAN training typically requires more VRAM. Adjust batch sizes accordingly.
+curriculum:
+  # Stage 1: Smaller patches.
+  - patch_size: 128
+    batch_size: 32    # Example: Reduced batch size for GAN. Adjust based on VRAM.
+    epochs: 150
+  # Stage 2: Larger patches.
+  - patch_size: 256
+    batch_size: 8     # Example: Further reduction likely needed.
+    epochs: 100
+  # Stage 3: (Optional) Fine-tuning.
+  # - patch_size: 512
+  #   batch_size: 2     # Example: Very small batch size. May need gradient accumulation.
+  #   epochs: 50
+
+# ------------------------------------------------------------------------------
+# Model Configuration (Generator - Conditional U-Net Only)
+# ------------------------------------------------------------------------------
+model: # Configures the GENERATOR.
+  type: "unet" # Must be "unet". Factory handles variant selection based on dataset.preset_range.
+  size: "base"    # "tiny", "small", "base", "large"
+
+# ------------------------------------------------------------------------------
+# Discriminator Configuration (PatchGAN) - NEW SECTION FOR GAN
+# ------------------------------------------------------------------------------
+discriminator:
+  # Input channels should match the generator output channels (usually 3 for RGB).
+  in_channels: 3
+  # Number of channels in the first convolutional layer. Controls discriminator capacity.
+  base_channels: 64 # (e.g., 32, 64, 128)
+  # Number of downsampling Conv layers. 3 gives a 70x70 receptive field per patch score.
+  # More layers increase receptive field but reduce output patch resolution.
+  n_layers: 3
+
+# ------------------------------------------------------------------------------
+# Loss Function Configuration - INCLUDES GAN WEIGHTS
+# ------------------------------------------------------------------------------
+loss:
+  # --- GAN Weights (Crucial for balancing G training) ---
+  # Weight for the sum of all reconstruction losses (L1, perceptual, etc.).
+  # Higher values prioritize matching the ground truth.
+  reconstruction_weight: 100.0 # Lambda Recon (Try 10 to 1000). Start high (e.g., 100).
+  # Weight for the adversarial loss component (how much G tries to fool D).
+  # Higher values prioritize realism over pixel accuracy.
+  adversarial_weight: 1.0      # Lambda Adv (Try 0.01 to 5). Start low (e.g., 0.1 or 1).
+
+  # --- Reconstruction Loss Components (Same structure as non-GAN) ---
+  charbonnier: {enabled: true, weight: 1.0, params: {eps: 0.001}}
+  perceptual: {enabled: true, weight: 0.01, params: {network: 'vgg'}} # Weight relative to charbonnier
+  ms_ssim: {enabled: false, weight: 0.1, params: {}}
+  frequency: {enabled: false, weight: 0.05, params: {alpha: 1.0}}
+  l1: {enabled: false, weight: 1.0, params: {}}
+  l2: {enabled: false, weight: 1.0, params: {}}
+
+# ------------------------------------------------------------------------------
+# Optimizer for GENERATOR - RENAMED SECTION
+# ------------------------------------------------------------------------------
+optimizer_G: # Note the "_G" suffix.
+  type: "adamw"
+  lr: 1.0e-4          # Starting LR for Generator. Tune based on stability.
+  weight_decay: 1.0e-4
+  betas: [0.9, 0.999]   # Standard betas often work for Generator.
+  use_ema: true         # Apply EMA to the generator for validation/inference quality.
+  ema_decay: 0.9999
+  grad_clip_norm: 1.0   # Optional clipping for Generator stability. 0 to disable.
+
+# ------------------------------------------------------------------------------
+# Optimizer for DISCRIMINATOR - NEW SECTION FOR GAN
+# ------------------------------------------------------------------------------
+optimizer_D: # Note the "_D" suffix.
+  type: "adam"           # Adam is common for Discriminator. AdamW also possible.
+  lr: 2.0e-4             # Often slightly different (sometimes higher) LR than Generator. Tune carefully.
+  weight_decay: 0        # Weight decay usually disabled for Discriminator.
+  betas: [0.5, 0.999]    # Lower beta1 (0.5) is common in GANs for Discriminator stability.
+
+# ------------------------------------------------------------------------------
+# Learning Rate Scheduler for GENERATOR - RENAMED SECTION
+# ------------------------------------------------------------------------------
+scheduler_G: # Note the "_G" suffix. No scheduler for D by default, as D learns reactively.
+  type: "cosine"
+  min_lr: 1.0e-7
+  warmup_steps: 1000
+
+# ------------------------------------------------------------------------------
+# Training Loop Control
+# ------------------------------------------------------------------------------
+training:
+  # grad_clip_norm is now configured per-optimizer (under optimizer_G).
+  validate_every_n_epochs: 1 # Validation evaluates Generator reconstruction loss.
+  num_val_samples_to_log: 4  # Log visual comparisons from Generator.
+  log_every_n_steps: 50      # Log G and D training losses frequently.
+
+# ------------------------------------------------------------------------------
+# Checkpointing Configuration
+# ------------------------------------------------------------------------------
+checkpoint:
+  # Saves state for Generator, Discriminator, Optimizers G&D, Scheduler G, EMA G.
+  dir: "./checkpoints/unet_gan_base_crf23-63_full/" # UPDATE: Match experiment name.
+  save_every_n_epochs: 1 # Frequency for saving 'latest.pth'.
+
+# ------------------------------------------------------------------------------
+# System & Hardware Configuration
+# ------------------------------------------------------------------------------
+system:
+  num_workers: 8
+  device: "auto" # 'auto', 'cuda', 'mps', 'cpu'
+  mixed_precision: true # Highly recommended for GAN training speed and memory.
+  seed: 42

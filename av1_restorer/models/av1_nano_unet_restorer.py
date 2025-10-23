@@ -163,12 +163,16 @@ class AV1NanoUnetRestorer(nn.Module):
         • Non-conditional → train separate models per CRF bucket
     
     Model Sizes:
-        tiny:  16 base channels, [1,1,2] blocks → 0.8M params, fastest
-        small: 20 base channels, [1,2,2] blocks → 1.5M params, balanced
-        base:  24 base channels, [2,2,3] blocks → 2.5M params, best quality
+        nano:  20 base channels, [2,2,2] blocks → ~0.2M params
+        tiny:  24 base channels, [2,2,3] blocks → ~0.5M params
+        small: 32 base channels, [2,3,4] blocks → ~1.2M params
+        base:  48 base channels, [3,3,4] blocks → ~2.5M params
+        large: 64 base channels, [4,4,6] blocks → ~6.2M params
+        huge:  64 base channels, [4,6,12] blocks → ~11.2M params
+
     
     Args:
-        size: Model variant ('tiny', 'small', 'base')
+        size: Model variant ('tiny', 'small', 'base', 'large')
         crf_min: Minimum CRF value this model handles
         crf_max: Maximum CRF value this model handles
         norm_range: Image normalization range ((-1,1) or (0,1))
@@ -181,18 +185,31 @@ class AV1NanoUnetRestorer(nn.Module):
     """
     
     SIZE_CONFIGS: Dict[str, Dict] = {
-        'tiny': {
+        'nano': {
             'base_ch': 16,
-            'blocks_per_level': [1, 1, 2],  # [enc1, enc2, enc3]
+            'blocks_per_level': [2, 2, 2],  # [enc1, enc2, enc3]
+        },
+        'tiny': {
+            'base_ch': 24,
+            'blocks_per_level': [2, 2, 3],  
         },
         'small': {
-            'base_ch': 20,
-            'blocks_per_level': [1, 2, 2],
+            'base_ch': 32,
+            'blocks_per_level': [2, 3, 4],
         },
         'base': {
-            'base_ch': 24,
-            'blocks_per_level': [2, 2, 3],
+            'base_ch': 48,
+            'blocks_per_level': [3, 3, 4],
         },
+        'large': {
+            'base_ch': 64,
+            'blocks_per_level': [4, 4, 6],
+        },
+        'huge': {
+            'base_ch': 64,
+            'blocks_per_level': [6, 8, 12],
+        },
+
     }
     
     def __init__(
@@ -470,9 +487,9 @@ if __name__ == "__main__":
     print("=" * 70 + "\n")
     
     # Test all model sizes
-    for size in ['tiny', 'small', 'base']:
+    for size in ['nano', 'tiny', 'small', 'base', 'large', 'huge']:        
         print(f"\n{'=' * 70}")
-        print(f"Testing: {size.upper()} variant")
+        print(f"Testing: {size.upper()} unet variant")
         print('=' * 70)
         
         # Create model
@@ -533,8 +550,11 @@ if __name__ == "__main__":
     print("=" * 70)
     print(f"\n{'Model':<10} {'Params':<12} {'Use Case'}")
     print("-" * 70)
-    print(f"{'tiny':<10} {'~0.8M':<12} {'Mobile, embedded devices'}")
-    print(f"{'small':<10} {'~1.5M':<12} {'Balanced (recommended)'}")
-    print(f"{'base':<10} {'~2.5M':<12} {'Best quality nano variant'}")
+    print(f"{'nano':<10} {'~0.2M':<12} {'Mobile, embedded (fastest)'}")
+    print(f"{'tiny':<10} {'~0.5M':<12} {'Light tasks (e.g. CRF 23-33)'}")
+    print(f"{'small':<10} {'~1.2M':<12} {'Balanced (e.g. CRF 34-43)'}")
+    print(f"{'base':<10} {'~2.5M':<12} {'High quality (e.g. CRF 44-53)'}")
+    print(f"{'large':<10} {'~6.0M':<12} {'Heavy tasks (e.g. CRF 54-63)'}")
+    print(f"{'huge':<10} {'~11.2M':<12} {'Max quality (extreme CRF)'}")
     print("\n" + "=" * 70)
     print("✓ All tests passed!\n")
