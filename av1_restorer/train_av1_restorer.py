@@ -268,7 +268,7 @@ class UniversalRestorerTrainer:
         # Mixed precision (AMP)
         self.use_amp = sys_cfg.get('mixed_precision', False)
         if self.use_amp and self.device.type == 'cuda':
-            self.scaler = torch.amp.GradScaler(device_type='cuda', enabled=True)
+            self.scaler = torch.amp.GradScaler(enabled=True)
             logger.info("AMP: Enabled with GradScaler (CUDA)")
         elif self.use_amp:
             self.scaler = None
