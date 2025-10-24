@@ -320,7 +320,7 @@ class AV1Dataset(Dataset):
 
 
             # --- APPLY AUGMENTATION (FLIPS) INDEPENDENTLY ---
-            if self.augment and self.augment_tf: # Check self.augment here
+            if self.augment_tf: # Check self.augment here
                 seed = torch.randint(0, 2**32, (1,)).item()
                 torch.manual_seed(seed)
                 lq_patch = self.augment_tf(lq_patch)
