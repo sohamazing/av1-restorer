@@ -406,8 +406,9 @@ class ConditionalUNetTrainer:
                 patch_size=patch_size,
                 crf_range=tuple(dset_cfg['crf_range']),
                 preset_range=tuple(dset_cfg['preset_range']),
-                augment=False,
                 norm_range=tuple(dset_cfg.get('norm_range', [-1, 1])),
+                crop_mode='center',
+                augment=False,
                 return_metadata=True,
                 cached_image_pairs=cached_val_image_pairs
             )
