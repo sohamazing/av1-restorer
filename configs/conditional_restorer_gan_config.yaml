@@ -88,6 +88,7 @@ loss:
   # Weight for the adversarial loss component (how much G tries to fool D).
   # Higher values prioritize realism over pixel accuracy.
   adversarial_weight: 1.0      # Lambda Adv (Try 0.01 to 5). Start low (e.g., 0.1 or 1).
+  gan_type: "hinge"  # or "lsgan"
 
   # --- Reconstruction Loss Components (Same structure as non-GAN) ---
   charbonnier: {enabled: true, weight: 1.0, params: {eps: 0.001}}

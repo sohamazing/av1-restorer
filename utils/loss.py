@@ -237,7 +237,7 @@ class CombinedLoss(nn.Module):
                         continue
                     self.losses['ms_ssim'] = MS_SSIM(
                         data_range=1.0, size_average=True, 
-                        channel=3, nonnegative_ssim=True, **params
+                        channel=3, **params # nonnegative_ssim=True, 
                     )
                 elif name == 'frequency':
                     # CRITICAL: Set safe defaults for FrequencyLoss

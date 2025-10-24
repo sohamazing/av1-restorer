@@ -65,14 +65,12 @@ project_root = Path(__file__).resolve().parent.parent
 sys.path.append(str(project_root))
 
 # --- Generator ---
-# Imports the unified factory and model classes
-from av1_restorer.models.av1_conditional_unet_restorer import (
-    create_av1_restorer,
-    AV1ConditionalUNet,
-    AV1ConditionalUNetCRF
-)
+# Imports the unified factory and model classes (AV1ConditionalUNet or AV1ConditionalUNetCRF)
+from av1_restorer.models.av1_conditional_unet_restorer import create_av1_restorer
+
 # --- Discriminator ---
 from av1_restorer.models.patch_gan_discriminator import PatchGANDiscriminator
+from av1_restorer.models.patch_gan_discriminator import d_loss_fn, g_loss_fn, r1_regularization, 
 
 try:
     from utils.loss import CombinedLoss
@@ -139,11 +137,13 @@ class ConditionalUNetGANTrainer:
         self,
         config_path: str,
         resume_from: Optional[str] = None,
-        wandb_id: Optional[str] = None
+        wandb_id: Optional[str] = None,
+        pretrained: Optional[str] = None
     ):
         self.config = self._load_config(config_path)
         self.resume_from = resume_from
         self.wandb_id = wandb_id
+        self.pretrained_generator_path = pretrained
 
         self.train_image_pairs_cache = {}
         self.val_image_pairs_cache = {}
@@ -152,10 +152,37 @@ class ConditionalUNetGANTrainer:
         self._setup_system() # Sets self.device, self.use_amp, self.scaler (if cuda)
 
         # Models and Losses
+        self.gan_type = self.config['loss'].get("gan_type", "hinge").lower()
         self.generator, self.discriminator, self.model_needs_preset = self._setup_models()
         self.reconstruction_loss_fn, self.adversarial_loss_fn = self._setup_losses()
         self.lambda_recon = self.config['loss'].get('reconstruction_weight', 100.0)
         self.lambda_adv = self.config['loss'].get('adversarial_weight', 1.0)
+
+
+        if self.pretrained_generator_path and not self.resume_from:
+            gen_path = Path(self.pretrained_generator_path).expanduser()
+            if gen_path.is_file():
+                logger.info(f"Loading Generator state from pre-train checkpoint: {gen_path}")
+                try:
+                    ckpt = torch.load(gen_path, map_location=self.device, weights_only=False)
+                    
+                    # Try to find state dict (assume full checkpoint or just state_dict)
+                    state_dict = ckpt.get('generator_state_dict', ckpt.get('model_state_dict', ckpt))
+                    
+                    missing, unexpected = self.generator.load_state_dict(state_dict, strict=False)
+                    
+                    logger.info(f"✓ Generator loaded. Missing keys: {missing}, Unexpected keys: {unexpected}")
+                    
+                    # Reset GAN training state, even if a later checkpoint loads it back.
+                    self.start_stage = 0
+                    self.start_epoch = 0
+                    self.global_step = 0
+                    
+                except Exception as e:
+                    logger.error(f"Failed to load pretrained generator weights: {e}", exc_info=True)
+                    logger.warning("Continuing GAN training with randomly initialized generator.")
+            else:
+                logger.warning(f"Pretrained path not found: {gen_path}. Starting GAN training from scratch.")
 
         # Optimizers and Schedulers
         self.optimizer_G, self.optimizer_D, self.scheduler_G = self._setup_optimizers()
@@ -265,6 +292,8 @@ class ConditionalUNetGANTrainer:
         norm_range = tuple(dset_cfg.get('norm_range', [-1, 1]))
 
         logger.info(f"Creating Generator: {model_type} (size={size})")
+        
+        # Determine model type based on preset range
         model_needs_preset: bool
         if preset_range[0] == preset_range[1]:
             logger.info(f"Preset range is single value ({preset_range[0]}). Using CRF-Only Generator.")
@@ -273,7 +302,7 @@ class ConditionalUNetGANTrainer:
             logger.info("Using Standard Generator (CRF + Preset).")
             model_needs_preset = True
 
-        # Use the unified factory from the model file
+        # Instantiate Generator
         generator = create_av1_restorer(
             size=size, crf_range=crf_range, preset_range=preset_range, norm_range=norm_range
         )
@@ -281,37 +310,46 @@ class ConditionalUNetGANTrainer:
         gen_params = sum(p.numel() for p in generator.parameters() if p.requires_grad)
         logger.info(f"Generator parameters: {gen_params:,} ({gen_params/1e6:.2f}M)")
 
-        # --- Discriminator Setup ---
+        # --- Discriminator Setup (FIXED) ---
         logger.info("Creating Discriminator: PatchGAN")
-        disc_in_channels = disc_cfg.get('in_channels', 3)
-        disc_base_channels = disc_cfg.get('base_channels', 64)
-        disc_n_layers = disc_cfg.get('n_layers', 3)
+        
+        # Discriminator inputs: Target (HQ/Fake) channels = 3, Conditional (LQ) channels = 3
         discriminator = PatchGANDiscriminator(
-            in_channels=disc_in_channels,
-            base_channels=disc_base_channels,
-            n_layers=disc_n_layers
-        )
-        discriminator = discriminator.to(self.device)
-        # Optional: Initialize discriminator weights
-        # self._init_weights(discriminator) # Define this if needed
+            in_channels=3, # disc_cfg.get('in_channels', 3)
+            cond_channels=3,
+            base_channels=disc_cfg.get('base_channels', 64),
+            n_layers=disc_cfg.get('n_layers', 3),
+            conditional=True # This GAN design is conditional
+        ).to(self.device)
+
+        # NOTE: If you enable custom initialization in your config:
+        init_weights(discriminator, init_type=disc_cfg.get("init_type", "kaiming")) #xavier
+        
         disc_params = sum(p.numel() for p in discriminator.parameters() if p.requires_grad)
         logger.info(f"Discriminator parameters: {disc_params:,} ({disc_params/1e6:.2f}M)")
 
         return generator, discriminator, model_needs_preset
 
-    def _setup_losses(self) -> Tuple[nn.Module, nn.Module]:
-        """ Initialize Reconstruction and Adversarial losses. """
+    def _setup_losses(self) -> Tuple[nn.Module, None]:
+        """ Initialize Reconstruction Loss. Adversarial loss is handled via helper functions. """
         norm_range = tuple(self.config['dataset'].get('norm_range', [-1, 1]))
+        
+        # Reconstruction Loss (CombinedLoss supports Charbonnier, L1, Perceptual, etc.)
         reconstruction_loss_fn = CombinedLoss(self.config['loss'], norm_range=norm_range)
         logger.info("Reconstruction loss initialized")
 
-        # LSGAN uses MSE Loss
-        adversarial_loss_fn = nn.MSELoss()
-        logger.info("Adversarial loss (LSGAN/MSE) initialized")
+        # Adversarial Loss: We use helper functions (d_loss_fn/g_loss_fn) directly in the loop.
+        logger.info(f"Adversarial loss type: {self.gan_type.upper()} (Calculated via helper functions)")
 
-        return reconstruction_loss_fn.to(self.device), adversarial_loss_fn.to(self.device)
+        # DEPRECIATED # LSGAN uses MSE Loss
+        # adversarial_loss_fn = nn.MSELoss()
+        # logger.info("Adversarial loss (LSGAN/MSE) initialized")
+        # return reconstruction_loss_fn.to(self.device), adversarial_loss_fn.to(self.device)
 
-    def _setup_optimizers(self) -> Tuple[torch.optim.Optimizer, torch.optim.Optimizer, Optional[Any]]:
+        # Return None for the adversarial loss object
+        return reconstruction_loss_fn.to(self.device), None
+
+    def _setup_optimizers(self) -> Tuple[torch.optim.Optimizer, torch.optim.Optimizer, Optional[torch.optim.lr_scheduler.SequentialLR]]:
         """ Create optimizers for G and D, scheduler for G. """
         opt_g_cfg = self.config['optimizer_G']
         opt_d_cfg = self.config['optimizer_D']
@@ -319,28 +357,25 @@ class ConditionalUNetGANTrainer:
 
         # --- Optimizer G ---
         lr_g = opt_g_cfg['lr']
-        if opt_g_cfg['type'].lower() == 'adamw':
-            optimizer_G = AdamW(self.generator.parameters(), lr=lr_g,
-                                betas=tuple(opt_g_cfg.get('betas', [0.9, 0.999])),
-                                weight_decay=opt_g_cfg.get('weight_decay', 1e-4))
-        else: # Default Adam
-            optimizer_G = Adam(self.generator.parameters(), lr=lr_g,
-                               betas=tuple(opt_g_cfg.get('betas', [0.9, 0.999])))
-        logger.info(f"Optimizer G: {opt_g_cfg['type'].upper()}, lr={lr_g}")
+        optim_class_g = AdamW if opt_g_cfg['type'].lower() == 'adamw' else Adam
+        optimizer_G = optim_class_g(
+            self.generator.parameters(), lr=lr_g,
+            betas=tuple(opt_g_cfg.get('betas', [0.9, 0.999])),
+            weight_decay=opt_g_cfg.get('weight_decay', 1e-4 if optim_class_g is AdamW else 0)
+        )
+        logger.info(f"Optimizer G: {optim_class_g.__name__}, lr={lr_g}")
 
         # --- Optimizer D ---
         lr_d = opt_d_cfg['lr']
-        if opt_d_cfg['type'].lower() == 'adamw':
-            optimizer_D = AdamW(self.discriminator.parameters(), lr=lr_d,
-                                betas=tuple(opt_d_cfg.get('betas', [0.5, 0.999])), # Common GAN betas
-                                weight_decay=opt_d_cfg.get('weight_decay', 0)) # Often no WD for D
-        else: # Default Adam
-            optimizer_D = Adam(self.discriminator.parameters(), lr=lr_d,
-                               betas=tuple(opt_d_cfg.get('betas', [0.5, 0.999])))
-        logger.info(f"Optimizer D: {opt_d_cfg['type'].upper()}, lr={lr_d}")
+        optim_class_d = AdamW if opt_d_cfg['type'].lower() == 'adamw' else Adam
+        optimizer_D = optim_class_d(
+            self.discriminator.parameters(), lr=lr_d,
+            betas=tuple(opt_d_cfg.get('betas', [0.5, 0.999])), 
+            weight_decay=opt_d_cfg.get('weight_decay', 0)
+        )
+        logger.info(f"Optimizer D: {optim_class_d.__name__}, lr={lr_d}")
 
         # --- Scheduler G ---
-        # Estimate total steps using fallback (will be updated in train())
         estimated_total_steps_G = sum(
             sum(s['epochs']) if isinstance(s['epochs'], list) else s['epochs']
             for s in self.config['curriculum']
@@ -349,13 +384,15 @@ class ConditionalUNetGANTrainer:
         scheduler_G = None
         scheduler_type = sched_g_cfg.get('type', 'cosine').lower()
         warmup_steps = sched_g_cfg.get('warmup_steps', 500)
+        
         if scheduler_type == 'cosine':
             main_scheduler = CosineAnnealingLR(
                 optimizer_G, T_max=max(1, estimated_total_steps_G - warmup_steps),
                 eta_min=sched_g_cfg.get('min_lr', 1e-6)
             )
             warmup_scheduler = LinearLR(
-                optimizer_G, start_factor=1e-5, end_factor=1.0, total_iters=warmup_steps
+                optimizer_G, start_factor=sched_g_cfg.get('warmup_start_factor', 1e-5), 
+                end_factor=1.0, total_iters=warmup_steps
             )
             scheduler_G = SequentialLR(
                 optimizer_G, schedulers=[warmup_scheduler, main_scheduler],
@@ -730,6 +767,7 @@ class ConditionalUNetGANTrainer:
                 val_loader, optimizer_G, optimizer_D, scheduler_G
             )
 
+
     def _train_epoch(
         self,
         epoch: int, # Absolute epoch index within the current stage (0-based)
@@ -752,14 +790,19 @@ class ConditionalUNetGANTrainer:
         pbar_desc = f"{stage_desc} | Epoch {epoch+1}/{total_epochs}" # Display 1-based epoch
         pbar = tqdm(train_loader, desc=pbar_desc, leave=True, dynamic_ncols=True)
 
-        # Initialize epoch loss accumulators
+        # Initialize epoch loss accumulators (FIXED: removed redundant D_real/D_fake)
         epoch_loss_G_total = 0.0
         epoch_loss_G_recon = 0.0
         epoch_loss_G_adv = 0.0
         epoch_loss_D_total = 0.0
-        epoch_loss_D_real = 0.0
-        epoch_loss_D_fake = 0.0
         epoch_recon_components = defaultdict(float)
+
+        # R1 Regularization hyperparameter
+        r1_gamma = self.config['loss'].get('r1_gamma', 10.0)
+        r1_freq = self.config['training'].get('r1_freq', 16)
+        
+        # Initialize wandb_log here for use in R1 logging scope
+        wandb_log = {}
 
         for batch_idx, batch in enumerate(pbar):
             # --- 1. Load Data ---
@@ -774,77 +817,72 @@ class ConditionalUNetGANTrainer:
                 logger.error(f"Error loading batch {batch_idx}: {e}")
                 continue # Skip batch on error
 
-            # --- Determine label shapes once ---
-            # Needed because discriminator output shape depends on architecture and input size
+            # --- Determine label shapes once (using correct conditional D forward) ---
             if self.adv_label_shape is None:
                 try:
                     with torch.no_grad(), torch.amp.autocast(device_type=str(self.device.type), enabled=self.use_amp):
-                         # Use a small slice to determine output shape efficiently
-                         dummy_pred = self.discriminator(hq[:1])
-                         # Store shape excluding batch dimension
+                         dummy_pred = self.discriminator(hq[:1], cond=lq[:1])
                          self.adv_label_shape = dummy_pred.shape[1:]
                     logger.info(f"Determined Discriminator output patch shape: {self.adv_label_shape}")
                 except Exception as e:
                     logger.error(f"Could not determine Discriminator output shape: {e}", exc_info=True)
                     raise # Cannot proceed without label shape
-
-            # Create labels for adversarial loss (LSGAN: real=1, fake=0) matching D output shape
-            current_batch_size = lq.size(0)
-            real_labels = torch.ones(current_batch_size, *self.adv_label_shape, device=self.device)
-            fake_labels = torch.zeros(current_batch_size, *self.adv_label_shape, device=self.device)
-
+            
             # --- 2. Train Discriminator ---
-            # Enable grads for D, disable for G
             for p in self.discriminator.parameters():
                 p.requires_grad = True
             for p in self.generator.parameters():
                 p.requires_grad = False
-
             optimizer_D.zero_grad(set_to_none=True)
 
-            # Generate fake image within autocast context and detach
+            # D Forward and Loss Calculation (using loss helpers)
             with torch.amp.autocast(device_type=str(self.device.type), enabled=self.use_amp):
+                # Generate fake image and detach
                 if self.model_needs_preset:
                     fake_hq = self.generator(lq, crf, preset).detach()
                 else:
                     fake_hq = self.generator(lq, crf).detach()
 
-            # Real forward + loss
-            with torch.amp.autocast(device_type=str(self.device.type), enabled=self.use_amp):
-                pred_real = self.discriminator(hq)
-                loss_D_real = self.adversarial_loss_fn(pred_real, real_labels)
-
-            # Fake forward + loss
-            with torch.amp.autocast(device_type=str(self.device.type), enabled=self.use_amp):
-                pred_fake = self.discriminator(fake_hq) # Use detached fake
-                loss_D_fake = self.adversarial_loss_fn(pred_fake, fake_labels)
-
-            # Combine, backward, and step for D
-            loss_D = (loss_D_real + loss_D_fake) * 0.5
-
-            if self.scaler: # CUDA AMP path for Discriminator backward
+                # Conditional D forward passes
+                pred_real = self.discriminator(hq, cond=lq)
+                pred_fake = self.discriminator(fake_hq, cond=lq) 
+                
+                # Use imported loss function (FIXED)
+                loss_D = d_loss_fn(pred_real, pred_fake, loss_type=self.gan_type)
+            
+            # --- R1 Regularization ---
+            if r1_gamma > 0 and self.global_step % r1_freq == 0: 
+                hq.requires_grad_(True)
+                
+                # R1 Forward Pass (non-AMP context for gradient stability)
+                with torch.amp.autocast(device_type=str(self.device.type), enabled=False): 
+                    d_real_r1 = self.discriminator(hq, cond=lq)
+                
+                # Calculate R1 penalty and add to loss
+                r1_penalty = r1_regularization(d_real_r1, hq)
+                loss_D_r1 = (r1_gamma / 2.0) * r1_penalty
+                loss_D = loss_D + loss_D_r1
+                
+                # Log R1 loss component and reset grad state
+                wandb_log['train/loss_D_r1'] = loss_D_r1.item()
+                hq.requires_grad_(False)
+            
+            # D Backward Pass and Step
+            if self.scaler:
                 self.scaler.scale(loss_D).backward()
-                # Optional: Clip D grads if needed (usually not necessary)
-                # self.scaler.unscale_(optimizer_D)
-                # torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), max_norm=1.0)
                 self.scaler.step(optimizer_D)
-                # Scaler update happens after G step
-            else: # Non-CUDA or no AMP path for Discriminator backward
+            else:
                 loss_D.backward()
-                # Optional: Clip D grads if needed
-                # torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), max_norm=1.0)
                 optimizer_D.step()
 
             # --- 3. Train Generator ---
-            # Enable grads for G, disable for D
             for p in self.discriminator.parameters():
                 p.requires_grad = False
             for p in self.generator.parameters():
                 p.requires_grad = True
-
             optimizer_G.zero_grad(set_to_none=True)
 
-            # Forward pass G + D and loss calculation within autocast
+            # Forward pass G + D and loss calculation
             with torch.amp.autocast(device_type=str(self.device.type), enabled=self.use_amp):
                 # Regenerate fake image to keep it in G's computation graph
                 if self.model_needs_preset:
@@ -852,9 +890,9 @@ class ConditionalUNetGANTrainer:
                 else:
                     fake_hq_for_G = self.generator(lq, crf)
 
-                # Adversarial loss (G tries to make D output 1 for fake images)
-                pred_fake_for_G = self.discriminator(fake_hq_for_G)
-                loss_G_adv = self.adversarial_loss_fn(pred_fake_for_G, real_labels)
+                # MODIFIED: Adversarial loss (Conditional D forward)
+                pred_fake_for_G = self.discriminator(fake_hq_for_G, cond=lq) 
+                loss_G_adv = g_loss_fn(pred_fake_for_G, loss_type=self.gan_type) 
 
                 # Reconstruction loss
                 loss_G_recon, recon_loss_dict = self.reconstruction_loss_fn(fake_hq_for_G, hq)
@@ -862,20 +900,17 @@ class ConditionalUNetGANTrainer:
                 # Combined Generator loss
                 loss_G = (loss_G_recon * self.lambda_recon) + (loss_G_adv * self.lambda_adv)
 
-            # Backward and step for G
-            if self.scaler: # CUDA AMP path for Generator backward
+            # G Backward Pass and Step
+            if self.scaler:
                 self.scaler.scale(loss_G).backward()
-                # Clip grads for G before step
                 grad_clip_G = self.config['optimizer_G'].get('grad_clip_norm', 0.0)
                 if grad_clip_G > 0:
-                    self.scaler.unscale_(optimizer_G) # Unscale before clipping
+                    self.scaler.unscale_(optimizer_G) 
                     torch.nn.utils.clip_grad_norm_(self.generator.parameters(), grad_clip_G)
                 self.scaler.step(optimizer_G)
-                # Update scaler ONCE per iteration, after both G and D steps
-                self.scaler.update()
-            else: # Non-CUDA or no AMP path for Generator backward
+                self.scaler.update() 
+            else:
                 loss_G.backward()
-                # Clip grads for G before step
                 grad_clip_G = self.config['optimizer_G'].get('grad_clip_norm', 0.0)
                 if grad_clip_G > 0:
                     torch.nn.utils.clip_grad_norm_(self.generator.parameters(), grad_clip_G)
@@ -887,13 +922,11 @@ class ConditionalUNetGANTrainer:
             if self.ema_G:
                 self.ema_G.update()
 
-            # Accumulate losses for epoch average
-            epoch_loss_D_real += loss_D_real.item()
-            epoch_loss_D_fake += loss_D_fake.item()
+            # Accumulate losses for epoch average (FIXED accumulation logic)
             epoch_loss_D_total += loss_D.item()
             epoch_loss_G_adv += loss_G_adv.item()
             epoch_loss_G_recon += loss_G_recon.item()
-            epoch_loss_G_total += loss_G.item() # Combined G loss
+            epoch_loss_G_total += loss_G.item()
             for k, v in recon_loss_dict.items():
                 epoch_recon_components[k] += v.item()
 
@@ -905,24 +938,22 @@ class ConditionalUNetGANTrainer:
                 Adv=f"{loss_G_adv.item():.3f}",
                 Recon=f"{loss_G_recon.item():.3f}",
                 LR_G=f"{lr_g:.2e}",
-                refresh=(batch_idx % 10 == 0) # Reduce refresh rate
+                refresh=(batch_idx % 10 == 0)
             )
 
             # W&B step logging
             if WANDB_AVAILABLE and wandb.run:
                 log_freq = self.config['training'].get('log_every_n_steps', 50)
                 if self.global_step % log_freq == 0:
-                    wandb_log = {
+                    wandb_log.update({
                         'train/loss_G_total': loss_G.item(),
                         'train/loss_G_recon': loss_G_recon.item(),
                         'train/loss_G_adv': loss_G_adv.item(),
                         'train/loss_D_total': loss_D.item(),
-                        'train/loss_D_real': loss_D_real.item(),
-                        'train/loss_D_fake': loss_D_fake.item(),
                         'train/lr_G': lr_g,
                         **{f'train/recon_{k.replace("loss_", "")}': v.item()
                            for k, v in recon_loss_dict.items()}
-                    }
+                    })
                     wandb.log(wandb_log, step=self.global_step)
 
             self.global_step += 1
@@ -942,14 +973,13 @@ class ConditionalUNetGANTrainer:
                     'epoch/avg_loss_G_recon': epoch_loss_G_recon / num_batches,
                     'epoch/avg_loss_G_adv': epoch_loss_G_adv / num_batches,
                     'epoch/avg_loss_D_total': avg_loss_D,
-                    'epoch/avg_loss_D_real': epoch_loss_D_real / num_batches,
-                    'epoch/avg_loss_D_fake': epoch_loss_D_fake / num_batches,
                     **{f'epoch/avg_recon_{k.replace("loss_", "")}': v
                        for k, v in avg_recon_comps.items()}
                 }
                 wandb.log(wandb_log, step=self.global_step)
         else:
             logger.warning("Train loader was empty for this epoch.")
+
 
     def _validate_and_checkpoint(
         self,
@@ -1441,6 +1471,10 @@ def parse_args():
         '--wandb_id', type=str, default=None,
         help="W&B run ID to resume logging."
     )
+    parser.add_argument(
+        '--pretrained', type=str, default=None,
+        help="Path to a checkpoint file for Generator pre-initialization (L1/L2 stage)."
+    )
     return parser.parse_args()
 
 
@@ -1454,7 +1488,8 @@ def main():
         trainer = ConditionalUNetGANTrainer(
             config_path=args.config,
             resume_from=args.resume,
-            wandb_id=args.wandb_id
+            wandb_id=args.wandb_id,
+            pretrained=args.pretrained
         )
         # Start the training loop
         trainer.train()
