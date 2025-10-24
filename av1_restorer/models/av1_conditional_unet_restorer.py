@@ -324,6 +324,12 @@ class FiLMLayer(nn.Module):
         # Generate scale (γ) and shift (β)
         params = self.mlp(conditioning)  # [B, 2C]
         gamma, beta = params.chunk(2, dim=1)  # [B, C], [B, C]
+
+        # ========== CRITICAL FIX: Clamp FiLM parameters ==========
+        # Prevents feature explosion: γ ∈ [-5, 5], β ∈ [-5, 5]
+        gamma = torch.clamp(gamma, min=-5.0, max=5.0)
+        beta = torch.clamp(beta, min=-5.0, max=5.0)
+        # =========================================================
         
         # Reshape for broadcasting: [B, C] → [B, C, 1, 1]
         gamma = gamma.view(B, C, 1, 1)
@@ -511,13 +517,26 @@ class AV1ConditionalUNetCRF(nn.Module):
         # ===== 3. BOTTLENECK =====
         b = self.bottleneck_down(skip3)
         b = F.gelu(self.bottleneck_bn(b))
-        
+
+        # ========== CLAMP 1: Init activation in Bottleneck =========
+        b = torch.clamp(b, min=-10.0, max=10.0)
+        # ====================================================================
+
         b = self.bottleneck_pre_attn(b)
         b = self.bottleneck_film1(b, cond)
-        
+
+        # ========== CLAMP 2: After first FiLM application ==========
+        b = torch.clamp(b, min=-10.0, max=10.0)
+        # ===========================================================
+
         b = self.bottleneck_attn(b)
-        
+
         b = self.bottleneck_film2(b, cond)
+
+        # ========== CLAMP 3: After second FiLM application ==========
+        b = torch.clamp(b, min=-10.0, max=10.0)
+        # ===========================================================
+
         b = self.bottleneck_post_attn(b)
         
         # ===== 4. DECODER PATH =====

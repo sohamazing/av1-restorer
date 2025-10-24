@@ -18,7 +18,7 @@ project:
   name: "AV1-Restorer"
   # A descriptive name for this specific training run.
   # Recommendation: model-size_crf-range_conditioning-mode (e.g., base_crf23-63_full or base_crf23-63_crf-only)
-  experiment_name: "conditional_unet_base_m4" # UPDATE: Reflect size, CRF range, mode.
+  experiment_name: "conditional_unet_base_M4" # UPDATE: Reflect size, CRF range, mode.
   # Set to true to log metrics, checkpoints, and samples to W&B.
   log_to_wandb: true
 
@@ -67,25 +67,25 @@ dataset:
 # Helps the model learn coarse features first, then refine details.
 curriculum:
   # Stage 1: Smaller patches, typically larger batch size. Focus on basic structure.
-  - patch_size: 128
-    # Adjust based on GPU VRAM. U-Net models require more memory than Nano variants.
-    batch_size: 64 # Example, tune based on hardware (e.g., 16, 32, 64)
-    epochs: 100      # Number of epochs for this stage.
+  # - patch_size: 128
+  #  # Adjust based on GPU VRAM. U-Net models require more memory than Nano variants.
+  #  batch_size: 64 # Example, tune based on hardware (e.g., 16, 32, 64)
+  #  epochs: 100      # Number of epochs for this stage.
 
   # Stage 2: Larger patches, smaller batch size. Focus on finer details.
-  - patch_size: 192
-    batch_size: 24    # Reduce significantly due to quadratic memory increase with patch size.
+  - patch_size: 128
+    batch_size: 48    # Reduce significantly due to quadratic memory increase with patch size.
     epochs: 100
 
   # Stage 3: (Optional) Final fine-tuning on largest patches. Very small batch size.
   - patch_size: 256
-    batch_size: 16     # May require gradient accumulation or very large VRAM.
-    epochs: 50
+    batch_size: 12     # May require gradient accumulation or very large VRAM.
+    epochs: 100
 
   # Stage 4: (Optional) Final fine-tuning on largest patches. Very small batch size.
   - patch_size: 512
     batch_size: 4     # May require gradient accumulation or very large VRAM.
-    epochs: 10
+    epochs: 20
 
 # ------------------------------------------------------------------------------
 # Model Configuration (Generator - Conditional U-Net Only)
@@ -115,7 +115,7 @@ loss:
   # Perceptual Loss (VGG or LPIPS features)
   perceptual:
     enabled: true
-    weight: 0.01      # Tune carefully (e.g., 0.001 to 0.1). U-Net might tolerate higher weight than Nano.
+    weight: 0.5      # Tune carefully (e.g., 0.01 to 1.0). Conditional-U-Net might tolerate higher weight than Nano.
     params:
       network: 'vgg'  # 'vgg' (faster, ImageNet features) or 'lpips' (learned perceptual metric).
 
@@ -128,7 +128,7 @@ loss:
   # Frequency Domain Loss (e.g., L1 on FFT magnitudes)
   frequency:
     enabled: true
-    weight: 0.05      # Contribution weight if enabled.
+    weight: 0.01      # Contribution weight if enabled.
     params: {alpha: 1.0} # alpha=1.0 for magnitude only, 0.0 for phase only.
 
   # Standard L1 / L2 (MSE) Losses (Usually disable if using Charbonnier)
@@ -174,7 +174,7 @@ training:
 # ------------------------------------------------------------------------------
 checkpoint:
   # Directory where model checkpoints will be saved.
-  dir: "./checkpoints/conditional_unet_base_m4/" # UPDATE: Match experiment name or use a common base.
+  dir: "./checkpoints/conditional_unet_base_M4/" # UPDATE: Match experiment name or use a common base.
   # Frequency to save the 'latest.pth' checkpoint (in epochs). 0 disables.
   save_every_n_epochs: 1
 

@@ -1,6 +1,10 @@
-# av1_restorer/models/av1_nano_unet_restorer.py
 """
 AV1 Nano U-Net Restorer: Ultra-Lightweight 3-Level U-Net for AV1 Artifact Removal
+Finalized Ultimate Lightweight Nano UNet:
+  - BatchNorm -> GroupNorm (robust for small batches)
+  - SE -> ECA (Efficient Channel Attention)
+  - Depthwise separable convs with GroupNorm + GELU
+  - Residual scaling on final predicted residual for stability
 
 ==============================================================================
 ARCHITECTURE OVERVIEW
@@ -26,294 +30,259 @@ Architecture Flow:
                 → Output = Input + Residual
 
 ==============================================================================
-Author: Soham Mukherjee
-Version: 2.0 (Professional)
+
+Author: Soham Mukherjee (adapted)
+Version: 2.1 (Optimized)
 License: MIT
-==============================================================================
 """
+import logging
+from typing import Tuple, Dict
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple, Dict
-import logging
 
 logger = logging.getLogger(__name__)
 
 
 # ==============================================================================
-# SECTION 1: Core Building Blocks
+# SECTION 1: Core Building Blocks (GroupNorm + ECA + DWS)
 # ==============================================================================
+
+def choose_num_groups(channels: int, preferred: int = 16) -> int:
+    """Return preferred group count if divisible, else 1 for stability."""
+    return preferred if channels % preferred == 0 else 1
+
 
 class DepthwiseSeparable(nn.Module):
     """
-    Depthwise Separable Convolution: 8× parameter reduction vs standard conv.
-    
-    Flow: Depthwise (spatial, per-channel) → Pointwise (1×1, channel mixing)
-          → BatchNorm → GELU
-    
+    Depthwise Separable Convolution using GroupNorm and GELU.
+
+    Flow: Depthwise (per-channel 3x3) -> Pointwise (1x1) -> GroupNorm -> GELU
+
     Args:
         in_ch: Input channels
         out_ch: Output channels
-        stride: Convolution stride (1 for same size, 2 for downsampling)
+        stride: Convolution stride (1 or 2)
+        num_groups: preferred GroupNorm groups (default 16)
     """
-    def __init__(self, in_ch: int, out_ch: int, stride: int = 1):
+    def __init__(self, in_ch: int, out_ch: int, stride: int = 1, num_groups: int = 16):
         super().__init__()
+        padding = 1
         self.depthwise = nn.Conv2d(
-            in_ch, in_ch, kernel_size=3, stride=stride, 
-            padding=1, groups=in_ch, bias=False
+            in_ch, in_ch, kernel_size=3, stride=stride, padding=padding, groups=in_ch, bias=False
         )
         self.pointwise = nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=False)
-        self.bn = nn.BatchNorm2d(out_ch)
+
+        gn_groups = choose_num_groups(out_ch, num_groups)
+        self.norm = nn.GroupNorm(num_groups=gn_groups, num_channels=out_ch)
         self.act = nn.GELU()
-    
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.act(self.bn(self.pointwise(self.depthwise(x))))
+        x = self.depthwise(x)
+        x = self.pointwise(x)
+        x = self.norm(x)
+        return self.act(x)
 
 
-class SqueezeExcitation(nn.Module):
+class ECA(nn.Module):
     """
-    Squeeze-and-Excitation: Efficient channel attention (Hu et al., CVPR 2018).
-    
-    Mechanism: Global pooling → FC compress → ReLU → FC expand → Sigmoid → Scale
-    Parameters: <1% of total, but improves quality by 5-10%
-    
+    Efficient Channel Attention (ECA).
+    Lightweight alternative to SE: uses 1D conv across channel descriptors.
     Args:
-        channels: Number of channels
-        reduction: Compression ratio (higher = fewer params, less capacity)
+        channels: number of channels
+        kernel_size: kernel size for 1D conv (odd recommended: 3,5,7)
     """
-    def __init__(self, channels: int, reduction: int = 8):
+    def __init__(self, channels: int, kernel_size: int = 3):
         super().__init__()
-        self.squeeze = nn.AdaptiveAvgPool2d(1)
-        self.excitation = nn.Sequential(
-            nn.Conv2d(channels, channels // reduction, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(channels // reduction, channels, 1),
-            nn.Sigmoid()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        # ECA uses a 1D conv over the channel dimension after pooling.
+        # Input shape to conv1d: (B, 1, C)
+        self.conv = nn.Conv1d(
+            in_channels=1,
+            out_channels=1,
+            kernel_size=kernel_size,
+            padding=(kernel_size - 1) // 2,
+            bias=False
         )
-    
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x * self.excitation(self.squeeze(x))
+        b, c, _, _ = x.shape
+        y = self.avg_pool(x).view(b, 1, c)       # (B, 1, C)
+        y = self.conv(y)                         # (B, 1, C)
+        y = torch.sigmoid(y).view(b, c, 1, 1)    # (B, C, 1, 1)
+        return x * y
 
 
 class MicroResBlock(nn.Module):
     """
-    Efficient residual block: 2× DWS Conv + SE attention.
-    
-    Parameters: ~2C² vs standard ResBlock: ~9C²
-    
-    Flow: Input → DWSConv → DWSConv → SE → Add(input)
+    Efficient residual block: 2 x DepthwiseSeparable + ECA attention.
+    Flow: x -> DWS -> DWS -> ECA -> x + out
     """
-    def __init__(self, channels: int):
+    def __init__(self, channels: int, num_groups: int = 16, eca_kernel: int = 3):
         super().__init__()
-        self.conv1 = DepthwiseSeparable(channels, channels)
-        self.conv2 = DepthwiseSeparable(channels, channels)
-        self.se = SqueezeExcitation(channels, reduction=8)
-    
+        self.conv1 = DepthwiseSeparable(channels, channels, stride=1, num_groups=num_groups)
+        self.conv2 = DepthwiseSeparable(channels, channels, stride=1, num_groups=num_groups)
+        self.attn = ECA(channels, kernel_size=eca_kernel)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         identity = x
         out = self.conv1(x)
         out = self.conv2(out)
-        out = self.se(out)
+        out = self.attn(out)
         return identity + out
 
 
 class MultiScaleFusion(nn.Module):
     """
-    Multi-scale feature fusion for skip connections.
-    
-    Concatenates upsampled decoder features with encoder skip features,
-    then fuses with 1×1 conv. Preserves both high and low frequency details.
-    
-    Args:
-        channels: Channel count (must match for both inputs)
+    Multi-scale feature fusion for skip connections using GroupNorm.
+    Concatenate decoder upsampled features with encoder skip and fuse via 1x1 conv.
     """
-    def __init__(self, channels: int):
+    def __init__(self, channels: int, num_groups: int = 16):
         super().__init__()
+        gn_groups = choose_num_groups(channels, num_groups)
         self.fusion = nn.Sequential(
             nn.Conv2d(channels * 2, channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(channels),
+            nn.GroupNorm(gn_groups, channels),
             nn.GELU()
         )
-    
+
     def forward(self, x_up: torch.Tensor, x_skip: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x_up: Upsampled features from decoder
-            x_skip: Skip connection from encoder
-        Returns:
-            Fused features
-        """
         return self.fusion(torch.cat([x_up, x_skip], dim=1))
 
 
 # ==============================================================================
-# SECTION 2: Main U-Net Architecture
+# SECTION 2: AV1NanoUnetRestorer (uses upgraded blocks)
 # ==============================================================================
 
 class AV1NanoUnetRestorer(nn.Module):
     """
     Ultra-lightweight 3-level U-Net for specialized CRF range artifact removal.
-    
+    - Replaces BatchNorm with GroupNorm.
+    - Uses ECA instead of SE for attention.
+    - Depthwise separable convs everywhere.
+    - Predicts a scaled residual which is added to the input.
+
     Key Design Decisions:
         • 3 encoder/decoder levels (vs 5 in full U-Net) → speed
         • No bottleneck self-attention → avoid computational cost
         • Depthwise separable convs everywhere → parameter efficiency
         • SE blocks for channel attention → cheap quality boost
         • Non-conditional → train separate models per CRF bucket
-    
-    Model Sizes:
-        nano:  20 base channels, [2,2,2] blocks → ~0.2M params
-        tiny:  24 base channels, [2,2,3] blocks → ~0.5M params
-        small: 32 base channels, [2,3,4] blocks → ~1.2M params
-        base:  48 base channels, [3,3,4] blocks → ~2.5M params
-        large: 64 base channels, [4,4,6] blocks → ~6.2M params
-        huge:  64 base channels, [4,6,12] blocks → ~11.2M params
-
-    
-    Args:
-        size: Model variant ('tiny', 'small', 'base', 'large')
-        crf_min: Minimum CRF value this model handles
-        crf_max: Maximum CRF value this model handles
-        norm_range: Image normalization range ((-1,1) or (0,1))
-    
-    Example:
-        >>> # Create model for medium compression (CRF 34-43)
-        >>> model = AV1NanoUnetRestorer('small', crf_min=34, crf_max=43)
-        >>> x = torch.randn(1, 3, 1080, 1920)
-        >>> restored = model.inference(x)
     """
-    
-    SIZE_CONFIGS: Dict[str, Dict] = {
-        'nano': {
-            'base_ch': 16,
-            'blocks_per_level': [2, 2, 2],  # [enc1, enc2, enc3]
-        },
-        'tiny': {
-            'base_ch': 24,
-            'blocks_per_level': [2, 2, 3],  
-        },
-        'small': {
-            'base_ch': 32,
-            'blocks_per_level': [2, 3, 4],
-        },
-        'base': {
-            'base_ch': 48,
-            'blocks_per_level': [3, 3, 4],
-        },
-        'large': {
-            'base_ch': 64,
-            'blocks_per_level': [4, 4, 6],
-        },
-        'huge': {
-            'base_ch': 64,
-            'blocks_per_level': [6, 8, 12],
-        },
 
+    SIZE_CONFIGS: Dict[str, Dict] = {
+        'nano':  {'base_ch': 16, 'blocks_per_level': [2, 2, 2]},
+        'tiny':  {'base_ch': 24, 'blocks_per_level': [2, 2, 3]},
+        'small': {'base_ch': 32, 'blocks_per_level': [2, 3, 4]},
+        'base':  {'base_ch': 48, 'blocks_per_level': [3, 3, 4]},
+        'large': {'base_ch': 64, 'blocks_per_level': [4, 4, 6]},
+        'huge':  {'base_ch': 64, 'blocks_per_level': [6, 8, 12]},
     }
-    
+
     def __init__(
         self,
         size: str = 'small',
         crf_min: int = 23,
         crf_max: int = 63,
-        norm_range: Tuple[float, float] = (-1, 1)
+        norm_range: Tuple[float, float] = (-1, 1),
+        res_scale: float = 0.1,
+        gn_groups: int = 16,
     ):
         super().__init__()
-        
+
         if size not in self.SIZE_CONFIGS:
-            raise ValueError(
-                f"Unknown size: '{size}'. "
-                f"Choose from: {list(self.SIZE_CONFIGS.keys())}"
-            )
-        
+            raise ValueError(f"Unknown size: '{size}'. Choose from: {list(self.SIZE_CONFIGS.keys())}")
+
         cfg = self.SIZE_CONFIGS[size]
         base = cfg['base_ch']
         blocks = cfg['blocks_per_level']
-        
+
         self.size = size
         self.crf_min = crf_min
         self.crf_max = crf_max
         self.clamp_min, self.clamp_max = norm_range
-        
+        self.res_scale = nn.Parameter(torch.tensor(res_scale, dtype=torch.float32))
+        self._gn_groups = gn_groups
+
         logger.info("=" * 60)
         logger.info(f"Initializing AV1NanoUnetRestorer ({size})")
         logger.info(f"  Base channels: {base}")
         logger.info(f"  Blocks per level: {blocks}")
         logger.info(f"  CRF Range: {crf_min}-{crf_max}")
         logger.info(f"  Normalization: [{norm_range[0]}, {norm_range[1]}]")
+        logger.info(f"  Residual scale: {self.res_scale}")
         logger.info("=" * 60)
-        
-        # ===== Input Head: 3ch → base_ch with initial processing =====
+
+        # ===== Input head =====
+        head_gn = choose_num_groups(base, self._gn_groups)
         self.head = nn.Sequential(
             nn.Conv2d(3, base, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(base),
+            nn.GroupNorm(head_gn, base),
             nn.GELU(),
-            *[MicroResBlock(base) for _ in range(2)]
+            *[MicroResBlock(base, num_groups=self._gn_groups) for _ in range(2)]
         )
-        
-        # ===== Encoder Path (3 levels with downsampling) =====
-        # Level 1: base → base*2, H/2
+
+        # ===== Encoder =====
+        # Enc1: base -> base*2 (downsample)
         self.enc1 = nn.ModuleList([
-            DepthwiseSeparable(base, base*2, stride=2),
-            *[MicroResBlock(base*2) for _ in range(blocks[0])]
+            DepthwiseSeparable(base, base * 2, stride=2, num_groups=self._gn_groups),
+            *[MicroResBlock(base * 2, num_groups=self._gn_groups) for _ in range(blocks[0])]
         ])
-        
-        # Level 2: base*2 → base*4, H/4
+
+        # Enc2: base*2 -> base*4 (downsample)
         self.enc2 = nn.ModuleList([
-            DepthwiseSeparable(base*2, base*4, stride=2),
-            *[MicroResBlock(base*4) for _ in range(blocks[1])]
+            DepthwiseSeparable(base * 2, base * 4, stride=2, num_groups=self._gn_groups),
+            *[MicroResBlock(base * 4, num_groups=self._gn_groups) for _ in range(blocks[1])]
         ])
-        
-        # Level 3: base*4 → base*8, H/8
+
+        # Enc3: base*4 -> base*8 (downsample)
         self.enc3 = nn.ModuleList([
-            DepthwiseSeparable(base*4, base*8, stride=2),
-            *[MicroResBlock(base*8) for _ in range(blocks[2])]
+            DepthwiseSeparable(base * 4, base * 8, stride=2, num_groups=self._gn_groups),
+            *[MicroResBlock(base * 8, num_groups=self._gn_groups) for _ in range(blocks[2])]
         ])
-        
-        # ===== Decoder Path (3 levels with upsampling + skip fusion) =====
-        # Level 3: base*8 → base*4, H/4, fuse with enc2 skip
+
+        # ===== Decoder =====
+        # Dec3: base*8 -> base*4 (upsample) + fuse with skip2
+        dec3_gn = choose_num_groups(base * 4, self._gn_groups)
         self.dec3_up = nn.Sequential(
-            nn.ConvTranspose2d(base*8, base*4, kernel_size=2, stride=2, bias=False),
-            nn.BatchNorm2d(base*4),
+            nn.ConvTranspose2d(base * 8, base * 4, kernel_size=2, stride=2, bias=False),
+            nn.GroupNorm(dec3_gn, base * 4),
             nn.GELU()
         )
-        self.dec3_fusion = MultiScaleFusion(base*4)
-        self.dec3_blocks = nn.Sequential(
-            *[MicroResBlock(base*4) for _ in range(blocks[1])]
-        )
-        
-        # Level 2: base*4 → base*2, H/2, fuse with enc1 skip
+        self.dec3_fusion = MultiScaleFusion(base * 4, num_groups=self._gn_groups)
+        self.dec3_blocks = nn.Sequential(*[MicroResBlock(base * 4, num_groups=self._gn_groups) for _ in range(blocks[1])])
+
+        # Dec2: base*4 -> base*2 (upsample) + fuse with skip1
+        dec2_gn = choose_num_groups(base * 2, self._gn_groups)
         self.dec2_up = nn.Sequential(
-            nn.ConvTranspose2d(base*4, base*2, kernel_size=2, stride=2, bias=False),
-            nn.BatchNorm2d(base*2),
+            nn.ConvTranspose2d(base * 4, base * 2, kernel_size=2, stride=2, bias=False),
+            nn.GroupNorm(dec2_gn, base * 2),
             nn.GELU()
         )
-        self.dec2_fusion = MultiScaleFusion(base*2)
-        self.dec2_blocks = nn.Sequential(
-            *[MicroResBlock(base*2) for _ in range(blocks[0])]
-        )
-        
-        # Level 1: base*2 → base, H, fuse with head skip
+        self.dec2_fusion = MultiScaleFusion(base * 2, num_groups=self._gn_groups)
+        self.dec2_blocks = nn.Sequential(*[MicroResBlock(base * 2, num_groups=self._gn_groups) for _ in range(blocks[0])])
+
+        # Dec1: base*2 -> base (upsample) + fuse with head skip
+        dec1_gn = choose_num_groups(base, self._gn_groups)
         self.dec1_up = nn.Sequential(
-            nn.ConvTranspose2d(base*2, base, kernel_size=2, stride=2, bias=False),
-            nn.BatchNorm2d(base),
+            nn.ConvTranspose2d(base * 2, base, kernel_size=2, stride=2, bias=False),
+            nn.GroupNorm(dec1_gn, base),
             nn.GELU()
         )
-        self.dec1_fusion = MultiScaleFusion(base)
-        self.dec1_blocks = nn.Sequential(
-            *[MicroResBlock(base) for _ in range(2)]
-        )
-        
-        # ===== Output Tail: Predict 3-channel residual =====
+        self.dec1_fusion = MultiScaleFusion(base, num_groups=self._gn_groups)
+        self.dec1_blocks = nn.Sequential(*[MicroResBlock(base, num_groups=self._gn_groups) for _ in range(2)])
+
+        # ===== Tail: predict 3-channel residual =====
         self.tail = nn.Sequential(
-            MicroResBlock(base),
+            MicroResBlock(base, num_groups=self._gn_groups),
             nn.Conv2d(base, 3, kernel_size=3, padding=1)
         )
-        
+
+        # initialize weights
         self._init_weights()
-        
-        # Log statistics
+
+        # Logging sizes
         total_params = sum(p.numel() for p in self.parameters())
         trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
         logger.info(f"✓ Model initialized")
@@ -321,30 +290,44 @@ class AV1NanoUnetRestorer(nn.Module):
         logger.info(f"  Trainable: {trainable_params:,} params")
         logger.info(f"  Size (FP32): ~{total_params * 4 / 1e6:.1f} MB")
         logger.info("=" * 60)
-    
+
     def _init_weights(self):
         """
-        Initialize weights for stable training.
-        
-        Strategy:
-            • Conv/ConvTranspose: Kaiming (He) init for ReLU-family activations
-            • BatchNorm: ones (weight) + zeros (bias)
-            • Final tail: zero init → network outputs 0 at start (identity map)
+        Initialize weights for stable training (GroupNorm included).
+        - Convs: Kaiming normal
+        - GroupNorm: weight=1, bias=0
+        - Final conv in tail: zero-init (so network starts as identity)
         """
         for m in self.modules():
             if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
+                if hasattr(m, "weight") and m.weight is not None:
+                    nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if hasattr(m, "bias") and m.bias is not None:
                     nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.ones_(m.weight)
-                nn.init.zeros_(m.bias)
-        
-        # Zero-init final layer for residual learning
-        nn.init.zeros_(self.tail[-1].weight)
-        nn.init.zeros_(self.tail[-1].bias)
-        logger.info("✓ Weights initialized (tail zeroed for residual learning)")
-    
+            elif isinstance(m, nn.GroupNorm):
+                if hasattr(m, "weight") and m.weight is not None:
+                    nn.init.ones_(m.weight)
+                if hasattr(m, "bias") and m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+        # Zero-init final layer of tail for residual learning (if exists)
+        final_conv = None
+        if isinstance(self.tail, nn.Sequential) and len(self.tail) > 0:
+            # expect last module to be Conv2d
+            if isinstance(self.tail[-1], nn.Conv2d):
+                final_conv = self.tail[-1]
+        if isinstance(final_conv, nn.Conv2d):
+            if hasattr(final_conv, "weight") and final_conv.weight is not None:
+                nn.init.zeros_(final_conv.weight)
+            if hasattr(final_conv, "bias") and final_conv.bias is not None:
+                nn.init.zeros_(final_conv.bias)
+
+        # if hasattr(self, "res_scale"):
+        #     with torch.no_grad():
+        #         self.res_scale.clamp_(0.0, 1.0)
+
+        logger.info("✓ Weights initialized (tail final conv zeroed for residual start)")
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass: Input + Predicted Residual.
@@ -362,41 +345,41 @@ class AV1NanoUnetRestorer(nn.Module):
             4. Output: Input + Residual (residual learning)
         """
         # Encoder path with skip storage
-        skip0 = self.head(x)  # [B, base, H, W]
-        
+        skip0 = self.head(x)  # base channels, H, W
+
         enc1 = skip0
         for layer in self.enc1:
             enc1 = layer(enc1)
-        skip1 = enc1  # [B, base*2, H/2, W/2]
-        
+        skip1 = enc1  # base*2, H/2, W/2
+
         enc2 = skip1
         for layer in self.enc2:
             enc2 = layer(enc2)
-        skip2 = enc2  # [B, base*4, H/4, W/4]
-        
+        skip2 = enc2  # base*4, H/4, W/4
+
         enc3 = skip2
         for layer in self.enc3:
-            enc3 = layer(enc3)  # [B, base*8, H/8, W/8]
-        
+            enc3 = layer(enc3)  # base*8, H/8, W/8
+
         # Decoder path with skip fusion
         dec3 = self.dec3_up(enc3)
         dec3 = self.dec3_fusion(dec3, skip2)
         dec3 = self.dec3_blocks(dec3)
-        
+
         dec2 = self.dec2_up(dec3)
         dec2 = self.dec2_fusion(dec2, skip1)
         dec2 = self.dec2_blocks(dec2)
-        
+
         dec1 = self.dec1_up(dec2)
         dec1 = self.dec1_fusion(dec1, skip0)
         dec1 = self.dec1_blocks(dec1)
-        
-        # Predict residual and add to input
-        residual = self.tail(dec1)
+
+        # Predict residual and add scaled residual to input
+        residual = self.tail(dec1) * torch.clamp(self.res_scale, 0.0, 1.0)
         restored = x + residual
-        
+
         return torch.clamp(restored, self.clamp_min, self.clamp_max)
-    
+
     @torch.no_grad()
     def inference(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -413,110 +396,70 @@ class AV1NanoUnetRestorer(nn.Module):
         """
         self.eval()
         B, C, H, W = x.shape
-        
         # Calculate padding needed (must be divisible by 8)
         pad_h = (8 - H % 8) % 8
         pad_w = (8 - W % 8) % 8
-        
+
         if pad_h > 0 or pad_w > 0:
             # Pad, process, crop
             x_padded = F.pad(x, (0, pad_w, 0, pad_h), mode='reflect')
             output = self.forward(x_padded)
             return output[:, :, :H, :W]
-        
         return self.forward(x)
 
 
 # ==============================================================================
-# SECTION 3: Model Factory
+# SECTION 3: Factory
 # ==============================================================================
 
 def create_av1_nano_unet_restorer(
     size: str = 'small',
     crf_min: int = 23,
     crf_max: int = 63,
-    norm_range: Tuple[float, float] = (-1, 1)
+    norm_range: Tuple[float, float] = (-1, 1),
+    res_scale: float = 0.1,
+    gn_groups: int = 16,
 ) -> AV1NanoUnetRestorer:
-    """
-    Factory function for creating AV1 Nano U-Net models.
-    
-    Recommended Strategy: Train separate models per CRF bucket
-        • Low:    CRF 23-33 (light artifacts)
-        • Medium: CRF 34-43 (moderate artifacts)
-        • High:   CRF 44-53 (heavy artifacts)
-        • Extreme: CRF 54-63 (severe artifacts)
-    
-    Args:
-        size: 'tiny' (0.8M), 'small' (1.5M), or 'base' (2.5M)
-        crf_min: Minimum CRF value for specialization
-        crf_max: Maximum CRF value for specialization
-        norm_range: Image normalization range
-    
-    Returns:
-        Initialized AV1NanoUnetRestorer model
-    
-    Example:
-        >>> # Create models for each compression tier
-        >>> model_med = create_av1_nano_unet_restorer(
-        ...     size='small', crf_min=34, crf_max=43
-        ... )
-        >>> 
-        >>> # At inference, select based on known CRF
-        >>> if 34 <= crf <= 43:
-        ...     restored = model_med.inference(compressed_image)
-    """
     logger.info(f"Creating AV1NanoUnetRestorer (size={size}, CRF={crf_min}-{crf_max})")
-    return AV1NanoUnetRestorer(size, crf_min, crf_max, norm_range)
+    return AV1NanoUnetRestorer(size=size, crf_min=crf_min, crf_max=crf_max,
+                               norm_range=norm_range, res_scale=res_scale, gn_groups=gn_groups)
 
 
 # ==============================================================================
-# SECTION 4: Testing & Benchmarking
+# SECTION 4: Quick test harness (run as script)
 # ==============================================================================
 
 if __name__ == "__main__":
-    import logging
     import time
-    
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s | %(levelname)s | %(message)s'
-    )
-    
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
+
     print("\n" + "=" * 70)
-    print("AV1 Nano U-Net Restorer - Model Testing")
+    print("AV1 Nano U-Net Restorer - Model Testing (GroupNorm + ECA)")
     print("=" * 70 + "\n")
-    
-    # Test all model sizes
-    for size in ['nano', 'tiny', 'small', 'base', 'large', 'huge']:        
+
+    for size in ['nano', 'tiny', 'small', 'base', 'large', 'huge']:
         print(f"\n{'=' * 70}")
         print(f"Testing: {size.upper()} unet variant")
         print('=' * 70)
-        
-        # Create model
-        model = create_av1_nano_unet_restorer(
-            size=size,
-            crf_min=23,
-            crf_max=33,
-            norm_range=(-1, 1)
-        )
+
+        model = create_av1_nano_unet_restorer(size=size, crf_min=23, crf_max=33, norm_range=(-1, 1))
         model.eval()
-        
+
         # Parameter count
         total = sum(p.numel() for p in model.parameters())
         print(f"\nParameters: {total:,} ({total/1e6:.2f}M)")
         print(f"Model Size: ~{total * 4 / 1e6:.1f} MB (FP32), ~{total * 2 / 1e6:.1f} MB (FP16)")
-        
+
         # Test forward pass
         print(f"\nForward Pass Test:")
         x = torch.randn(2, 3, 256, 256)
         with torch.no_grad():
             output = model(x)
-        
         print(f"  Input:  {x.shape}, range [{x.min():.3f}, {x.max():.3f}]")
         print(f"  Output: {output.shape}, range [{output.min():.3f}, {output.max():.3f}]")
         assert output.shape == x.shape, "Shape mismatch"
         assert output.min() >= -1.0 and output.max() <= 1.0, "Range violation"
-        
+
         # Test inference with odd dimensions
         print(f"\nOdd Dimensions Test:")
         x_odd = torch.randn(1, 3, 333, 555)
@@ -524,27 +467,22 @@ if __name__ == "__main__":
             output_odd = model.inference(x_odd)
         print(f"  {x_odd.shape} → {output_odd.shape} ✓")
         assert output_odd.shape == x_odd.shape, "Inference shape mismatch"
-        
-        # Speed benchmark
-        print(f"\nSpeed Benchmark (1080p, 10 iterations, CPU):")
+
+        # CPU speed benchmark
+        print(f"\nSpeed Benchmark (1080p, 5 iterations, CPU):")
         x_1080p = torch.randn(1, 3, 1080, 1920)
-        
         with torch.no_grad():
-            # Warmup
-            _ = model.inference(x_1080p)
-            
-            # Benchmark
+            _ = model.inference(x_1080p)  # warmup
             times = []
-            for _ in range(10):
+            for _ in range(5):
                 start = time.time()
                 _ = model.inference(x_1080p)
                 times.append(time.time() - start)
-        
         avg_time = sum(times) / len(times)
         print(f"  Avg time: {avg_time * 1000:.1f} ms ({1.0/avg_time:.1f} fps)")
-        
+
         print(f"\n✓ All tests passed for {size.upper()}")
-    
+
     print("\n" + "=" * 70)
     print("Summary")
     print("=" * 70)
