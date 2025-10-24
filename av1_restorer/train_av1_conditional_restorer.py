@@ -523,7 +523,7 @@ class ConditionalUNetTrainer:
         
         val_loader = DataLoader(
             val_dset,
-            batch_size=batch_size * 2,
+            batch_size=batch_size,
             shuffle=False,
             num_workers=max(2, num_workers // 2),
             pin_memory=pin_memory,

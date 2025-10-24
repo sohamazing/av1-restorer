@@ -528,7 +528,7 @@ class NonConditionalTrainer:
         
         val_loader = DataLoader(
             val_dset, 
-            batch_size=batch_size * 2, 
+            batch_size=batch_size, 
             shuffle=False, 
             drop_last=False,
             num_workers=max(2, num_workers // 2), 

@@ -18,7 +18,7 @@ project:
   name: "AV1-Restorer"
   # A descriptive name for this specific training run.
   # Recommendation: model-size_crf-range_conditioning-mode (e.g., base_crf23-63_full or base_crf23-63_crf-only)
-  experiment_name: "unet_base_crf23-63_full" # UPDATE: Reflect size, CRF range, mode.
+  experiment_name: "conditional_unet_base_m4" # UPDATE: Reflect size, CRF range, mode.
   # Set to true to log metrics, checkpoints, and samples to W&B.
   log_to_wandb: true
 
@@ -53,7 +53,7 @@ dataset:
   #   The dataset loader will filter samples based on this range.
   # - Set to a single value (e.g., [4, 4]) to train the CRF-Only model variant.
   #   The dataset loader will filter samples to only include this preset.
-  preset_range: [0, 8] # UPDATE: Change to e.g., [4, 4] for CRF-Only training.
+  preset_range: [4, 4] # UPDATE: Change to e.g., [4, 4] for CRF-Only training.
 
   # Normalization applied to images before entering the model.
   # [-1, 1] is common for GANs and many modern networks using activations like Tanh/LeakyReLU.
@@ -70,17 +70,22 @@ curriculum:
   - patch_size: 128
     # Adjust based on GPU VRAM. U-Net models require more memory than Nano variants.
     batch_size: 64 # Example, tune based on hardware (e.g., 16, 32, 64)
-    epochs: 150      # Number of epochs for this stage.
+    epochs: 100      # Number of epochs for this stage.
 
   # Stage 2: Larger patches, smaller batch size. Focus on finer details.
-  - patch_size: 256
-    batch_size: 16    # Reduce significantly due to quadratic memory increase with patch size.
+  - patch_size: 192
+    batch_size: 24    # Reduce significantly due to quadratic memory increase with patch size.
     epochs: 100
 
   # Stage 3: (Optional) Final fine-tuning on largest patches. Very small batch size.
-  # - patch_size: 512
-  #   batch_size: 4     # May require gradient accumulation or very large VRAM.
-  #   epochs: 50
+  - patch_size: 256
+    batch_size: 16     # May require gradient accumulation or very large VRAM.
+    epochs: 50
+
+  # Stage 4: (Optional) Final fine-tuning on largest patches. Very small batch size.
+  - patch_size: 512
+    batch_size: 4     # May require gradient accumulation or very large VRAM.
+    epochs: 10
 
 # ------------------------------------------------------------------------------
 # Model Configuration (Generator - Conditional U-Net Only)
@@ -116,13 +121,13 @@ loss:
 
   # Multi-Scale Structural Similarity Index (Focuses on structure across scales)
   ms_ssim:
-    enabled: false    # Can slow down training slightly.
+    enabled: true    # Can slow down training slightly.
     weight: 0.1       # Contribution weight if enabled.
     params: {}        # Uses default parameters.
 
   # Frequency Domain Loss (e.g., L1 on FFT magnitudes)
   frequency:
-    enabled: false
+    enabled: true
     weight: 0.05      # Contribution weight if enabled.
     params: {alpha: 1.0} # alpha=1.0 for magnitude only, 0.0 for phase only.
 
@@ -169,7 +174,7 @@ training:
 # ------------------------------------------------------------------------------
 checkpoint:
   # Directory where model checkpoints will be saved.
-  dir: "./checkpoints/unet_base_crf23-63_full/" # UPDATE: Match experiment name or use a common base.
+  dir: "./checkpoints/conditional_unet_base_m4/" # UPDATE: Match experiment name or use a common base.
   # Frequency to save the 'latest.pth' checkpoint (in epochs). 0 disables.
   save_every_n_epochs: 1
 
