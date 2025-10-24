@@ -22,90 +22,11 @@ from typing import Tuple, List, Union, Optional
 import logging
 logger = logging.getLogger(__name__)
 
+from .blocks import DepthwiseSeparable, ECA, EfficientResBlock
 
 # ==============================================================================
-# SECTION 1: Core Building Blocks
+# SECTION 2: Conditioning + Channel Attention 
 # ==============================================================================
-
-class DepthwiseSeparableConv(nn.Module):
-    """
-    Depthwise Separable Convolution: ~8× parameter reduction vs standard conv.
-    
-    Flow: Depthwise (spatial) → Pointwise (channel mixing) → BatchNorm → GELU
-    """
-    def __init__(self, in_ch: int, out_ch: int, kernel_size: int = 3, stride: int = 1):
-        super().__init__()
-        padding = kernel_size // 2
-        self.depthwise = nn.Conv2d(
-            in_ch, in_ch, kernel_size, stride, padding, 
-            groups=in_ch, bias=False
-        )
-        self.pointwise = nn.Conv2d(in_ch, out_ch, 1, bias=False)
-        self.bn = nn.BatchNorm2d(out_ch)
-        self.gelu = nn.GELU()
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.gelu(self.bn(self.pointwise(self.depthwise(x))))
-
-
-class SqueezeExcitation(nn.Module):
-    """
-    Squeeze-and-Excitation: Channel-wise attention mechanism.
-    
-    Flow: Global Pool → FC (compress) → ReLU → FC (expand) → Sigmoid → Scale
-    """
-    def __init__(self, channels: int, reduction: int = 4):
-        super().__init__()
-        self.squeeze = nn.AdaptiveAvgPool2d(1)
-        self.excitation = nn.Sequential(
-            nn.Conv2d(channels, channels // reduction, 1),
-            nn.GELU(),
-            nn.Conv2d(channels // reduction, channels, 1),
-            nn.Sigmoid()
-        )
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x * self.excitation(self.squeeze(x))
-
-
-class EfficientResBlock(nn.Module):
-    """
-    MobileNetV3-inspired inverted residual block with SE attention.
-    
-    Flow: Expand → Depthwise → SE → Project → Residual Add
-    Parameters: ~4C² (vs 9C² for standard ResNet block)
-    """
-    def __init__(self, channels: int, expansion_ratio: int = 2):
-        super().__init__()
-        hidden_dim = channels * expansion_ratio
-        
-        # Expansion
-        self.expand = nn.Sequential(
-            nn.Conv2d(channels, hidden_dim, 1, bias=False),
-            nn.BatchNorm2d(hidden_dim),
-            nn.GELU()
-        )
-        
-        # Depthwise convolution
-        self.dwconv = DepthwiseSeparableConv(hidden_dim, hidden_dim, 3)
-        
-        # Squeeze-Excitation
-        self.se = SqueezeExcitation(hidden_dim, reduction=4)
-        
-        # Projection
-        self.project = nn.Sequential(
-            nn.Conv2d(hidden_dim, channels, 1, bias=False),
-            nn.BatchNorm2d(channels)
-        )
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        identity = x
-        out = self.expand(x)
-        out = self.dwconv(out)
-        out = self.se(out)
-        out = self.project(out)
-        return out + identity  # Residual connection
-
 
 class SimpleSelfAttention(nn.Module):
     """
@@ -175,10 +96,6 @@ class SimpleSelfAttention(nn.Module):
         
         return identity + out  # Residual connection
 
-
-# ==============================================================================
-# SECTION 2: Conditioning Modules (CRF-Only Embedder is now internal to the main class)
-# ==============================================================================
 
 class ConditioningEmbedder(nn.Module):
     """

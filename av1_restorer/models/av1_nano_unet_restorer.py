@@ -31,7 +31,7 @@ Architecture Flow:
 
 ==============================================================================
 
-Author: Soham Mukherjee (adapted)
+Author: Soham Mukherjee
 Version: 2.1 (Optimized)
 License: MIT
 """
@@ -44,112 +44,7 @@ import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
-
-# ==============================================================================
-# SECTION 1: Core Building Blocks (GroupNorm + ECA + DWS)
-# ==============================================================================
-
-def choose_num_groups(channels: int, preferred: int = 16) -> int:
-    """Return preferred group count if divisible, else 1 for stability."""
-    return preferred if channels % preferred == 0 else 1
-
-
-class DepthwiseSeparable(nn.Module):
-    """
-    Depthwise Separable Convolution using GroupNorm and GELU.
-
-    Flow: Depthwise (per-channel 3x3) -> Pointwise (1x1) -> GroupNorm -> GELU
-
-    Args:
-        in_ch: Input channels
-        out_ch: Output channels
-        stride: Convolution stride (1 or 2)
-        num_groups: preferred GroupNorm groups (default 16)
-    """
-    def __init__(self, in_ch: int, out_ch: int, stride: int = 1, num_groups: int = 16):
-        super().__init__()
-        padding = 1
-        self.depthwise = nn.Conv2d(
-            in_ch, in_ch, kernel_size=3, stride=stride, padding=padding, groups=in_ch, bias=False
-        )
-        self.pointwise = nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=False)
-
-        gn_groups = choose_num_groups(out_ch, num_groups)
-        self.norm = nn.GroupNorm(num_groups=gn_groups, num_channels=out_ch)
-        self.act = nn.GELU()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.depthwise(x)
-        x = self.pointwise(x)
-        x = self.norm(x)
-        return self.act(x)
-
-
-class ECA(nn.Module):
-    """
-    Efficient Channel Attention (ECA).
-    Lightweight alternative to SE: uses 1D conv across channel descriptors.
-    Args:
-        channels: number of channels
-        kernel_size: kernel size for 1D conv (odd recommended: 3,5,7)
-    """
-    def __init__(self, channels: int, kernel_size: int = 3):
-        super().__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        # ECA uses a 1D conv over the channel dimension after pooling.
-        # Input shape to conv1d: (B, 1, C)
-        self.conv = nn.Conv1d(
-            in_channels=1,
-            out_channels=1,
-            kernel_size=kernel_size,
-            padding=(kernel_size - 1) // 2,
-            bias=False
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        b, c, _, _ = x.shape
-        y = self.avg_pool(x).view(b, 1, c)       # (B, 1, C)
-        y = self.conv(y)                         # (B, 1, C)
-        y = torch.sigmoid(y).view(b, c, 1, 1)    # (B, C, 1, 1)
-        return x * y
-
-
-class MicroResBlock(nn.Module):
-    """
-    Efficient residual block: 2 x DepthwiseSeparable + ECA attention.
-    Flow: x -> DWS -> DWS -> ECA -> x + out
-    """
-    def __init__(self, channels: int, num_groups: int = 16, eca_kernel: int = 3):
-        super().__init__()
-        self.conv1 = DepthwiseSeparable(channels, channels, stride=1, num_groups=num_groups)
-        self.conv2 = DepthwiseSeparable(channels, channels, stride=1, num_groups=num_groups)
-        self.attn = ECA(channels, kernel_size=eca_kernel)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        identity = x
-        out = self.conv1(x)
-        out = self.conv2(out)
-        out = self.attn(out)
-        return identity + out
-
-
-class MultiScaleFusion(nn.Module):
-    """
-    Multi-scale feature fusion for skip connections using GroupNorm.
-    Concatenate decoder upsampled features with encoder skip and fuse via 1x1 conv.
-    """
-    def __init__(self, channels: int, num_groups: int = 16):
-        super().__init__()
-        gn_groups = choose_num_groups(channels, num_groups)
-        self.fusion = nn.Sequential(
-            nn.Conv2d(channels * 2, channels, kernel_size=1, bias=False),
-            nn.GroupNorm(gn_groups, channels),
-            nn.GELU()
-        )
-
-    def forward(self, x_up: torch.Tensor, x_skip: torch.Tensor) -> torch.Tensor:
-        return self.fusion(torch.cat([x_up, x_skip], dim=1))
-
+from .blocks import DepthwiseSeparable, ECA, MicroResBlock, MultiScaleFusion, choose_num_groups
 
 # ==============================================================================
 # SECTION 2: AV1NanoUnetRestorer (uses upgraded blocks)
@@ -242,36 +137,36 @@ class AV1NanoUnetRestorer(nn.Module):
             *[MicroResBlock(base * 8, num_groups=self._gn_groups) for _ in range(blocks[2])]
         ])
 
-        # ===== Decoder =====
-        # Dec3: base*8 -> base*4 (upsample) + fuse with skip2
-        dec3_gn = choose_num_groups(base * 4, self._gn_groups)
+        # ===== Decoder Path (UPGRADED: Upsample+Conv and GroupNorm) =====
+        # Level 3: base*8 → base*4, H/4, fuse with enc2 skip
         self.dec3_up = nn.Sequential(
-            nn.ConvTranspose2d(base * 8, base * 4, kernel_size=2, stride=2, bias=False),
-            nn.GroupNorm(dec3_gn, base * 4),
-            nn.GELU()
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            DepthwiseSeparable(base*8, base*4)
         )
-        self.dec3_fusion = MultiScaleFusion(base * 4, num_groups=self._gn_groups)
-        self.dec3_blocks = nn.Sequential(*[MicroResBlock(base * 4, num_groups=self._gn_groups) for _ in range(blocks[1])])
-
-        # Dec2: base*4 -> base*2 (upsample) + fuse with skip1
-        dec2_gn = choose_num_groups(base * 2, self._gn_groups)
+        self.dec3_fusion = MultiScaleFusion(base*4)
+        self.dec3_blocks = nn.Sequential(
+            *[MicroResBlock(base*4) for _ in range(blocks[1])]
+        )
+        
+        # Level 2: base*4 → base*2, H/2, fuse with enc1 skip
         self.dec2_up = nn.Sequential(
-            nn.ConvTranspose2d(base * 4, base * 2, kernel_size=2, stride=2, bias=False),
-            nn.GroupNorm(dec2_gn, base * 2),
-            nn.GELU()
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            DepthwiseSeparable(base*4, base*2)
         )
-        self.dec2_fusion = MultiScaleFusion(base * 2, num_groups=self._gn_groups)
-        self.dec2_blocks = nn.Sequential(*[MicroResBlock(base * 2, num_groups=self._gn_groups) for _ in range(blocks[0])])
-
-        # Dec1: base*2 -> base (upsample) + fuse with head skip
-        dec1_gn = choose_num_groups(base, self._gn_groups)
+        self.dec2_fusion = MultiScaleFusion(base*2)
+        self.dec2_blocks = nn.Sequential(
+            *[MicroResBlock(base*2) for _ in range(blocks[0])]
+        )
+        
+        # Level 1: base*2 → base, H, fuse with head skip
         self.dec1_up = nn.Sequential(
-            nn.ConvTranspose2d(base * 2, base, kernel_size=2, stride=2, bias=False),
-            nn.GroupNorm(dec1_gn, base),
-            nn.GELU()
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            DepthwiseSeparable(base*2, base)
         )
-        self.dec1_fusion = MultiScaleFusion(base, num_groups=self._gn_groups)
-        self.dec1_blocks = nn.Sequential(*[MicroResBlock(base, num_groups=self._gn_groups) for _ in range(2)])
+        self.dec1_fusion = MultiScaleFusion(base)
+        self.dec1_blocks = nn.Sequential(
+            *[MicroResBlock(base) for _ in range(2)]
+        )
 
         # ===== Tail: predict 3-channel residual =====
         self.tail = nn.Sequential(

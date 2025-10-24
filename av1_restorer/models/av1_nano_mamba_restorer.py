@@ -24,49 +24,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# ==============================================================================
-# SECTION 1: SOTA-Informed Core Building Blocks
-# ==============================================================================
-
-class DepthwiseSeparable(nn.Module):
-    """
-    Efficient Depthwise Separable Conv.
-    Uses GroupNorm for small-batch stability (replaces BatchNorm).
-    (Copied from your av1_fbcnn_restorer.py)
-    """
-    def __init__(self, in_ch: int, out_ch: int, kernel_size: int = 3, stride: int = 1, num_groups: int = 16):
-        super().__init__()
-        padding = kernel_size // 2
-        
-        if out_ch % num_groups != 0:
-            num_groups = 16
-            while out_ch % num_groups != 0 and num_groups > 1:
-                num_groups //= 2
-            if out_ch % num_groups != 0:
-                num_groups = 1
-                
-        self.depthwise = nn.Conv2d(in_ch, in_ch, kernel_size, stride, padding, groups=in_ch, bias=False)
-        self.pointwise = nn.Conv2d(in_ch, out_ch, 1, bias=False)
-        self.norm = nn.GroupNorm(num_groups=num_groups, num_channels=out_ch)
-        self.act = nn.GELU()
-        
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.act(self.norm(self.pointwise(self.depthwise(x))))
-
-class MultiScaleFusion(nn.Module):
-    """Fuses features from decoder upsampling and encoder skip connection."""
-    def __init__(self, channels: int, num_groups: int = 16):
-        super().__init__()
-        if channels % num_groups != 0: # Auto-adjust num_groups
-            num_groups = 1
-        self.fusion = nn.Sequential(
-            nn.Conv2d(channels * 2, channels, kernel_size=1, bias=False),
-            nn.GroupNorm(num_groups, channels),
-            nn.GELU()
-        )
-    def forward(self, x_up: torch.Tensor, x_skip: torch.Tensor) -> torch.Tensor:
-        fused = torch.cat([x_up, x_skip], dim=1)
-        return self.fusion(fused)
+from .blocks import DepthwiseSeparable
 
 # ==============================================================================
 # SECTION 2: NEW SOTA Mamba-inspired Block
