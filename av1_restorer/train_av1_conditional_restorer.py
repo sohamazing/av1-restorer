@@ -60,7 +60,8 @@ import torch.amp
 project_root = Path(__file__).resolve().parent.parent
 sys.path.append(str(project_root))
 
-from av1_restorer.models.av1_conditional_unet_restorer import create_av1_restorer
+# from av1_restorer.models.av1_conditional_unet_restorer import create_av1_restorer # V1
+from av1_restorer.models.av1_conditional_unet_restorer_v2 import create_av1_restorer # V2
 
 try:
     from utils.loss import CombinedLoss

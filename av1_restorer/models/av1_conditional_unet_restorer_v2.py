@@ -22,7 +22,7 @@ from typing import Tuple, List, Union, Optional
 import logging
 logger = logging.getLogger(__name__)
 
-from .blocks import DepthwiseSeparable, ECA, EfficientResBlock
+from .blocks import DepthwiseSeparable, ECA, EfficientResBlock, choose_num_groups
 
 # ==============================================================================
 # SECTION 2: Conditioning + Channel Attention 
@@ -230,7 +230,7 @@ class AV1ConditionalUNet(nn.Module):
         # ===== INPUT HEAD (Level 0) =====
         self.head = nn.Sequential(
             nn.Conv2d(3, ch[0], kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(ch[0]),
+            nn.GroupNorm(choose_num_groups(ch[0]), ch[0]), # <-- GROUP NORM
             nn.GELU(),
             *[EfficientResBlock(ch[0]) for _ in range(blocks[0])]
         )
@@ -242,7 +242,7 @@ class AV1ConditionalUNet(nn.Module):
         
         # ===== BOTTLENECK (Consolidated and Stabilized) =====
         self.bottleneck_down = nn.Conv2d(ch[3], ch[4], kernel_size=3, stride=2, padding=1, bias=False)
-        self.bottleneck_bn = nn.BatchNorm2d(ch[4])
+        self.bottleneck_gn = nn.GroupNorm(choose_num_groups(ch[4]), ch[4]) # <-- GROUP NORM
         
         self.bottleneck_pre_attn = nn.Sequential(
             *[EfficientResBlock(ch[4]) for _ in range(blocks[4] // 2)]
@@ -263,7 +263,7 @@ class AV1ConditionalUNet(nn.Module):
         
         # ===== OUTPUT TAIL =====
         self.tail_up = nn.ConvTranspose2d(ch[1], ch[0], kernel_size=2, stride=2, bias=False)
-        self.tail_bn = nn.BatchNorm2d(ch[0])
+        self.tail_gn = nn.GroupNorm(choose_num_groups(ch[0]), ch[0])
         self.tail_fusion = nn.Conv2d(ch[0] * 2, ch[0], kernel_size=1, bias=False)
         self.tail_body = nn.Sequential(
             *[EfficientResBlock(ch[0]) for _ in range(blocks[0])]
@@ -284,7 +284,7 @@ class AV1ConditionalUNet(nn.Module):
         return nn.ModuleDict({
             'downsample': nn.Sequential(
                 nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=2, padding=1, bias=False),
-                nn.BatchNorm2d(out_ch),
+                nn.GroupNorm(choose_num_groups(out_ch), out_ch), # <-- GROUP NORM
                 nn.GELU()
             ),
             'body': nn.Sequential(
@@ -296,10 +296,10 @@ class AV1ConditionalUNet(nn.Module):
     def _build_decoder_level(self, in_ch: int, out_ch: int, num_blocks: int) -> nn.ModuleDict:
         return nn.ModuleDict({
             'upsample': nn.ConvTranspose2d(in_ch, out_ch, kernel_size=2, stride=2, bias=False),
-            'upsample_bn': nn.BatchNorm2d(out_ch),
+            'upsample_gn': nn.GroupNorm(choose_num_groups(out_ch), out_ch), # <-- GROUP NORM 1 (renamed variable too)
             'fusion': nn.Sequential(
                 nn.Conv2d(out_ch * 2, out_ch, kernel_size=1, bias=False),
-                nn.BatchNorm2d(out_ch),
+                nn.GroupNorm(choose_num_groups(out_ch), out_ch), # <-- GROUP NORM 2
                 nn.GELU()
             ),
             'body': nn.Sequential(
@@ -313,7 +313,7 @@ class AV1ConditionalUNet(nn.Module):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.BatchNorm2d):
+            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
             elif isinstance(m, nn.Linear):
@@ -360,7 +360,7 @@ class AV1ConditionalUNet(nn.Module):
         
         # ===== 3. BOTTLENECK (Consolidated FiLM and Stability Clamps) =====
         b = self.bottleneck_down(skip3)
-        b = F.gelu(self.bottleneck_bn(b))
+        b = F.gelu(self.bottleneck_gn(b))
 
         # ========== CLAMP 1: Activation Clamp ==========
         b = torch.clamp(b, min=-10.0, max=10.0) 
@@ -381,26 +381,26 @@ class AV1ConditionalUNet(nn.Module):
         
         # ===== 4. DECODER PATH =====
         d3 = self.decoder3['upsample'](b)
-        d3 = F.gelu(self.decoder3['upsample_bn'](d3))
+        d3 = F.gelu(self.decoder3['upsample_gn'](d3))
         d3 = torch.cat([d3, skip3], dim=1)
         d3 = self.decoder3['fusion'](d3)
         d3 = self.decoder3['body'](d3)
         
         d2 = self.decoder2['upsample'](d3)
-        d2 = F.gelu(self.decoder2['upsample_bn'](d2))
+        d2 = F.gelu(self.decoder2['upsample_gn'](d2))
         d2 = torch.cat([d2, skip2], dim=1)
         d2 = self.decoder2['fusion'](d2)
         d2 = self.decoder2['body'](d2)
         
         d1 = self.decoder1['upsample'](d2)
-        d1 = F.gelu(self.decoder1['upsample_bn'](d1))
+        d1 = F.gelu(self.decoder1['upsample_gn'](d1))
         d1 = torch.cat([d1, skip1], dim=1)
         d1 = self.decoder1['fusion'](d1)
         d1 = self.decoder1['body'](d1)
         
         # ===== 5. OUTPUT TAIL =====
         t = self.tail_up(d1)
-        t = F.gelu(self.tail_bn(t))
+        t = F.gelu(self.tail_gn(t))
         t = torch.cat([t, skip0], dim=1)
         t = self.tail_fusion(t)
         t = self.tail_body(t)

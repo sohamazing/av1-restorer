@@ -205,8 +205,8 @@ class EfficientResBlock(nn.Module):
         )
         
         # Depthwise spatial processing
-        self.dwconv = DepthwiseSeparable(hidden, hidden, 3, num_groups=num_groups)
-        
+        self.dwconv = DepthwiseSeparable(hidden, hidden, stride=1, num_groups=num_groups)
+          
         # Channel attention
         self.attn = ECA(hidden)
         
