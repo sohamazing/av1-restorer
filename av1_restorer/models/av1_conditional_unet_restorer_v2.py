@@ -1,6 +1,6 @@
 # av1_restorer/models/av1_unet_restorer.py
 """
-AV1 U-Net Restorer - Production Implementation
+AV1 U-Net Restorer
 
 Efficient U-Net with FiLM conditioning for CRF and Preset-adaptive restoration.
 
@@ -10,8 +10,10 @@ Architecture Highlights:
   - SimpleSelfAttention at bottleneck (channel attention)
   - FiLM conditioning at encoder levels and bottleneck
   - Residual learning (predicts artifact correction)
+  - SOTA Upsampling: Bilinear Interpolation + Conv
 
 Author: Soham Mukherjee
+Version: 2.1 
 """
 
 import torch
@@ -182,9 +184,10 @@ class AV1ConditionalUNet(nn.Module):
     Architecture:
       - 5 levels: Head + 3 encoder levels + bottleneck + 3 decoder levels + tail
       - Skip connections at all encoder-decoder pairs
-      - FiLM conditioning at: Encoder (3 levels) + Bottleneck (1 points) <- was 2 points
+      - FiLM conditioning at: Encoder (3 levels) + Bottleneck (1 point)
       - SimpleSelfAttention at bottleneck only
       - Residual learning: output = input + predicted_residual
+      - SOTA UPSAMPLING: Bilinear + Conv (NO checkerboard artifacts!)
     
     Args:
         config (dict): Configuration with keys:
@@ -220,6 +223,7 @@ class AV1ConditionalUNet(nn.Module):
         logger.info(f"  Blocks: {blocks}")
         logger.info(f"  CRF Range: {crf_range}")
         logger.info(f"  Norm Range: [{self.clamp_min}, {self.clamp_max}]")
+        logger.info(f"  Upsampling: Bilinear + DepthwiseSeparable (SOTA)")
         logger.info("="*60)
         
         # ===== CONDITIONING SYSTEM =====
@@ -230,41 +234,45 @@ class AV1ConditionalUNet(nn.Module):
         # ===== INPUT HEAD (Level 0) =====
         self.head = nn.Sequential(
             nn.Conv2d(3, ch[0], kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(choose_num_groups(ch[0]), ch[0]), # <-- GROUP NORM
+            nn.GroupNorm(choose_num_groups(ch[0]), ch[0]),
             nn.GELU(),
             *[EfficientResBlock(ch[0]) for _ in range(blocks[0])]
         )
         
-        # ===== ENCODER (Use single cond_dim for FiLM initialization) =====
+        # ===== ENCODER =====
         self.encoder1 = self._build_encoder_level(ch[0], ch[1], blocks[1], self.cond_dim)
         self.encoder2 = self._build_encoder_level(ch[1], ch[2], blocks[2], self.cond_dim)
         self.encoder3 = self._build_encoder_level(ch[2], ch[3], blocks[3], self.cond_dim)
         
         # ===== BOTTLENECK (Consolidated and Stabilized) =====
         self.bottleneck_down = nn.Conv2d(ch[3], ch[4], kernel_size=3, stride=2, padding=1, bias=False)
-        self.bottleneck_gn = nn.GroupNorm(choose_num_groups(ch[4]), ch[4]) # <-- GROUP NORM
+        self.bottleneck_gn = nn.GroupNorm(choose_num_groups(ch[4]), ch[4])
         
         self.bottleneck_pre_attn = nn.Sequential(
             *[EfficientResBlock(ch[4]) for _ in range(blocks[4] // 2)]
         )
         
-        # NOTE: Only ONE FiLM layer is used post-attention
         self.bottleneck_attn = SimpleSelfAttention(ch[4])
-        self.bottleneck_film = FiLMLayer(self.cond_dim, ch[4]) # Consolidated FiLM
+        self.bottleneck_film = FiLMLayer(self.cond_dim, ch[4])
         
         self.bottleneck_post_attn = nn.Sequential(
             *[EfficientResBlock(ch[4]) for _ in range(blocks[4] // 2)]
         )
         
-        # ===== DECODER =====
+        # ===== DECODER (FIXED: Upsample + Conv) =====
         self.decoder3 = self._build_decoder_level(ch[4], ch[3], blocks[3])
         self.decoder2 = self._build_decoder_level(ch[3], ch[2], blocks[2])
         self.decoder1 = self._build_decoder_level(ch[2], ch[1], blocks[1])
         
-        # ===== OUTPUT TAIL =====
-        self.tail_up = nn.ConvTranspose2d(ch[1], ch[0], kernel_size=2, stride=2, bias=False)
+        # ===== OUTPUT TAIL (FIXED: Upsample + Conv) =====
+        self.tail_upsample_op = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        self.tail_upsample_conv = DepthwiseSeparable(ch[1], ch[0], stride=1)
         self.tail_gn = nn.GroupNorm(choose_num_groups(ch[0]), ch[0])
         self.tail_fusion = nn.Conv2d(ch[0] * 2, ch[0], kernel_size=1, bias=False)
+        self.tail_fusion_gn_act = nn.Sequential(
+            nn.GroupNorm(choose_num_groups(ch[0]), ch[0]),
+            nn.GELU()
+        )
         self.tail_body = nn.Sequential(
             *[EfficientResBlock(ch[0]) for _ in range(blocks[0])]
         )
@@ -274,7 +282,7 @@ class AV1ConditionalUNet(nn.Module):
         
         total_params = sum(p.numel() for p in self.parameters())
         trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        logger.info(f"✓ Model initialized (CRF-Only)")
+        logger.info(f"✓ Model initialized")
         logger.info(f"  Total parameters: {total_params:,} ({total_params/1e6:.2f}M)")
         logger.info(f"  Trainable parameters: {trainable_params:,} ({trainable_params/1e6:.2f}M)")
         logger.info("="*60)
@@ -284,24 +292,28 @@ class AV1ConditionalUNet(nn.Module):
         return nn.ModuleDict({
             'downsample': nn.Sequential(
                 nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=2, padding=1, bias=False),
-                nn.GroupNorm(choose_num_groups(out_ch), out_ch), # <-- GROUP NORM
+                nn.GroupNorm(choose_num_groups(out_ch), out_ch),
                 nn.GELU()
             ),
             'body': nn.Sequential(
                 *[EfficientResBlock(out_ch) for _ in range(num_blocks)]
             ),
-            'film': FiLMLayer(cond_dim, out_ch) # cond_dim will be 128 / 192
+            'film': FiLMLayer(cond_dim, out_ch)
         })
 
     def _build_decoder_level(self, in_ch: int, out_ch: int, num_blocks: int) -> nn.ModuleDict:
+
         return nn.ModuleDict({
-            'upsample': nn.ConvTranspose2d(in_ch, out_ch, kernel_size=2, stride=2, bias=False),
-            'upsample_gn': nn.GroupNorm(choose_num_groups(out_ch), out_ch), # <-- GROUP NORM 1 (renamed variable too)
+            'upsample_op': nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            'upsample_conv': DepthwiseSeparable(in_ch, out_ch, stride=1),
+            'upsample_gn': nn.GroupNorm(choose_num_groups(out_ch), out_ch),
+            
             'fusion': nn.Sequential(
                 nn.Conv2d(out_ch * 2, out_ch, kernel_size=1, bias=False),
-                nn.GroupNorm(choose_num_groups(out_ch), out_ch), # <-- GROUP NORM 2
+                nn.GroupNorm(choose_num_groups(out_ch), out_ch),
                 nn.GELU()
             ),
+            
             'body': nn.Sequential(
                 *[EfficientResBlock(out_ch) for _ in range(num_blocks)]
             )
@@ -327,17 +339,17 @@ class AV1ConditionalUNet(nn.Module):
 
     def forward(self, lq_image: torch.Tensor, crf: torch.Tensor, preset: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        Full forward pass through the network (CRF or CRF-Preset conditoning).
+        Full forward pass through the network (CRF or CRF-Preset conditioning).
         
         Args:
             lq_image: [B, 3, H, W] Low-quality compressed image
             crf: [B, 1] CRF value, range [23, 63]
+            preset: [B, 1] Optional preset value
         
         Returns:
             [B, 3, H, W] Restored image
         """
         # ===== 1. GENERATE CONDITIONING VECTOR =====
-        # The embedder handles generating the (crf)128-dim or (crf+preset)192-dim vector
         cond = self.conditioning_embedder(crf, preset)
 
         # ===== 2. ENCODER PATH (FiLM application) =====
@@ -358,51 +370,46 @@ class AV1ConditionalUNet(nn.Module):
         e3 = self.encoder3['film'](e3, cond)
         skip3 = e3
         
-        # ===== 3. BOTTLENECK (Consolidated FiLM and Stability Clamps) =====
+        # ===== 3. BOTTLENECK =====
         b = self.bottleneck_down(skip3)
         b = F.gelu(self.bottleneck_gn(b))
-
-        # ========== CLAMP 1: Activation Clamp ==========
-        b = torch.clamp(b, min=-10.0, max=10.0) 
-        # ===============================================
-
-        b = self.bottleneck_pre_attn(b)
-        # NOTE: REMOVED bottleneck_film1 (pre-attention FiLM)
-        
-        b = self.bottleneck_attn(b)
-        
-        b = self.bottleneck_film(b, cond) # CONSOLIDATED FiLM application 
-        
-        # ========== CLAMP 2: Final Bottleneck Clamp ==========
         b = torch.clamp(b, min=-10.0, max=10.0)
-        # ====================================================
-
+        
+        b = self.bottleneck_pre_attn(b)
+        b = self.bottleneck_attn(b)
+        b = self.bottleneck_film(b, cond)
+        b = torch.clamp(b, min=-10.0, max=10.0)
         b = self.bottleneck_post_attn(b)
         
-        # ===== 4. DECODER PATH =====
-        d3 = self.decoder3['upsample'](b)
+        # ===== 4. DECODER PATH (FIXED: Upsample + Conv) =====
+        d3 = self.decoder3['upsample_op'](b)        # Bilinear upsample
+        d3 = self.decoder3['upsample_conv'](d3)     # Then convolve
         d3 = F.gelu(self.decoder3['upsample_gn'](d3))
         d3 = torch.cat([d3, skip3], dim=1)
         d3 = self.decoder3['fusion'](d3)
         d3 = self.decoder3['body'](d3)
         
-        d2 = self.decoder2['upsample'](d3)
+        d2 = self.decoder2['upsample_op'](d3)       # Bilinear upsample
+        d2 = self.decoder2['upsample_conv'](d2)     # Then convolve
         d2 = F.gelu(self.decoder2['upsample_gn'](d2))
         d2 = torch.cat([d2, skip2], dim=1)
         d2 = self.decoder2['fusion'](d2)
         d2 = self.decoder2['body'](d2)
         
-        d1 = self.decoder1['upsample'](d2)
+        d1 = self.decoder1['upsample_op'](d2)       # Bilinear upsample
+        d1 = self.decoder1['upsample_conv'](d1)     # Then convolve
         d1 = F.gelu(self.decoder1['upsample_gn'](d1))
         d1 = torch.cat([d1, skip1], dim=1)
         d1 = self.decoder1['fusion'](d1)
         d1 = self.decoder1['body'](d1)
         
-        # ===== 5. OUTPUT TAIL =====
-        t = self.tail_up(d1)
+        # ===== 5. OUTPUT TAIL (FIXED: Upsample + Conv) =====
+        t = self.tail_upsample_op(d1)               # Bilinear upsample
+        t = self.tail_upsample_conv(t)              # Then convolve
         t = F.gelu(self.tail_gn(t))
         t = torch.cat([t, skip0], dim=1)
         t = self.tail_fusion(t)
+        t = self.tail_fusion_gn_act(t)              # Added consistency
         t = self.tail_body(t)
         residual = self.tail_pred(t)
         
@@ -412,65 +419,27 @@ class AV1ConditionalUNet(nn.Module):
         
         return restored
 
-    # --- MODIFIED inference ---
     @torch.no_grad()
     def inference(
         self,
         lq_image: torch.Tensor,
         crf: torch.Tensor,
-        preset: Optional[torch.Tensor] = None, # Added Optional
+        preset: Optional[torch.Tensor] = None,
         tile_size: int = 512,
         tile_overlap: int = 64,
         center_crop: bool = False
     ) -> torch.Tensor:
-        """
-        Memory-efficient tiled inference for images of any size with seamless blending.
-        
-        This method handles three scenarios:
-        1. Center crop mode: Extract and process only the center tile
-        2. Small images (≤ tile_size): Process entire image with padding
-        3. Large images (> tile_size): Tiled processing with smooth blending
-        
-        Args:
-            lq_image: [B, 3, H, W] Input image (any size)
-            crf: [B, 1] CRF value for conditioning
-            preset: [B, 1] Preset value for conditioning
-            tile_size: Maximum tile dimensions for processing (default: 512)
-            tile_overlap: Overlap pixels between tiles for blending (default: 64)
-            center_crop: If True, only process center tile_size×tile_size region
-        
-        Returns:
-            [B, 3, H, W] Restored image (full size or center crop)
-        
-        Notes:
-            - All images are padded to multiples of 32 (2^5 for 5 downsample layers)
-            - Tiles use Gaussian-like edge blending for seamless stitching
-            - Center crop is useful for quick quality checks on large images
-
-        Memory-efficient tiled inference (CRF-Only).
-        
-        Args:
-            lq_image: [B, 3, H, W] Input image
-            crf: [B, 1] CRF value
-            tile_size: ...
-            tile_overlap: ...
-            center_crop: ...
-        
-        Returns:
-            [B, 3, H, W] Restored image
-        """
+        """Memory-efficient tiled inference with seamless blending."""
         self.eval()
         B, C, H, W = lq_image.shape
         
         is_crf_only_mode = (self.cond_dim == 128)
 
-        # Helper to call self.forward correctly
         def _forward_pass(tile: torch.Tensor):
             if is_crf_only_mode:
                 return self.forward(tile, crf)
             else:
                 if preset is None:
-                    # Should not happen in CRF+Preset mode if data loading is correct
                     raise ValueError("Preset input missing in CRF+Preset mode inference.")
                 return self.forward(tile, crf, preset)
 
@@ -548,7 +517,6 @@ class AV1ConditionalUNet(nn.Module):
         output = output / (weight + 1e-8)
         return output
 
-    # _create_blend_mask is identical, so we can copy it
     def _create_blend_mask(
         self,
         tile_h: int,
