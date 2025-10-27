@@ -1,4 +1,4 @@
-# utils/loss.py - ROBUST VERSION
+# utils/loss.py
 
 import logging
 from typing import Dict, Tuple
@@ -25,35 +25,136 @@ logger = logging.getLogger(__name__)
 
 # --- Constants ---
 MIN_SIZE_MSSSIM = 160
-# EPSILON = 1e-8  # For numerical stability
 
 
 # ==============================================================================
-# Fixed FrequencyLoss with Multiple Stability Improvements
+# SECTION 1: Core Loss Components (SOTA Optimized)
 # ==============================================================================
+
+class CharbonnierLoss(nn.Module):
+    """
+    Robust L1 Loss (Charbonnier/Pseudo-Huber Loss).
+    
+    More robust to outliers than MSE, smoother than L1 near zero.
+    Used in EDSR, RCAN, and most modern image restoration networks.
+    
+    Formula: sqrt((pred - target)^2 + eps^2)
+    
+    Args:
+        eps (float): Small constant for numerical stability. Default: 1e-3
+    """
+    def __init__(self, eps: float = 1e-3):
+        super().__init__()
+        # Use buffer to avoid re-creating tensor on every forward pass
+        self.register_buffer('eps_squared', torch.tensor(eps**2))
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            pred: [B, C, H, W] Predicted image
+            target: [B, C, H, W] Target image
+        
+        Returns:
+            Scalar loss value
+        """
+        return torch.sqrt((pred - target).pow(2) + self.eps_squared).mean()
+
+
+class PerceptualLoss(nn.Module):
+    """
+    VGG19 or LPIPS-based perceptual loss.
+    
+    Compares high-level features instead of pixel values, capturing
+    perceptual similarity better than L1/L2 losses.
+    
+    Args:
+        network (str): 'vgg' for VGG19 features or 'lpips' for learned perceptual metric
+    """
+    def __init__(self, network: str = 'vgg'):
+        super().__init__()
+        self.network_type = network
+
+        if self.network_type == 'vgg':
+            # Use VGG19 features up to relu5_4 (layer 36)
+            # This is the most commonly used layer for perceptual loss
+            vgg = vgg19(weights=VGG19_Weights.IMAGENET1K_V1).features
+            self.model = nn.Sequential(*list(vgg.children())[:36]).eval()
+            
+            # ImageNet normalization parameters
+            self.register_buffer('mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+            self.register_buffer('std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+            
+        elif self.network_type == 'lpips':
+            if not LPIPS_AVAILABLE:
+                raise ImportError("LPIPS not available. Install: pip install lpips")
+            # LPIPS uses AlexNet features by default (faster than VGG)
+            self.model = lpips.LPIPS(net='alex', spatial=False).eval()
+        else:
+            raise ValueError(f"Unknown network: {network}. Choose 'vgg' or 'lpips'.")
+
+        # Freeze all parameters - perceptual loss should not be trainable
+        for param in self.model.parameters():
+            param.requires_grad = False
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            pred: [B, C, H, W] Predicted image in [0, 1]
+            target: [B, C, H, W] Target image in [0, 1]
+        
+        Returns:
+            Scalar perceptual loss value
+        """
+        # Ensure valid range [0, 1]
+        pred = torch.clamp(pred, 0.0, 1.0)
+        target = torch.clamp(target, 0.0, 1.0)
+
+        if self.network_type == 'vgg':
+            # Apply ImageNet normalization
+            pred_norm = (pred - self.mean) / self.std
+            target_norm = (target - self.mean) / self.std
+            
+            # Extract features and compare with L1 loss
+            pred_features = self.model(pred_norm)
+            target_features = self.model(target_norm)
+            
+            return F.l1_loss(pred_features, target_features)
+        else:  # LPIPS
+            # LPIPS expects inputs in [-1, 1] range
+            return self.model(pred * 2.0 - 1.0, target * 2.0 - 1.0).mean()
+
 
 class FrequencyLoss(nn.Module):
     """
-    ROBUST Frequency domain loss with multiple numerical stability fixes.
+    ROBUST Frequency Domain Loss using FFT.
     
-    Improvements:
-    1. Optional phase loss (can be disabled entirely)
-    2. Magnitude weighting to avoid division by zero
-    3. Clamping before angle calculation
-    4. Log-space magnitude comparison option
-    5. Gradient clipping during backward pass
+    Penalizes differences in the frequency spectrum, which is excellent
+    for preserving high-frequency details (textures, edges).
+    
+    Key improvements for stability:
+    - Log-space magnitude comparison (more perceptually uniform)
+    - Optional phase loss (disabled by default due to instability)
+    - Magnitude-weighted phase to avoid near-zero frequency issues
+    - Multiple loss function options (L1, L2, Charbonnier)
+    
+    Args:
+        loss_func_type (str): Base loss function ('l1', 'l2', 'charbonnier')
+        alpha (float): Weight for magnitude vs phase (1.0 = magnitude only)
+        use_phase (bool): Enable phase loss (unstable, use with caution)
+        use_log_magnitude (bool): Use log space for magnitude (recommended)
+        eps (float): Small constant for numerical stability
     """
     def __init__(
         self, 
         loss_func_type: str = 'l1',
-        alpha: float = 1.0,  # 1.0 = magnitude only, 0.0 = phase only
-        use_phase: bool = False,  # DISABLE phase by default
-        use_log_magnitude: bool = True,  # Use log space for better stability
+        alpha: float = 1.0,
+        use_phase: bool = False,
+        use_log_magnitude: bool = True,
         eps: float = 1e-6
     ):
         super().__init__()
         
-        # Loss function selection
+        # Select base loss function
         if loss_func_type.lower() == 'l1':
             self.loss_func = nn.L1Loss()
         elif loss_func_type.lower() in ['l2', 'mse']:
@@ -72,26 +173,27 @@ class FrequencyLoss(nn.Module):
             raise ValueError("alpha must be in [0, 1]")
         
         logger.info(
-            f"FrequencyLoss initialized: alpha={alpha}, "
-            f"use_phase={use_phase}, use_log_mag={use_log_magnitude}"
+            f"FrequencyLoss: alpha={alpha}, "
+            f"phase={use_phase}, log_mag={use_log_magnitude}, "
+            f"base_loss={loss_func_type}"
         )
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """
-        Calculate FFT-based loss with robust numerical handling.
+        Calculate FFT-based loss.
         
         Args:
-            pred: [B, C, H, W] predicted image
-            target: [B, C, H, W] target image
+            pred: [B, C, H, W] Predicted image
+            target: [B, C, H, W] Target image
             
         Returns:
-            Scalar loss tensor
+            Scalar frequency domain loss
         """
         # Ensure float32 for FFT stability
         pred = pred.float()
         target = target.float()
         
-        # Compute FFT (use rfft2 for real inputs - more efficient)
+        # Compute 2D FFT (rfft2 is optimized for real inputs)
         pred_fft = torch.fft.rfft2(pred, norm='ortho')
         target_fft = torch.fft.rfft2(target, norm='ortho')
         
@@ -100,26 +202,21 @@ class FrequencyLoss(nn.Module):
         target_mag = torch.abs(target_fft)
         
         if self.use_log_magnitude:
-            # Log space is more stable and better matches perception
-            # Add epsilon before log to avoid log(0)
-            pred_mag_safe = torch.clamp(pred_mag, min=self.eps)
-            target_mag_safe = torch.clamp(target_mag, min=self.eps)
+            # Log space: more perceptually uniform and numerically stable
+            pred_mag = torch.clamp(pred_mag, min=self.eps)
+            target_mag = torch.clamp(target_mag, min=self.eps)
             
-            pred_log_mag = torch.log(pred_mag_safe + self.eps)
-            target_log_mag = torch.log(target_mag_safe + self.eps)
+            pred_log_mag = torch.log(pred_mag + self.eps)
+            target_log_mag = torch.log(target_mag + self.eps)
             
             magnitude_loss = self.loss_func(pred_log_mag, target_log_mag)
         else:
-            # Direct magnitude comparison
             magnitude_loss = self.loss_func(pred_mag, target_mag)
         
-        # === PHASE LOSS (Optional, Often Unstable) ===
+        # === PHASE LOSS (Optional, Use with Caution) ===
         if self.use_phase and self.alpha < 1.0:
-            # Only compute phase where magnitude is significant
-            # This avoids phase instability at near-zero frequencies
-            
-            # Create mask for significant frequencies
-            magnitude_threshold = target_mag.mean() * 0.01  # 1% of mean
+            # Only compute phase at significant magnitudes
+            magnitude_threshold = target_mag.mean() * 0.01
             mask = (target_mag > magnitude_threshold).float()
             
             # Compute phase using atan2 (more stable than torch.angle)
@@ -130,72 +227,40 @@ class FrequencyLoss(nn.Module):
             phase_diff = pred_phase - target_phase
             phase_diff = torch.atan2(torch.sin(phase_diff), torch.cos(phase_diff))
             
-            # Apply mask and compute loss
+            # Apply magnitude mask and compute loss
             masked_phase_diff = phase_diff * mask
             phase_loss = torch.abs(masked_phase_diff).mean()
             
             # Combine magnitude and phase
-            total_loss = self.alpha * magnitude_loss + (1 - self.alpha) * phase_loss
-        else:
-            # Magnitude only
-            total_loss = magnitude_loss
+            return self.alpha * magnitude_loss + (1 - self.alpha) * phase_loss
         
-        return total_loss
+        # Magnitude only (default and recommended)
+        return magnitude_loss
 
 
 # ==============================================================================
-# Other Loss Components (Your Existing Code with Minor Fixes)
-# ==============================================================================
-
-class CharbonnierLoss(nn.Module):
-    """Robust L1 Loss with epsilon buffer."""
-    def __init__(self, eps: float = 1e-3):
-        super().__init__()
-        self.register_buffer('eps_squared', torch.tensor(eps**2))
-
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        return torch.sqrt((pred - target).pow(2) + self.eps_squared).mean()
-
-
-class PerceptualLoss(nn.Module):
-    """VGG19 or LPIPS-based perceptual loss."""
-    def __init__(self, network: str = 'vgg'):
-        super().__init__()
-        self.network_type = network
-
-        if self.network_type == 'vgg':
-            vgg = vgg19(weights=VGG19_Weights.IMAGENET1K_V1).features
-            self.model = nn.Sequential(*list(vgg.children())[:36]).eval()
-            self.register_buffer('mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
-            self.register_buffer('std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
-        elif self.network_type == 'lpips':
-            if not LPIPS_AVAILABLE:
-                raise ImportError("LPIPS not available. Install: pip install lpips")
-            self.model = lpips.LPIPS(net='alex', spatial=False).eval()
-        else:
-            raise ValueError(f"Unknown network: {network}")
-
-        for param in self.model.parameters():
-            param.requires_grad = False
-
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        pred = torch.clamp(pred, 0.0, 1.0)
-        target = torch.clamp(target, 0.0, 1.0)
-
-        if self.network_type == 'vgg':
-            pred_norm = (pred - self.mean) / self.std
-            target_norm = (target - self.mean) / self.std
-            return F.l1_loss(self.model(pred_norm), self.model(target_norm))
-        else:  # LPIPS
-            return self.model(pred * 2.0 - 1.0, target * 2.0 - 1.0).mean()
-
-
-# ==============================================================================
-# Combined Loss Manager
+# SECTION 2: Combined Loss Manager
 # ==============================================================================
 
 class CombinedLoss(nn.Module):
-    """Config-driven loss manager with robust numerical handling."""
+    """
+    Config-driven loss manager with smart weighted logging.
+    
+    Features:
+    - Automatic denormalization for perceptual/MS-SSIM losses
+    - Smart logging: only log weighted version for non-1.0 weights
+    - Robust NaN/Inf detection at multiple stages
+    - MS-SSIM size constraint handling
+    - Detailed error messages for debugging
+    
+    Config Example:
+        loss_config = {
+            'charbonnier': {'enabled': True, 'weight': 1.0, 'params': {'eps': 0.001}},
+            'perceptual': {'enabled': True, 'weight': 0.1, 'params': {'network': 'vgg'}},
+            'ms_ssim': {'enabled': True, 'weight': 0.15, 'params': {}},
+            'frequency': {'enabled': True, 'weight': 0.05, 'params': {'alpha': 1.0}}
+        }
+    """
     
     def __init__(self, loss_config: Dict[str, Dict], norm_range: Tuple[float, float] = (-1, 1)):
         super().__init__()
@@ -205,9 +270,11 @@ class CombinedLoss(nn.Module):
         self.norm_range = norm_range
         self.needs_denorm_01 = (norm_range == (-1, 1))
 
-        logger.info("Initializing CombinedLoss:")
+        logger.info("="*60)
+        logger.info("Initializing CombinedLoss")
         logger.info(f"  Normalization range: {norm_range}")
         logger.info(f"  Denormalization needed: {self.needs_denorm_01}")
+        logger.info("="*60)
 
         enabled_losses = []
         for name, config in loss_config.items():
@@ -236,15 +303,17 @@ class CombinedLoss(nn.Module):
                         logger.warning("pytorch-msssim not installed, skipping MS-SSIM")
                         continue
                     self.losses['ms_ssim'] = MS_SSIM(
-                        data_range=1.0, size_average=True, 
-                        channel=3, **params # nonnegative_ssim=True, 
+                        data_range=1.0, 
+                        size_average=True, 
+                        channel=3, 
+                        **params
                     )
                 elif name == 'frequency':
-                    # CRITICAL: Set safe defaults for FrequencyLoss
+                    # Set safe defaults for FrequencyLoss
                     fft_params = {
                         'loss_func_type': params.get('loss_func_type', 'l1'),
                         'alpha': params.get('alpha', 1.0),
-                        'use_phase': params.get('use_phase', False),  # DISABLE by default
+                        'use_phase': params.get('use_phase', False),
                         'use_log_magnitude': params.get('use_log_magnitude', True),
                         'eps': params.get('eps', 1e-6)
                     }
@@ -256,7 +325,7 @@ class CombinedLoss(nn.Module):
                 enabled_losses.append(name)
 
             except Exception as e:
-                logger.error(f"Failed to init '{name}': {e}")
+                logger.error(f"Failed to initialize '{name}': {e}")
                 if name in self.losses:
                     del self.losses[name]
                 if name in self.weights:
@@ -264,32 +333,49 @@ class CombinedLoss(nn.Module):
 
         if not self.losses:
             raise ValueError("No valid losses initialized")
+        
         logger.info(f"Active losses: {enabled_losses}")
+        logger.info("="*60)
 
     def _denormalize_to_01(self, x: torch.Tensor) -> torch.Tensor:
-        """Convert [-1, 1] to [0, 1] with clamping."""
+        """
+        Convert from training range to [0, 1] for perceptual/MS-SSIM losses.
+        
+        Args:
+            x: Input tensor in norm_range
+        
+        Returns:
+            Tensor in [0, 1] range
+        """
         if self.needs_denorm_01:
+            # [-1, 1] -> [0, 1]
             return (x.clamp(-1.0, 1.0) + 1.0) / 2.0
+        # Already [0, 1]
         return x.clamp(0.0, 1.0)
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
-        Calculate weighted loss with NaN detection.
+        Calculate weighted loss with smart logging.
         
         Returns:
-            (total_loss, loss_dict)
+            (total_loss, loss_dict) where loss_dict contains:
+                - 'loss_{name}': Unweighted component (always logged)
+                - 'loss_{name}_weighted': Weighted component (only if weight != 1.0)
+                - 'metric_*': Special metrics (e.g., MS-SSIM similarity)
+                - 'total_loss': Sum of all weighted components
         """
         total_loss = torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
         loss_dict = {}
 
         # Input sanity check
         if torch.isnan(pred).any() or torch.isinf(pred).any():
-            logger.error("NaN/Inf in pred before loss calculation!")
-            raise ValueError("NaN/Inf in prediction")
+            logger.error("NaN/Inf detected in prediction before loss calculation!")
+            raise ValueError("NaN/Inf in prediction tensor")
         if torch.isnan(target).any() or torch.isinf(target).any():
-            logger.error("NaN/Inf in target before loss calculation!")
-            raise ValueError("NaN/Inf in target")
+            logger.error("NaN/Inf detected in target before loss calculation!")
+            raise ValueError("NaN/Inf in target tensor")
 
+        # Lazy denormalization (only compute once if needed)
         pred_01, target_01 = None, None
         H, W = pred.shape[-2:]
 
@@ -297,54 +383,71 @@ class CombinedLoss(nn.Module):
             weight = self.weights[name]
 
             try:
-                # Select input range
+                # === Input Range Selection ===
                 if name in ['perceptual', 'ms_ssim']:
+                    # These losses require [0, 1] range
                     if pred_01 is None:
                         pred_01 = self._denormalize_to_01(pred)
                         target_01 = self._denormalize_to_01(target)
                     pred_for_loss = pred_01
                     target_for_loss = target_01
                 else:
+                    # Use native training range
                     pred_for_loss = pred
                     target_for_loss = target
 
-                # Handle MS-SSIM size constraint
+                # === MS-SSIM Size Constraint ===
                 if name == 'ms_ssim' and (H < MIN_SIZE_MSSSIM or W < MIN_SIZE_MSSSIM):
+                    # Image too small for MS-SSIM, skip this loss
                     loss = torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
                     loss_dict['metric_ms_ssim'] = torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
-                    logger.debug(f"Skipping MS-SSIM for size {H}x{W}")
+                    logger.debug(f"Skipping MS-SSIM for size {H}x{W} (min: {MIN_SIZE_MSSSIM})")
                 else:
-                    # Calculate loss
+                    # === Calculate Loss ===
                     if name == 'ms_ssim':
+                        # MS-SSIM returns similarity (higher is better)
                         similarity = loss_fn(
                             pred_for_loss.clamp(0.0, 1.0),
                             target_for_loss.clamp(0.0, 1.0)
                         )
                         loss = 1.0 - similarity.clamp(min=0.0)
-                        loss_dict['metric_ms_ssim'] = similarity
+                        # Log similarity as a metric (not a loss)
+                        loss_dict['metric_ms_ssim'] = similarity.detach()
                     else:
                         loss = loss_fn(pred_for_loss, target_for_loss)
 
-                # NaN/Inf check
+                # === NaN/Inf Check ===
                 if torch.isnan(loss) or torch.isinf(loss):
                     logger.error(
                         f"NaN/Inf in '{name}' loss! "
-                        f"Pred: [{pred.min():.4f}, {pred.max():.4f}], "
-                        f"Target: [{target.min():.4f}, {target.max():.4f}]"
+                        f"Pred range: [{pred.min():.4f}, {pred.max():.4f}], "
+                        f"Target range: [{target.min():.4f}, {target.max():.4f}]"
                     )
-                    raise ValueError(f"NaN/Inf in loss: {name}")
+                    raise ValueError(f"NaN/Inf in loss component: {name}")
 
             except Exception as e:
-                logger.error(f"Error in loss '{name}': {e}", exc_info=True)
+                logger.error(f"Error computing loss '{name}': {e}", exc_info=True)
                 raise
 
+            # === Smart Logging ===
+            # Always log unweighted component
+            loss_dict[f'loss_{name}'] = loss.detach()
+            
+            # Apply weighting
             weighted_loss = weight * loss
-            loss_dict[f'loss_{name}'] = weighted_loss
+            
+            # Only log weighted version if weight != 1.0
+            if weight != 1.0:
+                loss_dict[f'loss_{name}_weighted'] = weighted_loss.detach()
+            
+            # Accumulate total loss (always use weighted version)
             total_loss += weighted_loss
 
-        # Final check
+        # === Final Sanity Check ===
         if torch.isnan(total_loss) or torch.isinf(total_loss):
-            logger.error(f"Total loss is NaN/Inf! Components: {loss_dict}")
+            logger.error(f"Total loss is NaN/Inf! Component breakdown:")
+            for k, v in loss_dict.items():
+                logger.error(f"  {k}: {v}")
             raise ValueError("Total loss is NaN/Inf")
 
         loss_dict['total_loss'] = total_loss
@@ -352,7 +455,7 @@ class CombinedLoss(nn.Module):
 
 
 # ==============================================================================
-# SECTION 2: Dual Learning Losses (Reconstruction + Parameter Prediction) (av1_prior_embedder)
+# SECTION 3: Dual Learning Losses (Reconstruction + Parameter Prediction) (av1_prior_embedder)
 # ==============================================================================
 
 class DualLearning(nn.Module):
@@ -495,41 +598,61 @@ class BaselineRelativeLoss(DualLearning):
             'improvement_crf': crf_improvement,
         }
 
-# test CombinedLoss
+# ==============================================================================
+# SECTION 4: Testing
+# ==============================================================================
+
 if __name__ == "__main__":
     import torch
+    
+    print("="*60)
+    print("Testing CombinedLoss with smart weighted logging")
+    print("="*60)
     
     # Test configuration
     loss_config = {
         'charbonnier': {'enabled': True, 'weight': 1.0, 'params': {'eps': 0.001}},
-        'perceptual': {'enabled': True, 'weight': 0.2, 'params': {'network': 'vgg'}},
+        'perceptual': {'enabled': True, 'weight': 0.1, 'params': {'network': 'vgg'}},
         'ms_ssim': {'enabled': True, 'weight': 0.15, 'params': {}},
+        'frequency': {'enabled': True, 'weight': 0.05, 'params': {'alpha': 1.0}},
     }
     
     # Test with [-1, 1] range
-    print("Testing with norm_range=(-1, 1):")
+    print("\nTest 1: norm_range=(-1, 1)")
     loss_fn = CombinedLoss(loss_config, norm_range=(-1, 1))
     
-    i_size = 256
-
-    pred = torch.randn(2, 3, i_size, i_size) * 0.5  # Simulate [-1, 1] range
-    target = torch.randn(2, 3, i_size, i_size) * 0.5
+    pred = torch.randn(2, 3, 256, 256) * 0.5
+    target = torch.randn(2, 3, 256, 256) * 0.5
     
     loss, loss_dict = loss_fn(pred, target)
-    print(f"  Total loss: {loss.item():.6f}")
+    print(f"\nTotal loss: {loss.item():.6f}")
+    print("\nLoss components:")
     for k, v in loss_dict.items():
-        print(f"    {k}: {v.item():.6f}")
+        if not k.startswith('metric_'):
+            print(f"  {k}: {v.item():.6f}")
+    print("\nMetrics:")
+    for k, v in loss_dict.items():
+        if k.startswith('metric_'):
+            print(f"  {k}: {v.item():.6f}")
+    
+    # Verify smart logging
+    print("\nSmart logging verification:")
+    print(f"  'loss_charbonnier_weighted' in dict: {'loss_charbonnier_weighted' in loss_dict}")
+    print(f"  'loss_perceptual_weighted' in dict: {'loss_perceptual_weighted' in loss_dict}")
+    print("  ✓ Only non-1.0 weights have '_weighted' versions")
     
     # Test with [0, 1] range
-    print("\nTesting with norm_range=(0, 1):")
+    print("\n" + "="*60)
+    print("Test 2: norm_range=(0, 1)")
     loss_fn = CombinedLoss(loss_config, norm_range=(0, 1))
     
-    pred = torch.rand(2, 3, i_size, i_size)  # [0, 1] range
-    target = torch.rand(2, 3, i_size, i_size)
+    pred = torch.rand(2, 3, 256, 256)
+    target = torch.rand(2, 3, 256, 256)
     
     loss, loss_dict = loss_fn(pred, target)
-    print(f"  Total loss: {loss.item():.6f}")
-    for k, v in loss_dict.items():
-        print(f"    {k}: {v.item():.6f}")
+    print(f"\nTotal loss: {loss.item():.6f}")
+    print(f"Component count: {sum(1 for k in loss_dict if k.startswith('loss_'))}")
     
-    print("\n✅ All tests passed!")
+    print("\n" + "="*60)
+    print("All tests passed!")
+    print("="*60)
