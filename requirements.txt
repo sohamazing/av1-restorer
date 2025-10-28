@@ -1,81 +1,72 @@
 # ==============================================================================
-# AURA-Net Requirements
+# AURA-Net Requirements (Revised & Corrected)
+# ==============================================================================
+# This file is based on the provided Python code (train_*, restore_*,
+# degrade_*, blocks.py, loss.py, etc.) and lists only the required
+# dependencies, grouped for clarity.
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
-# Deep Learning Frameworks
+# Deep Learning Framework
 # ------------------------------------------------------------------------------
-# NOTE: PyTorch is installed separately via setup_env.sh to handle 
-# platform-specific versions (CUDA 11.8 for Linux, MPS for macOS)
-# torch>=2.0.0
-# torchvision>=0.15.0
-# torchaudio>=2.0.0
+# NOTE: As you specified, PyTorch is best installed separately via
+# https://pytorch.org/get-started/locally/ to match your hardware (CUDA/MPS).
+#
+# torch>=2.0.0             # Core framework, used everywhere
+# torchvision>=0.15.0      # For VGG models (loss.py) and transforms (av1_dataset.py)
+# torchaudio               # Not used
 
 # ------------------------------------------------------------------------------
-# Computer Vision & Image Processing
+# Core Training & Model Dependencies
 # ------------------------------------------------------------------------------
-pillow>=10.0.0              # Image loading and processing
-opencv-python>=4.8.0        # Advanced image operations
-timm>=0.9.0                 # Pre-trained vision models (Swin Transformer)
-torchvision>=0.15.0         # Vision utilities and transforms
-pillow-avif-plugin
+pyyaml>=6.0              # For parsing .yaml config files (train_*.py)
+tqdm>=4.65.0             # Progress bars (used in most scripts)
+numpy>=1.24.0            # Numerical operations (restore_av1.py)
+einops>=0.6.0            # Tensor manipulation (blocks.py)
+# transformers             # Not used (marked as Phase 2)
+# diffusers                # Not used (marked as Phase 2)
+# accelerate               # Not used (marked as Phase 2)
+# timm                     # Not used
+
+
 
 # ------------------------------------------------------------------------------
-# Diffusion Models & Generative AI (Phase 2)
+# Data Handling
 # ------------------------------------------------------------------------------
-diffusers>=0.21.0           # Hugging Face diffusers library
-transformers>=4.30.0        # Transformer models
-accelerate>=0.20.0          # Distributed training utilities
+pillow>=10.0.0           # Image loading (av1_dataset.py, restore_av1.py)
+pillow-avif-plugin       # Enables Pillow to read .avif files (av1_dataset.py)
+ffmpeg-python>=0.2.0     # For AV1 encoding (degrade_av1.py)
+opencv-python            # Not used; PIL/Torchvision handle image ops
+# psutil                   # Not used
+# scipy                    # Not used
+# scikit-learn             # Not used
+# av                       # Not used; ffmpeg-python is used instead
+
+
 
 # ------------------------------------------------------------------------------
-# Video/Image Codecs
+# Loss Functions & Metrics
 # ------------------------------------------------------------------------------
-ffmpeg-python>=0.2.0        # FFmpeg Python bindings for AV1 encoding
-av>=10.0.0                  # PyAV for video/image codec support
+lpips>=0.1.4             # LPIPS perceptual loss (loss.py)
+pytorch-msssim           # MS-SSIM loss (loss.py)
+
+------------------------------------------------------------------------
 
 # ------------------------------------------------------------------------------
-# Data & Scientific Computing
+# Development & Testing
 # ------------------------------------------------------------------------------
-numpy>=1.24.0               # Numerical computing
-scipy>=1.10.0               # Scientific computing
+wandb>=0.15.0            # Weights & Biases logging (train_av1_conditional_restorer.py)
+# tensorboard              # Not used; wandb is the active logger
+# pytest>=7.4.0            # Testing framework
+# black>=23.7.0            # Code formatting
+# flake8>=6.0.0            # Linting
+# mypy>=1.4.0              # Type checking
 
 # ------------------------------------------------------------------------------
-# Configuration & Utilities
+# Optional - Visualization
 # ------------------------------------------------------------------------------
-pyyaml>=6.0                 # YAML config file parsing
-tqdm>=4.65.0                # Progress bars
-einops>=0.6.0               # Tensor operations made easy
-
-# ------------------------------------------------------------------------------
-# Experiment Tracking & Logging
-# ------------------------------------------------------------------------------
-wandb>=0.15.0               # Weights & Biases experiment tracking
-tensorboard>=2.13.0         # TensorBoard logging (alternative to wandb)
-
-# ------------------------------------------------------------------------------
-# Metrics & Quality Assessment
-# ------------------------------------------------------------------------------
-scikit-learn>=1.3.0         # Machine learning utilities
-lpips>=0.1.4                # Perceptual similarity metric
-piqa>=1.3.0                 # PyTorch Image Quality Assessment
-
-# # ------------------------------------------------------------------------------
-# # Development & Testing (Optional)
-# # ------------------------------------------------------------------------------
-pytest>=7.4.0               # Testing framework
-black>=23.7.0               # Code formatting
-flake8>=6.0.0               # Linting
-mypy>=1.4.0                 # Type checking
-
-# ------------------------------------------------------------------------------
-# Visualization (Optional)
-# ------------------------------------------------------------------------------
-matplotlib>=3.7.0           # Plotting
-seaborn>=0.12.0             # Statistical visualization
-
-# ------------------------------------------------------------------------------
-# Additional Utilities
-# ------------------------------------------------------------------------------
-psutil>=5.9.0               # System monitoring
-colorama>=0.4.6             # Colored terminal output
-rich>=13.0.0                # Rich text and formatting in terminal
+# matplotlib>=3.7.0        # Plotting
+# seaborn>=0.12.0          # Statistical visualization
+# piqa                     # Not used
+# colorama                 # Not used
+# rich                     # Not used
