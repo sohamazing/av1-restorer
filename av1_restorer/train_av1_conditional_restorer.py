@@ -245,7 +245,8 @@ class ConditionalUNetTrainer:
 
         # --- SOTA: Enable TF32 for matrix multiplies on CUDA (PyTorch 2.x+) ---
         if self.device.type == 'cuda':
-            torch.set_float32_matmul_precision('high')
+            torch.backends.cuda.matmul.fp32_precision = 'high'
+            torch.backends.cudnn.allow_tf32 = True
             logger.info("Set float32 matmul precision to 'high' for CUDA.")
         # ------------------------------------------------------------------
         
@@ -1427,8 +1428,8 @@ class ConditionalUNetTrainer:
             # --- FIX: Sync W&B step *after* it's initialized and we've loaded the step ---
             if WANDB_AVAILABLE and wandb.run and wandb.run.resumed:
                 logger.info(f"W&B Resumed. Syncing step to {self.global_step}.")
-                # This manually sets wandb's internal counter to match our restored step
-                wandb.run.step = self.global_step
+                # ERROR: This manually sets wandb's internal counter to match our restored step
+                # wandb.run.step = self.global_step
             # ---------------------------------------------------------------------
 
             logger.info(f"Resuming at Stage {self.start_stage+1}, Epoch {self.start_epoch+1}")
