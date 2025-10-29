@@ -1427,7 +1427,7 @@ class ConditionalUNetTrainer:
             # --- FIX: Sync W&B step *after* it's initialized and we've loaded the step ---
             if WANDB_AVAILABLE and wandb.run and wandb.run.resumed:
                 logger.info(f"W&B Resumed. Syncing step to {self.global_step}.")
-                # ERROR: This manually sets wandb's internal counter to match our restored step
+                # ERROR:  Attempts to manually set wandb's internal counter to match restored step
                 # wandb.run.step = self.global_step
             # ---------------------------------------------------------------------
 

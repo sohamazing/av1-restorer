@@ -58,35 +58,46 @@ av1\_data/
 \<details\>  
 \<summary\>\<b\>View Detailed Architecture Flow\</b\>\</summary\>  
 Input \[B,3,H,W\] \+ CRF \[B,1\] (+ Preset \[B,1\])  
-    ↓  
+    │  
+    ▼  
 Conditioning Embedder (128/192-dim)  
-    ↓  
+    │  
+    ▼  
 ┌─────────────────────────────────────────┐  
 │         5-Level U-Net Backbone          │  
 ├─────────────────────────────────────────┤  
 │ Head (ch\[0\]) → EfficientResBlocks       │  
-│   ↓ Skip 0                              │  
+│   │                                     │  
+│   ▼ Skip 0                              │  
 │ Enc1 (ch\[1\]) → FiLM → Blocks  ↓2×       │  
-│   ↓ Skip 1                              │  
+│   │                                     │  
+│   ▼ Skip 1                              │  
 │ Enc2 (ch\[2\]) → FiLM → Blocks  ↓2×       │  
-│   ↓ Skip 2                              │  
+│   │                                     │  
+│   ▼ Skip 2                              │  
 │ Enc3 (ch\[3\]) → FiLM → Blocks  ↓2×       │  
-│   ↓ Skip 3                              │  
-│ Bottleneck (ch\[4\]) ↓2×                  │  
+│   │                                     │  
+│   ▼ Skip 3                              │  
+│ Bottleneck (ch\[4\]) ↓2×                 │  
 │   → Pre-Attn (Blocks)                   │  
 │   → SimpleSelfAttention (Channel-wise)  │  
 │   → FiLM Conditioning                   │  
 │   → Post-Attn (Blocks)                  │  
-│   ↓ ↑2× (Bilinear \+ Conv)               │  
+│   │                                     │  
+│   ▼ ↑2× (Bilinear \+ Conv)               │  
 │ Dec3 (ch\[3\]) ← Skip 3 → Blocks          │  
-│   ↓ ↑2× (Bilinear \+ Conv)               │  
+│   │                                     │  
+│   ▼ ↑2× (Bilinear \+ Conv)               │  
 │ Dec2 (ch\[2\]) ← Skip 2 → Blocks          │  
-│   ↓ ↑2× (Bilinear \+ Conv)               │  
+│   │                                     │  
+│   ▼ ↑2× (Bilinear \+ Conv)               │  
 │ Dec1 (ch\[1\]) ← Skip 1 → Blocks          │  
-│   ↓ ↑2× (Bilinear \+ Conv)               │  
+│   │                                     │  
+│   ▼ ↑2× (Bilinear \+ Conv)               │  
 │ Tail (ch\[0\]) ← Skip 0 → Predict Residual│  
 └─────────────────────────────────────────┘  
-    ↓  
+    │  
+    ▼  
 Output \= Input \+ Residual (clamped)
 
 \</details\>
@@ -134,44 +145,58 @@ At inference, a router selects the appropriate model based on the input CRF, res
 * Sizes: nano (0.2M), tiny (0.5M), small (1.2M), base (2.5M), large (6.0M), huge (11.2M)
 
 Input Image  
-    ↓  
+    │  
+    ▼  
 Head \+ ResBlocks  
-    ↓ \[skip0\]  
+    │  
+    ▼ \[skip0\]  
 Encoder-1 (downsample 2×)  
-    ↓ \[skip1\]  
+    │  
+    ▼ \[skip1\]  
 Encoder-2 (downsample 2×)  
-    ↓ \[skip2\]  
+    │  
+    ▼ \[skip2\]  
 Encoder-3 (downsample 2×)  
-    ↓  
+    │  
+    ▼  
 Decoder-3 (upsample 2×) ← \[skip2\]  
-    ↓  
+    │  
+    ▼  
 Decoder-2 (upsample 2×) ← \[skip1\]  
-    ↓  
+    │  
+    ▼  
 Decoder-1 (upsample 2×) ← \[skip0\]  
-    ↓  
+    │  
+    ▼  
 Tail → Residual  
-    ↓  
+    │  
+    ▼  
 Restored \= Input \+ Residual
 
 **B. Nano ResNet (av1\_nano\_resnet\_restorer.py)**
 
 * **Maximum speed (no downsampling)**  
-* Processes at native resolution (e.g., 60-90+ fps @ 1080p)  
+* Processes at native resolution  
 * Multi-scale feature extraction head  
 * Sizes: nano (0.7M), tiny (1.2M), small (2.1M), base (3.3M), huge (6.5M)
 
 Input Image  
-    ↓  
+    │  
+    ▼  
 Head Conv  
-    ↓  
+    │  
+    ▼  
 Multi-Scale Feature Extractor  
-(parallel 3×3, 5×5, 7×7 paths)  
-    ↓  
+(parallel 3x3, 5x5, 7x7 paths)  
+    │  
+    ▼  
 N × Residual Blocks  
 (with long skip connection)  
-    ↓  
+    │  
+    ▼  
 Tail → Residual  
-    ↓  
+    │  
+    ▼  
 Restored \= Input \+ Residual
 
 **C. Nano FBCNN (av1\_nano\_fbcnn\_restorer.py)**
@@ -281,9 +306,9 @@ model:
   size: "large"  \# Select: nano, tiny, small, base, large, huge, pro
 
 dataset:  
-  crf\_range: \[23, 63\]      \# Full CRF spectrum  
-  preset\_range: \[4, 4\]     \# Single value \= CRF-Only mode  
-  norm\_range: \[-1, 1\]      \# Image normalization
+  crf\_range: \[23, 63\]     \# Full CRF spectrum  
+  preset\_range: \[4, 4\]    \# Single value \= CRF-Only mode  
+  norm\_range: \[-1, 1\]     \# Image normalization
 
 data:  
   train\_lq\_root: "./av1\_data/train/lq"  
@@ -301,12 +326,12 @@ curriculum:
     patch\_size: 128  
     batch\_size: 32 \# Adjust based on VRAM  
     epochs: 50  
-    
+      
   \- \# Stage 2: Medium patches (learn broader context)  
     patch\_size: 256  
     batch\_size: 16  
     epochs: 75  
-    
+      
   \- \# Stage 3: Large patches (refine full context)  
     patch\_size: 512  
     batch\_size: 8  
@@ -377,13 +402,6 @@ python av1\_restorer/train\_av1\_conditional\_restorer.py \\
 * val/improvement\_l1: L1 improvement over baseline (should be positive and increasing).  
 * val/restored\_l1 vs. val/baseline\_l1: Restored L1 should become lower than baseline.
 
-Approximate Training Time (Conditional large Model):  
-| Hardware | Stage 1 (128px) | Stage 2 (256px) | Stage 3 (512px) | Total |  
-|:---|:---|:---|:---|:---|  
-| RTX 4090 | 8h | 24h | 20h | \~52h |  
-| RTX 3060 | 18h | 54h | 45h | \~117h |  
-| Apple M4 Max | 24h | 72h | 60h | \~156h |
-
 ### **Workflow 2: Nano Models (CRF-Specialized)**
 
 This workflow trains multiple lightweight models, each specialized for a specific CRF range.
@@ -398,7 +416,7 @@ model:
   size: "small"      \# nano, tiny, small, etc.
 
 dataset:  
-  crf\_range: \[34, 43\]      \# \<\<\< NARROW CRF BUCKET  
+  crf\_range: \[34, 43\]     \# \<\<\< NARROW CRF BUCKET  
 \# ... (rest of config) ...
 
 #### **Step 2: Train Each CRF Bucket**
@@ -412,13 +430,6 @@ python av1\_restorer/train\_av1\_nano\_restorer.py \\
 \# Train Model B (CRF 34-43)  
 python av1\_restorer/train\_av1\_nano\_restorer.py \\  
     \--config configs/nano\_models/nano\_unet\_small\_crf34-43.yaml
-
-Approximate Training Time (Per Nano Model):  
-| Hardware | Stage 1 (128px) | Stage 2 (256px) | Total |  
-|:---|:---|:---|:---|  
-| RTX 4090 | 2h | 6h | \~8h |  
-| RTX 3060 | 3h | 9h | \~12h |  
-| Apple M4 Max | 5h | 15h | \~20h |
 
 ## **🖥️ Inference (Usage)**
 
@@ -470,47 +481,14 @@ python scripts/restore\_av1.py \\
     \--crf 45 \\  
     \--preset 4
 
-## **📊 Performance & SOTA Strategy**
+## **📊 Performance Benchmarking**
 
-### **Model Comparison (Conditional vs. Nano)**
+This project will compare training and inference performance across two distinct hardware setups:
 
-| Metric | Conditional U-Net (large) | Nano U-Net (small) |
-| :---- | :---- | :---- |
-| **Parameters** | \~19.7M | \~1.2M |
-| **CRF Coverage** | 23-63 (Universal) | 34-43 (Specialized) |
-| **Inference (1080p)** | \~8-10 fps | \~60 fps |
-| **Quality (Subjective)** | ★★★★★ | ★★★★☆ |
-| **Best Use Case** | Offline processing, quality-critical | Live streaming |
+* **Nvidia L4 VM (Cloud Engine)**: Representing a typical cloud-based GPU environment.  
+* **M4 Max Macbook Pro (Local Machine)**: Representing high-end local ARM-based hardware (MPS).
 
-### **Speed Benchmarks (RTX 3060, 1080p)**
-
-| Model Type | Size | FPS | Quality | Use Case |
-| :---- | :---- | :---- | :---- | :---- |
-| Cond U-Net | large | \~8 | ★★★★★ | Photo/video editing |
-| Nano U-Net | small | \~60 | ★★★★☆ | Live streaming |
-| **Nano ResNet** | **small** | **\~90+** | **★★★☆☆** | **Real-time processing** |
-| Nano FBCNN | base | \~45 | ★★★★☆ | Balanced |
-
-### **Recommended Production Strategy: Hybrid**
-
-For a production system, use a hybrid approach for the best trade-off:
-
-1. **Estimate Input CRF:** Check metadata or use a lightweight classifier.  
-2. **Route:**  
-   * **CRF \< 35 (Light Artifacts):** Use a **Nano ResNet** model. Speed is critical, and artifacts are minimal.  
-   * **CRF \>= 35 (Heavy Artifacts):** Use the **Conditional U-Net**. Quality is paramount, and artifacts are complex.
-
-Incoming Compressed Video  
-        ↓  
-   CRF Estimator  
-        ↓  
-  ┌─────┴─────┐  
-  │           │  
-CRF \< 35   CRF \>= 35  
-  │           │  
-  ↓           ↓  
-Nano ResNet  Cond. U-Net  
-  (Fast)       (Quality)
+Metrics will be gathered during the training and testing phases to evaluate real-world speed and efficiency.
 
 ## **🔧 Troubleshooting & Training Tips**
 
@@ -566,24 +544,35 @@ aura/
 │   │   └── blocks.py                            \# Shared building blocks  
 │   │  
 │   ├── train\_av1\_conditional\_restorer.py        \# Trainer for Conditional U-Net  
-│   └── train\_av1\_nano\_restorer.py             \# (Hypothetical) Trainer for Nanos  
+│   └── train\_av1\_nano\_restorer.py               \# (Hypothetical) Trainer for Nanos  
 │  
 ├── utils/  
-│   ├── av1\_dataset.py                           \# Dataloader  
-│   └── loss.py                                  \# CombinedLoss function  
+│   ├── av1\_dataset.py                  \# Dataloader  
+│   └── loss.py                         \# CombinedLoss function  
 │  
 ├── scripts/  
-│   ├── degrade\_av1.py                           \# Creates LQ dataset  
-│   ├── split\_av1\_dataset.py                     \# Splits train/val  
-│   └── restore\_av1.py                           \# Inference script  
+│   ├── degrade\_av1.py                  \# Creates LQ dataset  
+│   ├── split\_av1\_dataset.py            \# Splits train/val  
+│   └── restore\_av1.py                  \# Inference script  
 │  
 ├── configs/  
-│   ├── conditional\_unet/                        \# Configs for Conditional U-Net  
-│   └── nano\_models/                             \# Configs for Nano models  
+│   ├── conditional\_unet/               \# Configs for Conditional U-Net  
+│   └── nano\_models/                    \# Configs for Nano models  
 │  
-├── av1\_data/  
-│   ├── train/ (lq, hq)  
-│   ├── val/ (lq, hq)  
-│   └── test/ (lq, hq)  
+├── av1\_data/                           \# master dataset (Div2K \+ Flickr2K)  
+├── train/                              \# 80% of master dataset  
+│   ├── lq/                             \# AV1-compressed images (.avif)  
+│   │   ├── crf\_23/preset\_4/  
+│   │   ├── crf\_24/preset\_4/  
+│   │   └── ... (up to crf\_63)  
+│   └── hq/                             \# High-quality reference images (.png)  
 │  
-└── checkpoints/                                 \# Saved models  
+├── val/                                \# 20% of master dataset  
+│   ├── lq/                             \# AV1-compressed images  
+│   └── hq/                             \# High-quality reference images  
+│  
+├── test/                               \# Separate test set (e.g., DIV2K\_valid)  
+│   ├── lq/                             \# AV1-compressed images  
+│   └── hq/                             \# High-quality reference images  
+│  
+└── checkpoints/                        \# Saved models  
