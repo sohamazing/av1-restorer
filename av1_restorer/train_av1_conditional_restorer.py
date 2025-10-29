@@ -405,7 +405,7 @@ class ConditionalUNetTrainer:
                 lq_root_dir=data_cfg['val_lq_root'],
                 hq_root_dir=data_cfg['val_hq_root'],
                 hq_ext=data_cfg.get('hq_ext', '.png'),
-                patch_size=512,
+                patch_size=patch_size,
                 crf_range=tuple(dset_cfg['crf_range']),
                 preset_range=tuple(dset_cfg['preset_range']),
                 norm_range=tuple(dset_cfg.get('norm_range', [-1, 1])),

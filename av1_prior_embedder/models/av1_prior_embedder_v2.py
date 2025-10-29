@@ -1,21 +1,4 @@
-Here is the SOTA-upgraded version of your av1_prior_embedder.py.
-
-This new architecture is designed for maximum stability, efficiency, and quality, based on the best practices from your other project files (like the V2 U-Net and Nano-ResNet).
-
-The key changes are:
-
-GroupNorm replaces BatchNorm: This is the most critical change. GroupNorm is batch-size independent, making it far more stable and effective for training with the small batch sizes common in image restoration.
-
-Efficient Blocks: The heavy ResidualBlock is replaced with the EfficientResBlock from your blocks.py file. This uses depthwise separable convolutions and channel attention (ECA) for a massive reduction in parameters and computational cost.
-
-Modern Upsampling: The UNetDecoder's ConvTranspose2d layers (which cause checkerboard artifacts) are replaced with the "Upsample + Conv" method (Bilinear Upsample + DepthwiseSeparable conv), ensuring a clean, artifact-free output.
-
-Logical Prediction: The CRFPredictor now branches from the fused_features (local + global) instead of just the local_features, giving it more context to make a better prediction.
-
-I have fully documented every decision inline.
-
-av1_prior_embedder_v2.py
-Python
+# av1_prior_embedder_v2.py
 
 """
 AV1 Compression Prior Embedder (CaPE) - SOTA CNN Architecture
