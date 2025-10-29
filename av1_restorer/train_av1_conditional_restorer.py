@@ -31,7 +31,7 @@ Resume W&B:
 
 ==============================================================================
 Author: Soham Mukherjee
-Version: 2.0 (Conditional U-Net with Auto CRF-only Detection)
+Version: 2.1
 License: MIT
 ==============================================================================
 """
@@ -178,9 +178,11 @@ class ConditionalUNetTrainer:
         # W&B logging
         self._setup_logging()
         
-        # Summary and validation samples
+        # Summary
         self._print_summary()
-        self.val_samples = self._get_fixed_val_samples()
+        # self.val_samples = self._get_fixed_val_samples() # depreciated
+        self.val_samples = None # val_samples moved to train() loop 
+
         
         # Training state
         self.start_stage = 0
@@ -193,6 +195,17 @@ class ConditionalUNetTrainer:
         # Load checkpoint if resuming
         if self.resume_from:
             self._load_checkpoint()
+
+        # --- SOTA: Compile model AFTER loading weights (if not resuming) ---
+        # Note: torch.compile() is best used *after* model.to(device) and load_state_dict
+        if self.device.type == 'cuda' and not self.resume_from:
+             try:
+                 logger.info("Compiling model with torch.compile() (mode='reduce-overhead')...")
+                 self.model = torch.compile(self.model, mode='reduce-overhead') 
+                 logger.info("Model compiled successfully.")
+             except Exception as e:
+                 logger.warning(f"torch.compile() failed: {e}. Proceeding without compilation.")
+        
     
     # --------------------------------------------------------------------------
     # Setup Methods
@@ -229,6 +242,12 @@ class ConditionalUNetTrainer:
         else:
             self.device = torch.device(device_str)
             logger.info(f"Device: {self.device}")
+
+        # --- SOTA: Enable TF32 for matrix multiplies on CUDA (PyTorch 2.x+) ---
+        if self.device.type == 'cuda':
+            torch.set_float32_matmul_precision('high')
+            logger.info("Set float32 matmul precision to 'high' for CUDA.")
+        # ------------------------------------------------------------------
         
         # Random seed for reproducibility
         seed = sys_cfg.get('seed', 42)
@@ -383,18 +402,22 @@ class ConditionalUNetTrainer:
         logger.info(f"Device: {self.device} | AMP: {self.use_amp} | EMA: {self.ema is not None}")
         logger.info("=" * 80)
     
-    def _get_fixed_val_samples(self) -> Optional[Dict[str, Any]]:
-        """Sample fixed validation images for W&B visualization."""
+    def _get_fixed_val_samples(self, stage_cfg: dict) -> Optional[Dict[str, Any]]:
+        """
+        Sample fixed validation images for W&B visualization per stage
+        """
         try:
             data_cfg = self.config['data']
             dset_cfg = self.config['dataset']
             num_samples = self.config['training'].get('num_val_samples_to_log', 4)
             
-            # Get patch size from last curriculum stage
-            last_stage = self.config['curriculum'][-1]
-            patch_size = last_stage['patch_size']
+            # --- Get patch size from CURRENT stage ---
+            patch_size = stage_cfg['patch_size']
             if isinstance(patch_size, list):
-                patch_size = patch_size[-1]
+                patch_size = patch_size[-1] # Use final patch size of a progressive stage
+            # ----------------------------------------------
+            
+            logger.info(f"Sampling {num_samples} validation images at {patch_size}px...")
 
             # Check cache for file list
             val_cache_key = f"{data_cfg['val_lq_root']}_{tuple(dset_cfg['crf_range'])}"
@@ -405,7 +428,7 @@ class ConditionalUNetTrainer:
                 lq_root_dir=data_cfg['val_lq_root'],
                 hq_root_dir=data_cfg['val_hq_root'],
                 hq_ext=data_cfg.get('hq_ext', '.png'),
-                patch_size=patch_size,
+                patch_size=patch_size, # This will now be 128, 256, etc.
                 crf_range=tuple(dset_cfg['crf_range']),
                 preset_range=tuple(dset_cfg['preset_range']),
                 norm_range=tuple(dset_cfg.get('norm_range', [-1, 1])),
@@ -419,6 +442,16 @@ class ConditionalUNetTrainer:
             if cached_val_image_pairs is None and hasattr(val_dataset, 'image_pairs'):
                 self.val_image_pairs_cache[val_cache_key] = val_dataset.image_pairs
             
+            if len(val_dataset) == 0:
+                logger.warning("Validation dataset is empty, cannot sample images.")
+                return None
+            
+            # Ensure num_samples is not larger than dataset
+            num_samples = min(num_samples, len(val_dataset))
+            if num_samples == 0:
+                 logger.warning("No samples to log.")
+                 return None
+
             loader = DataLoader(val_dataset, batch_size=num_samples, shuffle=False)
             batch = next(iter(loader))
             
@@ -432,7 +465,7 @@ class ConditionalUNetTrainer:
             return result
         
         except Exception as e:
-            logger.warning(f"Could not sample validation images: {e}")
+            logger.warning(f"Could not sample validation images: {e}", exc_info=True)
             return None
     
     # --------------------------------------------------------------------------
@@ -655,6 +688,9 @@ class ConditionalUNetTrainer:
         for stage_idx in range(self.start_stage, len(curriculum)):
             stage_cfg = curriculum[stage_idx]
             logger.info(f"\n▶ Starting Stage {stage_idx + 1}/{len(curriculum)}")
+            
+            # Get val samples for this stage
+            self.val_samples = self._get_fixed_val_samples(stage_cfg)
 
             current_stage_loader_len = stage_loader_lengths[stage_idx]
             self._run_stage(stage_idx, stage_cfg, optimizer, scheduler, current_stage_loader_len)
@@ -898,9 +934,9 @@ class ConditionalUNetTrainer:
                 )
                 raise
 
-            # Scheduler and EMA updates
             if scheduler:
                 scheduler.step()
+                
             if self.ema:
                 self.ema.update()
 
@@ -1154,6 +1190,12 @@ class ConditionalUNetTrainer:
         restored_display.clamp_(0, 1)
         hq_display.clamp_(0, 1)
 
+        # --- FIX: Replace NaNs before casting to uint8 ---
+        lq_display = torch.nan_to_num(lq_display, nan=0.0)
+        restored_display = torch.nan_to_num(restored_display, nan=0.0)
+        hq_display = torch.nan_to_num(hq_display, nan=0.0)
+        # -------------------------------------------------
+
         # Create W&B images
         images_to_log = []
         for i in range(restored_display.size(0)):
@@ -1330,17 +1372,29 @@ class ConditionalUNetTrainer:
 
             # Check if stage completed
             try:
-                curr_cfg = self.config['curriculum'][self.start_stage]
-                epochs_cfg = curr_cfg['epochs']
-                total_epochs = sum(epochs_cfg) if isinstance(epochs_cfg, list) else epochs_cfg
+                # FIX: Handle potential IndexError if curriculum changed
+                if self.start_stage >= len(self.config['curriculum']):
+                     logger.warning("Checkpoint is from a completed training run.")
+                     self.start_stage = len(self.config['curriculum'])
+                     self.start_epoch = 0
+                else:
+                    curr_cfg = self.config['curriculum'][self.start_stage]
+                    epochs_cfg = curr_cfg['epochs']
+                    total_epochs = sum(epochs_cfg) if isinstance(epochs_cfg, list) else epochs_cfg
 
-                if self.start_epoch >= total_epochs:
-                    logger.info(f"Stage {self.start_stage+1} completed")
-                    self.start_stage += 1
-                    self.start_epoch = 0
-                    logger.info(f"Resuming from Stage {self.start_stage+1}")
+                    if self.start_epoch >= total_epochs:
+                        logger.info(f"Stage {self.start_stage+1} completed")
+                        self.start_stage += 1
+                        self.start_epoch = 0
+                        logger.info(f"Resuming from Stage {self.start_stage+1}")
             except IndexError:
-                raise ValueError("Checkpoint stage index out of bounds")
+                logger.error("Curriculum mismatch or checkpoint stage index out of bounds. Starting from scratch.")
+                self.start_stage = 0
+                self.start_epoch = 0
+                self.global_step = 0
+                self.best_val_loss = float('inf')
+                self.resume_from = None
+                return # Stop loading here
 
             if self.start_stage >= len(self.config['curriculum']):
                 logger.warning("Training already completed")
@@ -1369,6 +1423,13 @@ class ConditionalUNetTrainer:
                             self.ema = EMA(self.model, decay=self.ema.decay)
                     except Exception as e:
                         logger.warning(f"Failed to restore EMA: {e}")
+            
+            # --- FIX: Sync W&B step *after* it's initialized and we've loaded the step ---
+            if WANDB_AVAILABLE and wandb.run and wandb.run.resumed:
+                logger.info(f"W&B Resumed. Syncing step to {self.global_step}.")
+                # This manually sets wandb's internal counter to match our restored step
+                wandb.run.step = self.global_step
+            # ---------------------------------------------------------------------
 
             logger.info(f"Resuming at Stage {self.start_stage+1}, Epoch {self.start_epoch+1}")
             logger.info(f"Global step: {self.global_step}, Best loss: {self.best_val_loss:.6f}")
