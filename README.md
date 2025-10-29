@@ -530,25 +530,30 @@ Metrics will be gathered during the training and testing phases to evaluate real
 * **Test Dataset Loading:**  
 ```
   python -c "  
-  from utils.av1_dataset import AV1Dataset  
-  ds = AV1Dataset(  
-  lq_root_dir='av1_data/train/lq',  
-  hq_root_dir='av1_data/train/hq',  
-  hq_ext='.png',  
-  patch_size=128,  
-  crf_range=(23, 63),  
-  preset_range=(4, 4),  
-  norm_range=(-1, 1)  
-  )  
-  print(f'Dataset size: {len(ds)}')  
-  ds.print_statistics()  
+    from utils.av1_dataset import AV1Dataset  
+    dataset = AV1Dataset(  
+      lq_root_dir='av1_data/train/lq',  
+      hq_root_dir='av1_data/train/hq',  
+      hq_ext='.png',  
+      patch_size=128,  
+      crf_range=(23, 63),  
+      preset_range=(4, 4),  
+      norm_range=(-1, 1)  
+    )  
+    print(f'Dataset size: {len(ds)}')  
+    dataset.print_statistics()  
+
+    sample = dataset[0]
+    print(f"Sample keys: {sample.keys()}")
+    print(f"LQ shape: {sample['lq'].shape}, range: [{sample['lq'].min():.3f}, {sample['lq'].max():.3f}]")
+    print(f"HQ shape: {sample['hq'].shape}, range: [{sample['hq'].min():.3f}, {sample['hq'].max():.3f}]")
+    print(f"CRF: {sample['crf'].item()}, Preset: {sample['preset'].item()}")
   "
 ```
-* **Model Loading (2 epochs):**  
+* **Model Loading:**  
 ```
-  # Create a dry_run.yaml config with epochs: 2  
-  python av1_restorer/models/av1_conditional_unet_restorer_v2.py \  
-      --config configs/dry_run.yaml
+  # Create conditional restorer for all size configs 
+  python av1_restorer/models/av1_conditional_unet_restorer_v2.py
 ```
 
 * **Dry Run Training (2 epochs):**  
