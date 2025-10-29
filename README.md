@@ -55,8 +55,6 @@ av1\_data/
 * **Residual Learning**: Predicts the artifact correction, preserving original image details.  
 * **Memory-Efficient Tiling**: Built-in inference logic handles images of any size.
 
-\<details\>  
-\<summary\>\<b\>View Detailed Architecture Flow\</b\>\</summary\>  
 Input \[B,3,H,W\] \+ CRF \[B,1\] (+ Preset \[B,1\])  
     │  
     ▼  
@@ -100,22 +98,20 @@ Conditioning Embedder (128/192-dim)
     ▼  
 Output \= Input \+ Residual (clamped)
 
-\</details\>
-
 #### **Model Sizes (Empirically Calibrated, CRF-Only Mode)**
 
 These configurations are precisely engineered to match target parameter counts.
 
-| Size | Target | Actual Params | Use Case |
-| :---- | :---- | :---- | :---- |
-| nano | \~2M | **2.30M** | Minimal viable conditional model |
-| tiny | \~5M | **4.96M** | Lightweight, fast iteration |
-| small | \~10M | **9.21M** | Standard balanced |
-| base | \~12M | **12.79M** | Enhanced standard |
-| **large** | **\~20M** | **19.69M** | **RECOMMENDED DEFAULT** ⭐ |
-| huge | \~32M | **32.34M** | High quality |
-| pro | \~50M | **50.31M** | Maximum quality / Research |
+|
 
+| Size | Target | Actual Params | Use Case |  
+| nano | \~2M | 2.30M | Minimal viable conditional model |  
+| tiny | \~5M | 4.96M | Lightweight, fast iteration |  
+| small | \~10M | 9.21M | Standard balanced |  
+| base | \~12M | 12.79M | Enhanced standard |  
+| large | \~20M | 19.69M | RECOMMENDED DEFAULT ⭐ |  
+| huge | \~32M | 32.34M | High quality |  
+| pro | \~50M | 50.31M | Maximum quality / Research |  
 *(Note: CRF+Preset mode adds \< 0.3M parameters)*
 
 ### **2\. Nano Models (CRF-Specialized)**
@@ -126,13 +122,11 @@ These configurations are precisely engineered to match target parameter counts.
 
 Train separate specialized models for each compression tier:
 
-| CRF Range | Compression | Strategy |
-| :---- | :---- | :---- |
-| 23-33 | Light | Texture preservation |
-| 34-43 | Moderate | Balanced restoration |
-| 44-53 | Heavy | Aggressive correction |
-| 54-63 | Extreme | Full reconstruction |
-
+| CRF Range | Compression | Strategy |  
+| 23-33 | Light | Texture preservation |  
+| 34-43 | Moderate | Balanced restoration |  
+| 44-53 | Heavy | Aggressive correction |  
+| 54-63 | Extreme | Full reconstruction |  
 At inference, a router selects the appropriate model based on the input CRF, resulting in faster and more accurate restoration for that specific range.
 
 #### **Available Architectures**
@@ -437,18 +431,17 @@ Use scripts/restore\_av1.py to run your trained models.
 
 ### **Key Arguments**
 
-| Argument | Short | Description |
-| :---- | :---- | :---- |
-| \--checkpoint \<path\> | \-c | **Required.** Path to the .pth checkpoint file. |
-| \--input\_dir \<path\> | \-d | **Required.** Path to a directory of LQ images. |
-| \--output\_dir \<path\> |  | **Required.** Path to save restored images. |
-| \--auto |  | Auto-detect CRF/Preset from filenames (e.g., ...\_crf30\_p4.avif). |
-| \--test |  | Enable test mode: runs metrics against an HQ directory. |
-| \--hq\_dir \<path\> |  | (Test Mode) Path to the corresponding HQ images. |
-| \--device \<name\> |  | auto, cuda, mps, or cpu. Defaults to auto. |
-| \--tile \<size\> |  | Tile size for large images (e.g., 512). |
-| \--overwrite |  | Overwrite existing files in the output directory. |
-| \--dry\_run |  | Log actions without processing. |
+| Argument | Short | Description |  
+| \--checkpoint \<path\> | \-c | Required. Path to the .pth checkpoint file. |  
+| \--input\_dir \<path\> | \-d | Required. Path to a directory of LQ images. |  
+| \--output\_dir \<path\> | | Required. Path to save restored images. |  
+| \--auto | | Auto-detect CRF/Preset from filenames (e.g., ...\_crf30\_p4.avif). |  
+| \--test | | Enable test mode: runs metrics against an HQ directory. |  
+| \--hq\_dir \<path\> | | (Test Mode) Path to the corresponding HQ images. |  
+| \--device \<name\> | | auto, cuda, mps, or cpu. Defaults to auto. |  
+| \--tile \<size\> | | Tile size for large images (e.g., 512). |  
+| \--overwrite | | Overwrite existing files in the output directory. |  
+| \--dry\_run | | Log actions without processing. |
 
 ### **Example 1: Test Full Validation Set (with Metrics)**
 
@@ -575,4 +568,5 @@ aura/
 │   ├── lq/                             \# AV1-compressed images  
 │   └── hq/                             \# High-quality reference images  
 │  
-└── checkpoints/                        \# Saved models  
+└── checkpoints/                        \# Saved models
+
