@@ -104,16 +104,15 @@ Output = Input + Residual (clamped)
 
 These configurations are precisely engineered to match target parameter counts.
 
-|
-
-| Size | Target | Actual Params | Use Case |  
-| nano | \~2M | 2.30M | Minimal viable conditional model |  
-| tiny | \~5M | 4.96M | Lightweight, fast iteration |  
-| small | \~10M | 9.21M | Standard balanced |  
-| base | \~12M | 12.79M | RECOMMENDED DEFAULT |  
-| large | \~20M | 19.69M | Enhanced restoration |  
-| huge | \~32M | 32.34M | High quality (Slow)|  
-| pro | \~50M | 50.31M | Maximum quality / Research |  
+| Size | Target | Actual Params | Use Case |
+| :--- | :--- | :--- | :--- |
+| nano | \~2M | 2.30M | Minimal viable conditional model |
+| tiny | \~5M | 4.96M | Lightweight, fast iteration |
+| small | \~10M | 9.21M | Standard balanced |
+| base | \~12M | 12.79M | RECOMMENDED DEFAULT |
+| large | \~20M | 19.69M | Enhanced restoration |
+| huge | \~32M | 32.34M | High quality (Slow)|
+| pro | \~50M | 50.31M | Maximum quality / Research |
 *(Note: CRF+Preset mode adds \< 0.3M parameters)*
 
 ### **2\. Nano Models (CRF-Specialized)**
@@ -124,11 +123,13 @@ These configurations are precisely engineered to match target parameter counts.
 
 Train separate specialized models for each compression tier:
 
-| CRF Range | Compression | Strategy |  
-| 23-33 | Light | Texture preservation |  
-| 34-43 | Moderate | Balanced restoration |  
-| 44-53 | Heavy | Aggressive correction |  
-| 54-63 | Extreme | Full reconstruction |  
+| CRF Range | Compression | Strategy |
+| :--- | :--- | :--- |
+| 23-33 | Light | Texture preservation |
+| 34-43 | Moderate | Balanced restoration |
+| 44-53 | Heavy | Aggressive correction |
+| 54-63 | Extreme | Full reconstruction |
+
 At inference, a router selects the appropriate model based on the input CRF, resulting in faster and more accurate restoration for that specific range.
 
 #### **Available Architectures**
@@ -450,16 +451,17 @@ Use scripts/restore\_av1.py to run your trained models.
 
 ### **Key Arguments**
 
-| Argument | Short | Description |  
-| \--checkpoint \<path\> | \-c | Required. Path to the .pth checkpoint file. |  
-| \--input\_dir \<path\> | \-d | Required. Path to a directory of LQ images. |  
-| \--output\_dir \<path\> | | Required. Path to save restored images. |  
-| \--auto | | Auto-detect CRF/Preset from filenames (e.g., ...\_crf30\_p4.avif). |  
-| \--test | | Enable test mode: runs metrics against an HQ directory. |  
-| \--hq\_dir \<path\> | | (Test Mode) Path to the corresponding HQ images. |  
-| \--device \<name\> | | auto, cuda, mps, or cpu. Defaults to auto. |  
-| \--tile \<size\> | | Tile size for large images (e.g., 512). |  
-| \--overwrite | | Overwrite existing files in the output directory. |  
+| Argument | Short | Description |
+| :--- | :--- | :--- |
+| \--checkpoint \<path\> | \-c | Required. Path to the .pth checkpoint file. |
+| \--input\_dir \<path\> | \-d | Required. Path to a directory of LQ images. |
+| \--output\_dir \<path\> | | Required. Path to save restored images. |
+| \--auto | | Auto-detect CRF/Preset from filenames (e.g., ...\_crf30\_p4.avif). |
+| \--test | | Enable test mode: runs metrics against an HQ directory. |
+| \--hq\_dir \<path\> | | (Test Mode) Path to the corresponding HQ images. |
+| \--device \<name\> | | auto, cuda, mps, or cpu. Defaults to auto. |
+| \--tile \<size\> | | Tile size for large images (e.g., 512). |
+| \--overwrite | | Overwrite existing files in the output directory. |
 | \--dry\_run | | Log actions without processing. |
 
 ### **Example 1: Test Full Validation Set (with Metrics)**
