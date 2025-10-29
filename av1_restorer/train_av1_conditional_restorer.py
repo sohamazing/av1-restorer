@@ -245,8 +245,7 @@ class ConditionalUNetTrainer:
 
         # --- SOTA: Enable TF32 for matrix multiplies on CUDA (PyTorch 2.x+) ---
         if self.device.type == 'cuda':
-            torch.backends.cuda.matmul.fp32_precision = 'high'
-            torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cuda.matmul.fp32_precision = 'tf32'
             logger.info("Set float32 matmul precision to 'high' for CUDA.")
         # ------------------------------------------------------------------
         
