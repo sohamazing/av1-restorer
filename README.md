@@ -14,22 +14,23 @@ Both architectures are built on SOTA principles, including GroupNorm, GELU, effi
 ## **💾 Dataset Structure**
 
 Your AV1 dataset should be organized as follows for the training and testing scripts:
-
-av1\_data/  
-├── train/        \# 80% of master dataset  
-│   ├── lq/         \# AV1-compressed images (.avif)  
-│   │   ├── crf\_23/preset\_4/  
-│   │   ├── crf\_24/preset\_4/  
-│   │   └── ... (up to crf\_63)  
-│   └── hq/         \# High-quality reference images (.png)  
+```
+av1_data/                          # Div2K + Flickr2K master dataset
+├── train/                          # 80% of master dataset  
+│   ├── lq/                         # AV1-compressed images (.avif)  
+│   │   ├── crf_23/preset_4/      # crf_XX/preset_y/image_crfXX_pY.avif
+│   │   ├── crf_24/preset_4/  
+│   │   └── ... (up to crf_63)  
+│   └── hq/                         # High-quality reference images (.png)  
 │  
-├── val/          \# 20% of master dataset  
-│   ├── lq/         \# AV1-compressed images  
-│   └── hq/         \# High-quality reference images  
+├── val/                            # 20% of master dataset  
+│   ├── lq/                         # AV1-compressed images  
+│   └── hq/                         # High-quality reference images  
 │  
-└── test/         \# Separate test set (e.g., DIV2K\_valid)  
-    ├── lq/         \# AV1-compressed images  
-    └── hq/         \# High-quality reference images
+└── test/                           # Separate test set (e.g., Div2K_valid)  
+    ├── lq/                         # AV1-compressed images  
+    └── hq/                         # High-quality reference images
+```
 
 **Purpose of each split:**
 
@@ -54,49 +55,50 @@ av1\_data/
 * **SOTA Upsampling**: Uses Bilinear Upsample \+ Conv to eliminate checkerboard artifacts.  
 * **Residual Learning**: Predicts the artifact correction, preserving original image details.  
 * **Memory-Efficient Tiling**: Built-in inference logic handles images of any size.
-
-Input \[B,3,H,W\] \+ CRF \[B,1\] (+ Preset \[B,1\])  
+```
+Input [B,3,H,W] + CRF [B,1] (+ Preset [B,1])  
     │  
     ▼  
 Conditioning Embedder (128/192-dim)  
     │  
     ▼  
-┌─────────────────────────────────────────┐  
-│         5-Level U-Net Backbone          │  
-├─────────────────────────────────────────┤  
-│ Head (ch\[0\]) → EfficientResBlocks       │  
-│   │                                     │  
-│   ▼ Skip 0                              │  
-│ Enc1 (ch\[1\]) → FiLM → Blocks  ↓2×       │  
-│   │                                     │  
-│   ▼ Skip 1                              │  
-│ Enc2 (ch\[2\]) → FiLM → Blocks  ↓2×       │  
-│   │                                     │  
-│   ▼ Skip 2                              │  
-│ Enc3 (ch\[3\]) → FiLM → Blocks  ↓2×       │  
-│   │                                     │  
-│   ▼ Skip 3                              │  
-│ Bottleneck (ch\[4\]) ↓2×                 │  
-│   → Pre-Attn (Blocks)                   │  
-│   → SimpleSelfAttention (Channel-wise)  │  
-│   → FiLM Conditioning                   │  
-│   → Post-Attn (Blocks)                  │  
-│   │                                     │  
-│   ▼ ↑2× (Bilinear \+ Conv)               │  
-│ Dec3 (ch\[3\]) ← Skip 3 → Blocks          │  
-│   │                                     │  
-│   ▼ ↑2× (Bilinear \+ Conv)               │  
-│ Dec2 (ch\[2\]) ← Skip 2 → Blocks          │  
-│   │                                     │  
-│   ▼ ↑2× (Bilinear \+ Conv)               │  
-│ Dec1 (ch\[1\]) ← Skip 1 → Blocks          │  
-│   │                                     │  
-│   ▼ ↑2× (Bilinear \+ Conv)               │  
-│ Tail (ch\[0\]) ← Skip 0 → Predict Residual│  
-└─────────────────────────────────────────┘  
+┌────────────────────────────────────────┐  
+│         5-Level U-Net Backbone         │  
+├────────────────────────────────────────┤  
+│ Head (ch[0]) → EfficientResBlocks      │  
+│   │                                    │  
+│   ▼ Skip 0                             │  
+│ Enc1 (ch[1]) → FiLM → Blocks  ↓2×      │  
+│   │                                    │  
+│   ▼ Skip 1                             │  
+│ Enc2 (ch[2]) → FiLM → Blocks  ↓2×      │  
+│   │                                    │  
+│   ▼ Skip 2                             │  
+│ Enc3 (ch[3]) → FiLM → Blocks  ↓2×      │  
+│   │                                    │  
+│   ▼ Skip 3                             │  
+│ Bottleneck (ch[4]) ↓2×                 │  
+│   → Pre-Attn (Blocks)                  │  
+│   → SimpleSelfAttention (Channel-wise) │  
+│   → FiLM Conditioning                  │  
+│   → Post-Attn (Blocks)                 │  
+│   │                                    │  
+│   ▼ ↑2× (Bilinear + Conv)              │  
+│ Dec3 (ch[3]) ← Skip 3 → Blocks         │  
+│   │                                    │  
+│   ▼ ↑2× (Bilinear + Conv)              │  
+│ Dec2 (ch[2]) ← Skip 2 → Blocks         │  
+│   │                                    │  
+│   ▼ ↑2× (Bilinear + Conv)              │  
+│ Dec1 (ch[1]) ← Skip 1 → Blocks         │  
+│   │                                    │  
+│   ▼ ↑2× (Bilinear + Conv)              │  
+│ Tail (ch[0]) ← Skip 0 →  Residual      │  
+└────────────────────────────────────────┘  
     │  
     ▼  
-Output \= Input \+ Residual (clamped)
+Output = Input + Residual (clamped)
+```
 
 #### **Model Sizes (Empirically Calibrated, CRF-Only Mode)**
 
@@ -108,9 +110,9 @@ These configurations are precisely engineered to match target parameter counts.
 | nano | \~2M | 2.30M | Minimal viable conditional model |  
 | tiny | \~5M | 4.96M | Lightweight, fast iteration |  
 | small | \~10M | 9.21M | Standard balanced |  
-| base | \~12M | 12.79M | Enhanced standard |  
-| large | \~20M | 19.69M | RECOMMENDED DEFAULT ⭐ |  
-| huge | \~32M | 32.34M | High quality |  
+| base | \~12M | 12.79M | RECOMMENDED DEFAULT |  
+| large | \~20M | 19.69M | Enhanced restoration |  
+| huge | \~32M | 32.34M | High quality (Slow)|  
 | pro | \~50M | 50.31M | Maximum quality / Research |  
 *(Note: CRF+Preset mode adds \< 0.3M parameters)*
 
@@ -138,34 +140,36 @@ At inference, a router selects the appropriate model based on the input CRF, res
 * Depthwise separable convolutions \+ ECA attention  
 * Sizes: nano (0.2M), tiny (0.5M), small (1.2M), base (2.5M), large (6.0M), huge (11.2M)
 
+```
 Input Image  
     │  
     ▼  
-Head \+ ResBlocks  
+Head + ResBlocks  
     │  
-    ▼ \[skip0\]  
+    ▼ [skip0]  
 Encoder-1 (downsample 2×)  
     │  
-    ▼ \[skip1\]  
+    ▼ [skip1]  
 Encoder-2 (downsample 2×)  
     │  
-    ▼ \[skip2\]  
+    ▼ [skip2]  
 Encoder-3 (downsample 2×)  
     │  
     ▼  
-Decoder-3 (upsample 2×) ← \[skip2\]  
+Decoder-3 (upsample 2×) ← [skip2]  
     │  
     ▼  
-Decoder-2 (upsample 2×) ← \[skip1\]  
+Decoder-2 (upsample 2×) ← [skip1]  
     │  
     ▼  
-Decoder-1 (upsample 2×) ← \[skip0\]  
+Decoder-1 (upsample 2×) ← [skip0]  
     │  
     ▼  
 Tail → Residual  
     │  
     ▼  
-Restored \= Input \+ Residual
+Restored = Input + Residual
+```
 
 **B. Nano ResNet (av1\_nano\_resnet\_restorer.py)**
 
@@ -173,7 +177,7 @@ Restored \= Input \+ Residual
 * Processes at native resolution  
 * Multi-scale feature extraction head  
 * Sizes: nano (0.7M), tiny (1.2M), small (2.1M), base (3.3M), huge (6.5M)
-
+```
 Input Image  
     │  
     ▼  
@@ -191,7 +195,8 @@ N × Residual Blocks
 Tail → Residual  
     │  
     ▼  
-Restored \= Input \+ Residual
+Restored = Input + Residual
+```
 
 **C. Nano FBCNN (av1\_nano\_fbcnn\_restorer.py)**
 
@@ -208,69 +213,75 @@ Restored \= Input \+ Residual
 ## **🚀 Setup & Installation**
 
 ### **1\. Clone Repository**
-
-git clone \<your-repo-url\>  
+```
+git clone <your-repo-url>  
 cd aura
+```
 
 ### **2\. Setup Environment**
 
 The setup script automatically detects and configures for CUDA (NVIDIA), MPS (Apple Silicon), or CPU.
+```
+chmod +x setup_env.sh  
+./setup_env.sh
 
-chmod \+x setup\_env.sh  
-./setup\_env.sh
-
-\# Activate the environment  
+# Activate the environment  
 conda activate aura
-
+```
 ## **💾 Dataset Preparation Workflow**
 
 This is the complete workflow to generate the train, val, and test splits.
 
 ### **1\. Download Source Data**
+```
+# Download DIV2K training data (for train/val)  
+wget [http://data.vision.ee.ethz.ch/cvl/DIV2K/DIV2K_train_HR.zip](http://data.vision.ee.ethz.ch/cvl/DIV2K/DIV2K_train_HR.zip)  
+unzip DIV2K_train_HR.zip
 
-\# Download DIV2K training data (for train/val)  
-wget \[http://data.vision.ee.ethz.ch/cvl/DIV2K/DIV2K\_train\_HR.zip\](http://data.vision.ee.ethz.ch/cvl/DIV2K/DIV2K\_train\_HR.zip)  
-unzip DIV2K\_train\_HR.zip
-
-\# Download DIV2K validation data (for test)  
-wget \[http://data.vision.ee.ethz.ch/cvl/DIV2K/DIV2K\_valid\_HR.zip\](http://data.vision.ee.ethz.ch/cvl/DIV2K/DIV2K\_valid\_HR.zip)  
-unzip DIV2K\_valid\_HR.zip
+# Download DIV2K validation data (for test)  
+wget [http://data.vision.ee.ethz.ch/cvl/DIV2K/DIV2K_valid_HR.zip](http://data.vision.ee.ethz.ch/cvl/DIV2K/DIV2K_valid_HR.zip)  
+unzip DIV2K_valid_HR.zip
+```
 
 ### **2\. Generate Master Training Dataset**
 
-python scripts/degrade\_av1.py \\  
-    \--input\_dir ./DIV2K\_train\_HR \\  
-    \--output\_dir ./av1\_data/master/lq \\  
-    \--crf\_range 23 63 \\  
-    \--preset\_range 4 4 \\  
-    \--num\_workers 8
+```
+python scripts/degrade_av1.py \  
+    --input_dir ./DIV2K_train_HR \  
+    --output_dir ./av1_data/master/lq \  
+    --crf_range 23 63 \  
+    --preset_range 4 4 \  
+    --num_workers 8
 
-\# Create symlink to HQ images  
-ln \-s $(pwd)/DIV2K\_train\_HR ./av1\_data/master/hq
+# Create symlink to HQ images  
+ln -s $(pwd)/DIV2K_train_HR ./av1_data/master/hq
+```
 
 ### **3\. Generate Test Dataset**
 
-python scripts/degrade\_av1.py \\  
-    \--input\_dir ./DIV2K\_valid\_HR \\  
-    \--output\_dir ./av1\_data/test/lq \\  
-    \--crf\_range 23 63 \\  
-    \--preset\_range 4 4 \\  
-    \--num\_workers 8
+```
+python scripts/degrade_av1.py \  
+    --input_dir ./DIV2K_valid_HR \  
+    --output_dir ./av1_data/test/lq \  
+    --crf_range 23 63 \  
+    --preset_range 4 4 \  
+    --num_workers 8
 
-\# Create symlink to HQ images  
-ln \-s $(pwd)/DIV2K\_valid\_HR ./av1\_data/test/hq
+# Create symlink to HQ images  
+ln -s $(pwd)/DIV2K_valid_HR ./av1_data/test/hq
+```
 
 ### **4\. Split Master into Train/Val (80/20)**
-
-python scripts/split\_av1\_dataset.py \\  
-    \--input\_lq ./av1\_data/master/lq \\  
-    \--input\_hq ./av1\_data/master/hq \\  
-    \--output\_train\_lq ./av1\_data/train/lq \\  
-    \--output\_train\_hq ./av1\_data/train/hq \\  
-    \--output\_val\_lq ./av1\_data/val/lq \\  
-    \--output\_val\_hq ./av1\_data/val/hq \\  
-    \--split\_ratio 0.8
-
+```
+python scripts/split_av1_dataset.py \  
+    --input_lq ./av1_data/master/lq \  
+    --input_hq ./av1_data/master/hq \  
+    --output_train_lq ./av1_data/train/lq \  
+    --output_train_hq ./av1_data/train/hq \  
+    --output_val_lq ./av1_data/val/lq \  
+    --output_val_hq ./av1_data/val/hq \  
+    --split_ratio 0.8
+```
 ## **🎓 Training Workflows**
 
 ### **Workflow 1: Conditional U-Net (Universal Model)**
@@ -279,109 +290,115 @@ This workflow trains a single, high-quality model (e.g., large @ 19.7M params) o
 
 #### **Step 1: Create Configuration**
 
-Create configs/conditional\_unet/unet\_large\_crf23-63.yaml:
-
-\# \============================================================  
-\# Conditional U-Net Configuration (CRF-Only Mode)  
-\# \============================================================  
+Create configs/conditional_config_tiny_crf23-63.yaml:
+```
+# ============================================================  
+# Conditional U-Net Configuration (CRF-Only Mode)  
+# ============================================================  
 project:  
   name: "AV1-Restorer"  
-  experiment\_name: "unet\_large\_crf23-63\_full"  
-  log\_to\_wandb: true
+  experiment_name: "conditional_unet_tiny_crf23-63"  
+  log_to_wandb: true
 
 system:  
-  device: "auto"  \# cuda/mps/cpu  
-  seed: 42  
-  mixed\_precision: true  \# True for CUDA, False for MPS  
-  num\_workers: 8
+  device: "auto"  # cuda/mps/cpu  
+  seed: 24  
+  mixed_precision: true  # True for CUDA, False for MPS  
+  num_workers: 8
 
 model:  
   type: "unet"  
-  size: "large"  \# Select: nano, tiny, small, base, large, huge, pro
+  size: "tiny"  # Select: nano, tiny, small, base, large, huge, pro
 
 dataset:  
-  crf\_range: \[23, 63\]     \# Full CRF spectrum  
-  preset\_range: \[4, 4\]    \# Single value \= CRF-Only mode  
-  norm\_range: \[-1, 1\]     \# Image normalization
+  crf_range: [23, 63]     # Full CRF spectrum  
+  preset_range: [4, 4]    # Single value = CRF-Only mode  
+  norm_range: [-1, 1]     # Image normalization
 
 data:  
-  train\_lq\_root: "./av1\_data/train/lq"  
-  train\_hq\_root: "./av1\_data/train/hq"  
-  val\_lq\_root: "./av1\_data/val/lq"  
-  val\_hq\_root: "./av1\_data/val/hq"  
-  lq\_ext: ".avif"  
-  hq\_ext: ".png"
+  train_lq_root: "./av1_data/train/lq"  
+  train_hq_root: "./av1_data/train/hq"  
+  val_lq_root: "./av1_data/val/lq"  
+  val_hq_root: "./av1_data/val/hq"  
+  lq_ext: ".avif"  
+  hq_ext: ".png"
 
-\# \============================================================  
-\# Curriculum Learning (Progressive Training)  
-\# \============================================================  
+# ============================================================  
+# Curriculum Learning (Progressive Training)  
+# ============================================================  
 curriculum:  
-  \- \# Stage 1: Small patches (learn local patterns)  
-    patch\_size: 128  
-    batch\_size: 32 \# Adjust based on VRAM  
+  - # Stage 1: Small patches (learn local patterns)  
+    patch_size: 128  
+    batch_size: 64  # Adjust based on VRAM  
+    epochs: 100  
+      
+  - # Stage 2: Medium patches (learn broader context)  
+    patch_size: 256  
+    batch_size: 16  
     epochs: 50  
       
-  \- \# Stage 2: Medium patches (learn broader context)  
-    patch\_size: 256  
-    batch\_size: 16  
-    epochs: 75  
-      
-  \- \# Stage 3: Large patches (refine full context)  
-    patch\_size: 512  
-    batch\_size: 8  
-    epochs: 50
+  - # Stage 3: Large patches (refine full context)  
+    patch_size: 512  
+    batch_size: 4  
+    epochs: 10
 
-\# \============================================================  
-\# Loss Configuration (SOTA Balanced)  
-\# \============================================================  
+# ============================================================  
+# Loss Configuration (SOTA Balanced)  
+# ============================================================  
 loss:  
-  charbonnier: {enabled: true, weight: 1.0}  
-  perceptual: {enabled: true, weight: 0.05} \# Start low  
-  ms\_ssim: {enabled: true, weight: 0.15}    \# pip install pytorch-msssim  
-  frequency: {enabled: true, weight: 0.01}    \# Low weight
+  charbonnier: {enabled: true, weight: 1.0}  # Robust l1 variant
+  perceptual: {enabled: true, weight: 0.05}  # 'vgg' (faster) or 'lpips'
+  ms_ssim: {enabled: true, weight: 0.15}     # pip install pytorch-msssim  
+  frequency: {enabled: true, weight: 0.01}   # 1.0 for magnitide, 0.0 for phase
 
-\# \============================================================  
-\# Optimizer & Scheduler  
-\# \============================================================  
+# ============================================================  
+# Optimizer & Scheduler  
+# ============================================================  
 optimizer:  
   type: "adamw"  
   lr: 0.0001  
-  use\_ema: true  
-  ema\_decay: 0.9999
+  use_ema: true  
+  ema_decay: 0.9999
 
 scheduler:  
   type: "cosine"  
-  warmup\_steps: 1000  
-  min\_lr: 1.0e-7
+  warmup_steps: 1000  
+  min_lr: 1.0e-7
 
-\# \============================================================  
-\# Training Settings  
-\# \============================================================  
+# ============================================================  
+# Training Settings  
+# ============================================================  
 training:  
-  grad\_clip\_norm: 1.0  
-  validate\_every\_n\_epochs: 1  
-  log\_every\_n\_steps: 50
+  grad_clip_norm: 1.0  
+  validate_every_n_epochs: 1  
+  log_every_n_steps: 50
 
 checkpoint:  
-  dir: "./checkpoints/unet\_large\_crf23-63\_full"  
-  save\_every\_n\_epochs: 1
-
+  dir: "./checkpoints/conditional_unet_tiny_crf23-63"  
+  save_every_n_epochs: 1
+```
 #### **Step 2: Start Training**
 
-\# Train from scratch  
-python av1\_restorer/train\_av1\_conditional\_restorer.py \\  
-    \--config configs/conditional\_unet/unet\_large\_crf23-63.yaml
+- Train from scratch  
+```
+python av1_restorer/train_av1_conditional_restorer.py \  
+    --config configs/conditional_unet/conditional_config_tiny_crf23-63.yaml
+```
 
-\# Resume from latest checkpoint  
-python av1\_restorer/train\_av1\_conditional\_restorer.py \\  
-    \--config configs/conditional\_unet/unet\_large\_crf23-63.yaml \\  
-    \--resume latest
+- Resume from latest checkpoint  
+```
+python av1_restorer/train_av1_conditional_restorer.py \  
+    --config configs/conditional_unet/conditional_config_tiny_crf23-63.yaml \  
+    --resume latest
+```
 
-\# Resume with W\&B tracking  
-python av1\_restorer/train\_av1\_conditional\_restorer.py \\  
-    \--config configs/conditional\_unet/unet\_large\_crf23-63.yaml \\  
-    \--resume best \\  
-    \--wandb\_id \<your-wandb-run-id\>
+- Resume with W&B tracking  
+```
+python av1_restorer/train_av1_conditional_restorer.py \  
+    --config configs/conditional_unet/conditional_config_tiny_crf23-63.yaml \  
+    --resume best \  
+    --wandb_id <your-wandb-run-id>
+```
 
 #### **Step 3: Monitor Training**
 
@@ -403,28 +420,30 @@ This workflow trains multiple lightweight models, each specialized for a specifi
 #### **Step 1: Create Configurations**
 
 Create a config file for *each* CRF bucket (e.g., configs/nano\_models/nano\_unet\_small\_crf34-43.yaml).
-
-\# ... (project, system, data sections as above) ...  
+```
+# ... (project, system, data sections as above) ...  
 model:  
-  type: "nano\_unet"  \# or nano\_resnet  
-  size: "small"      \# nano, tiny, small, etc.
+  type: "nano_unet"  # or nano_resnet  
+  size: "small"      # nano, tiny, small, etc.
 
 dataset:  
-  crf\_range: \[34, 43\]     \# \<\<\< NARROW CRF BUCKET  
-\# ... (rest of config) ...
+  crf_range: [34, 43]     # <<< NARROW CRF BUCKET  
+# ... (rest of config) ...
+```
 
 #### **Step 2: Train Each CRF Bucket**
 
 Launch a separate training run for each config file.
-
-\# Train Model A (CRF 23-33)  
-python av1\_restorer/train\_av1\_nano\_restorer.py \\  
-    \--config configs/nano\_models/nano\_unet\_small\_crf23-33.yaml
-
-\# Train Model B (CRF 34-43)  
-python av1\_restorer/train\_av1\_nano\_restorer.py \\  
-    \--config configs/nano\_models/nano\_unet\_small\_crf34-43.yaml
-
+```
+# Train Model A (CRF 23-33)  
+python av1_restorer/train_av1_nano_restorer.py \  
+    --config configs/nano_models/nano_unet_small_crf23-33.yaml
+```
+```
+# Train Model B (CRF 34-43)  
+python av1_restorer/train_av1_nano_restorer.py \  
+    --config configs/nano_models/nano_unet_small_crf34-43.yaml
+```
 ## **🖥️ Inference (Usage)**
 
 Use scripts/restore\_av1.py to run your trained models.
@@ -446,33 +465,36 @@ Use scripts/restore\_av1.py to run your trained models.
 ### **Example 1: Test Full Validation Set (with Metrics)**
 
 This is the recommended command for evaluating a model's performance.
-
-python scripts/restore\_av1.py \\  
-    \--checkpoint checkpoints/conditional\_unet\_large/best.pth \\  
-    \--input\_dir ./av1\_data/test/lq \\  
-    \--output\_dir ./results/large\_model\_test\_metrics \\  
-    \--hq\_dir ./av1\_data/test/hq \\  
-    \--test \\  
-    \--auto
+```
+python scripts/restore_av1.py \  
+    --checkpoint checkpoints/conditional_unet_large/best.pth \  
+    --input_dir ./av1_data/test/lq \  
+    --output_dir ./results/large_model_test_metrics \  
+    --hq_dir ./av1_data/test/hq \  
+    --test \  
+    --auto
+```
 
 ### **Example 2: Restore a Directory (Auto-Detect)**
 
 This is the standard use case for batch-processing a folder of images.
-
-python scripts/restore\_av1.py \\  
-    \--checkpoint checkpoints/conditional\_unet\_large/best.pth \\  
-    \--input\_dir /path/to/my\_compressed\_images \\  
-    \--output\_dir /path/to/my\_restored\_images \\  
-    \--auto
+```
+python scripts/restore_av1.py \  
+    --checkpoint checkpoints/conditional_unet_large/best.pth \  
+    --input_dir /path/to/my_compressed_images \ 
+    --output_dir /path/to/my_restored_images \  
+    --auto
+```
 
 ### **Example 3: Restore a Single Image (Manual Params)**
-
-python scripts/restore\_av1.py \\  
-    \--checkpoint checkpoints/conditional\_unet\_large/best.pth \\  
-    \--input /path/to/my\_image\_crf45\_p4.avif \\  
-    \--output /path/to/restored\_image.png \\  
-    \--crf 45 \\  
-    \--preset 4
+```
+python scripts/restore_av1.py \ 
+    --checkpoint checkpoints/conditional_unet_large/best.pth \  
+    --input /path/to/my_image_crf45_p4.avif \ 
+    --output /path/to/restored_image.png \  
+    --crf 45 \  
+    --preset 4
+```
 
 ## **📊 Performance Benchmarking**
 
@@ -504,69 +526,81 @@ Metrics will be gathered during the training and testing phases to evaluate real
 ### **Debug Tools**
 
 * **Test Dataset Loading:**  
-  python \-c "  
-  from utils.av1\_dataset import AV1Dataset  
-  ds \= AV1Dataset(  
-  lq\_root\_dir='av1\_data/train/lq',  
-  hq\_root\_dir='av1\_data/train/hq',  
-  hq\_ext='.png',  
-  patch\_size=128,  
-  crf\_range=(23, 63),  
-  preset\_range=(4, 4),  
-  norm\_range=(-1, 1\)  
+```
+  python -c "  
+  from utils.av1_dataset import AV1Dataset  
+  ds = AV1Dataset(  
+  lq_root_dir='av1_data/train/lq',  
+  hq_root_dir='av1_data/train/hq',  
+  hq_ext='.png',  
+  patch_size=128,  
+  crf_range=(23, 63),  
+  preset_range=(4, 4),  
+  norm_range=(-1, 1)  
   )  
   print(f'Dataset size: {len(ds)}')  
-  ds.print\_statistics()  
+  ds.print_statistics()  
   "
+```
+* **Model Loading (2 epochs):**  
+```
+  # Create a dry_run.yaml config with epochs: 2  
+  python av1_restorer/models/av1_conditional_unet_restorer_v2.py \  
+      --config configs/dry_run.yaml
+```
 
 * **Dry Run Training (2 epochs):**  
-  \# Create a dry\_run.yaml config with epochs: 2  
-  python av1\_restorer/train\_av1\_conditional\_restorer.py \\  
-      \--config configs/dry\_run.yaml
+```
+  # Create a dry_run.yaml config with epochs: 2  
+  python av1_restorer/train_av1_conditional_restorer.py \  
+      --config configs/dry_run.yaml
+```
 
 ## **📁 Project Structure**
 
+```
 aura/  
-├── av1\_restorer/  
+├── av1_restorer/  
 │   ├── models/  
-│   │   ├── av1\_conditional\_unet\_restorer\_v2.py  \# SOTA Conditional U-Net  
-│   │   ├── av1\_nano\_unet\_restorer.py            \# Nano U-Net  
-│   │   ├── av1\_nano\_resnet\_restorer.py          \# Nano ResNet (Fastest)  
-│   │   ├── av1\_nano\_fbcnn\_restorer.py  
-│   │   ├── av1\_nano\_mamba\_restorer.py  
-│   │   └── blocks.py                            \# Shared building blocks  
+│   │   ├── av1_conditional_unet_restorer_v2.py  # SOTA Conditional U-Net  
+│   │   ├── av1_nano_unet_restorer.py            # Nano U-Net  
+│   │   ├── av1_nano_resnet_restorer.py          # Nano ResNet (Fastest)  
+│   │   ├── av1_nano_fbcnn_restorer.py  
+│   │   ├── av1_nano_mamba_restorer.py  
+│   │   └── blocks.py                            # Shared building blocks  
 │   │  
-│   ├── train\_av1\_conditional\_restorer.py        \# Trainer for Conditional U-Net  
-│   └── train\_av1\_nano\_restorer.py               \# (Hypothetical) Trainer for Nanos  
+│   ├── train_av1_conditional_restorer.py        # Trainer for Conditional U-Net  
+│   └── train_av1_nano_restorer.py               # (Hypothetical) Trainer for Nanos  
 │  
 ├── utils/  
-│   ├── av1\_dataset.py                  \# Dataloader  
-│   └── loss.py                         \# CombinedLoss function  
+│   ├── av1_dataset.py                  # Dataloader  
+│   └── loss.py                         # CombinedLoss function  
 │  
 ├── scripts/  
-│   ├── degrade\_av1.py                  \# Creates LQ dataset  
-│   ├── split\_av1\_dataset.py            \# Splits train/val  
-│   └── restore\_av1.py                  \# Inference script  
+│   ├── degrade_av1.py                  # Creates LQ dataset  
+│   ├── split_av1_dataset.py            # Splits train/val  
+│   └── restore_av1.py                  # Inference script  
 │  
 ├── configs/  
-│   ├── conditional\_unet/               \# Configs for Conditional U-Net  
-│   └── nano\_models/                    \# Configs for Nano models  
+│   ├── conditional_unet/               # Configs for Conditional U-Net  
+│   └── nano_models/                    # Configs for Nano models  
 │  
-├── av1\_data/                           \# master dataset (Div2K \+ Flickr2K)  
-├── train/                              \# 80% of master dataset  
-│   ├── lq/                             \# AV1-compressed images (.avif)  
-│   │   ├── crf\_23/preset\_4/  
-│   │   ├── crf\_24/preset\_4/  
-│   │   └── ... (up to crf\_63)  
-│   └── hq/                             \# High-quality reference images (.png)  
+├── av1_data/                           # master dataset (Div2K + Flickr2K)  
+├── train/                              # 80% of master dataset  
+│   ├── lq/                             # AV1-compressed images (.avif)  
+│   │   ├── crf_23/preset_4/  
+│   │   ├── crf_24/preset_4/  
+│   │   └── ... (up to crf_63)  
+│   └── hq/                             # High-quality reference images (.png)  
 │  
-├── val/                                \# 20% of master dataset  
-│   ├── lq/                             \# AV1-compressed images  
-│   └── hq/                             \# High-quality reference images  
+├── val/                                # 20% of master dataset  
+│   ├── lq/                             # AV1-compressed images  
+│   └── hq/                             # High-quality reference images  
 │  
-├── test/                               \# Separate test set (e.g., DIV2K\_valid)  
-│   ├── lq/                             \# AV1-compressed images  
-│   └── hq/                             \# High-quality reference images  
+├── test/                               # Separate test set (e.g., DIV2K_valid)  
+│   ├── lq/                             # AV1-compressed images  
+│   └── hq/                             # High-quality reference images  
 │  
-└── checkpoints/                        \# Saved models
+└── checkpoints/                        # Saved models
+```
 
