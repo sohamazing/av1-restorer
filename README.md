@@ -215,8 +215,8 @@ Restored = Input + Residual
 
 ### **1\. Clone Repository**
 ```
-git clone <your-repo-url>  
-cd aura
+git clone https://github.com/sohamazing/av1-restorer.git  
+cd av1-restorer
 ```
 
 ### **2\. Setup Environment**
