@@ -1,6 +1,6 @@
 # av1_restorer/models/av1_unet_restorer.py
 """
-AV1 U-Net Restorer - Production Implementation
+AV1 U-Net Restorer
 
 Efficient U-Net with FiLM conditioning for CRF and Preset-adaptive restoration.
 
@@ -10,102 +10,25 @@ Architecture Highlights:
   - SimpleSelfAttention at bottleneck (channel attention)
   - FiLM conditioning at encoder levels and bottleneck
   - Residual learning (predicts artifact correction)
+  - SOTA Upsampling: Bilinear Interpolation + Conv
 
 Author: Soham Mukherjee
+Version: 2.1 
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple, List, Union
+from typing import Tuple, List, Union, Optional
 
 import logging
 logger = logging.getLogger(__name__)
 
+from .blocks import DepthwiseSeparable, ECA, EfficientResBlock, choose_num_groups
 
 # ==============================================================================
-# SECTION 1: Core Building Blocks
+# SECTION 1: Conditioning + Channel Attention 
 # ==============================================================================
-
-class DepthwiseSeparableConv(nn.Module):
-    """
-    Depthwise Separable Convolution: ~8× parameter reduction vs standard conv.
-    
-    Flow: Depthwise (spatial) → Pointwise (channel mixing) → BatchNorm → GELU
-    """
-    def __init__(self, in_ch: int, out_ch: int, kernel_size: int = 3, stride: int = 1):
-        super().__init__()
-        padding = kernel_size // 2
-        self.depthwise = nn.Conv2d(
-            in_ch, in_ch, kernel_size, stride, padding, 
-            groups=in_ch, bias=False
-        )
-        self.pointwise = nn.Conv2d(in_ch, out_ch, 1, bias=False)
-        self.bn = nn.BatchNorm2d(out_ch)
-        self.gelu = nn.GELU()
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.gelu(self.bn(self.pointwise(self.depthwise(x))))
-
-
-class SqueezeExcitation(nn.Module):
-    """
-    Squeeze-and-Excitation: Channel-wise attention mechanism.
-    
-    Flow: Global Pool → FC (compress) → ReLU → FC (expand) → Sigmoid → Scale
-    """
-    def __init__(self, channels: int, reduction: int = 4):
-        super().__init__()
-        self.squeeze = nn.AdaptiveAvgPool2d(1)
-        self.excitation = nn.Sequential(
-            nn.Conv2d(channels, channels // reduction, 1),
-            nn.GELU(),
-            nn.Conv2d(channels // reduction, channels, 1),
-            nn.Sigmoid()
-        )
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x * self.excitation(self.squeeze(x))
-
-
-class EfficientResBlock(nn.Module):
-    """
-    MobileNetV3-inspired inverted residual block with SE attention.
-    
-    Flow: Expand → Depthwise → SE → Project → Residual Add
-    Parameters: ~4C² (vs 9C² for standard ResNet block)
-    """
-    def __init__(self, channels: int, expansion_ratio: int = 2):
-        super().__init__()
-        hidden_dim = channels * expansion_ratio
-        
-        # Expansion
-        self.expand = nn.Sequential(
-            nn.Conv2d(channels, hidden_dim, 1, bias=False),
-            nn.BatchNorm2d(hidden_dim),
-            nn.GELU()
-        )
-        
-        # Depthwise convolution
-        self.dwconv = DepthwiseSeparableConv(hidden_dim, hidden_dim, 3)
-        
-        # Squeeze-Excitation
-        self.se = SqueezeExcitation(hidden_dim, reduction=4)
-        
-        # Projection
-        self.project = nn.Sequential(
-            nn.Conv2d(hidden_dim, channels, 1, bias=False),
-            nn.BatchNorm2d(channels)
-        )
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        identity = x
-        out = self.expand(x)
-        out = self.dwconv(out)
-        out = self.se(out)
-        out = self.project(out)
-        return out + identity  # Residual connection
-
 
 class SimpleSelfAttention(nn.Module):
     """
@@ -176,235 +99,164 @@ class SimpleSelfAttention(nn.Module):
         return identity + out  # Residual connection
 
 
-# ==============================================================================
-# SECTION 2: Conditioning Modules
-# ==============================================================================
-class CRFConditioningEmbedder(nn.Module):
-    """
-    Embeds ONLY CRF values into a conditioning vector.
-    
-    Args:
-        crf_min, crf_max: CRF normalization range (default: 23-63)
-    
-    Output: [B, 128] CRF embedding
-    """
-    def __init__(
-        self,
-        crf_min: float = 23.0,
-        crf_max: float = 63.0,
-    ):
-        super().__init__()
-        self.crf_min = crf_min
-        self.crf_max = crf_max
-        
-        # CRF embedder: 1 -> 64 -> 128
-        self.crf_embedder = nn.Sequential(
-            nn.Linear(1, 64),
-            nn.GELU(),
-            nn.Linear(64, 128)
-        )
-    
-    def forward(self, crf: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            crf: [B, 1] range [crf_min, crf_max]
-        
-        Returns:
-            [B, 128] combined embedding
-        """
-        # Normalize to [0, 1]
-        crf_range = self.crf_max - self.crf_min
-        crf_norm = (crf - self.crf_min) / crf_range if crf_range > 0 else torch.zeros_like(crf)
-        
-        # Embed
-        crf_emb = self.crf_embedder(crf_norm)  # [B, 128]
-
-        # CRITICAL: Clamp embeddings
-        crf_emb = torch.clamp(crf_emb, -10.0, 10.0)
-        
-        return crf_emb
-
 class ConditioningEmbedder(nn.Module):
     """
-    Embeds CRF and Preset values into a shared conditioning vector.
-    
-    Args:
-        crf_min, crf_max: CRF normalization range (default: 23-63)
-        preset_min, preset_max: Preset normalization range (default: 0-8)
-    
-    Output: [B, 192] combined embedding (128 from CRF + 64 from Preset)
+    Unified Embedder: Generates the appropriate vector (128-dim or 192-dim) 
+    based on the presence of the 'preset' input.
     """
     def __init__(
         self,
-        crf_min: float = 23.0,
-        crf_max: float = 63.0,
-        preset_min: float = 0.0,
-        preset_max: float = 8.0
+        crf_range: Tuple[float, float],
+        preset_range: Tuple[float, float]
     ):
         super().__init__()
-        self.crf_min = crf_min
-        self.crf_max = crf_max
-        self.preset_min = preset_min
-        self.preset_max = preset_max
+        self.crf_min, self.crf_max = crf_range
+        self.preset_min, self.preset_max = preset_range
         
         # CRF embedder: 1 → 64 → 128
-        self.crf_embedder = nn.Sequential(
-            nn.Linear(1, 64),
-            nn.GELU(),
-            nn.Linear(64, 128)
-        )
+        self.crf_embedder = nn.Sequential(nn.Linear(1, 64), nn.GELU(), nn.Linear(64, 128))
         
         # Preset embedder: 1 → 32 → 64
-        self.preset_embedder = nn.Sequential(
-            nn.Linear(1, 32),
-            nn.GELU(),
-            nn.Linear(32, 64)
-        )
-    
-    def forward(self, crf: torch.Tensor, preset: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            crf: [B, 1] range [crf_min, crf_max]
-            preset: [B, 1] range [preset_min, preset_max]
+        self.preset_embedder = nn.Sequential(nn.Linear(1, 32), nn.GELU(), nn.Linear(32, 64))
         
-        Returns:
-            [B, 192] combined embedding
-        """
-        # Normalize to [0, 1]
-        # --- ROBUST NORMALIZATION ---
-        crf_range = self.crf_max - self.crf_min
-        preset_range = self.preset_max - self.preset_min
+    def _normalize(self, val: torch.Tensor, min_val: float, max_val: float) -> torch.Tensor:
+        """Helper for robust normalization."""
+        range_val = max_val - min_val
+        if range_val == 0:
+             return torch.zeros_like(val)
+        return (val - min_val) / range_val
 
-        # Handle division-by-zero if range is a single value (e.g., [4, 4])
-        # If range is 0, the normalized value should be 0.
-        crf_norm = (crf - self.crf_min) / crf_range if crf_range > 0 else torch.zeros_like(crf)
-        preset_norm = (preset - self.preset_min) / preset_range if preset_range > 0 else torch.zeros_like(preset)
+    def forward(self, crf: torch.Tensor, preset: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Generates the conditioning vector (128-dim or 192-dim).
+        """
+        crf_norm = self._normalize(crf, self.crf_min, self.crf_max)
+        crf_emb = self.crf_embedder(crf_norm)
         
-        # Embed
-        crf_emb = self.crf_embedder(crf_norm)      # [B, 128]
-        preset_emb = self.preset_embedder(preset_norm)  # [B, 64]
-
-        # CRITICAL: Clamp embeddings to prevent NaN propagation in AMP
-        crf_emb = torch.clamp(crf_emb, -10.0, 10.0)
-        preset_emb = torch.clamp(preset_emb, -10.0, 10.0)
+        # Determine conditioning mode
+        if preset is not None and self.preset_max != self.preset_min:
+            # CRF + Preset Mode (192-dim)
+            preset_norm = self._normalize(preset, self.preset_min, self.preset_max)
+            preset_emb = self.preset_embedder(preset_norm)
+            cond = torch.cat([crf_emb, preset_emb], dim=1)
+        else:
+            # CRF-Only Mode (128-dim)
+            cond = crf_emb
         
-        # Concatenate
-        return torch.cat([crf_emb, preset_emb], dim=1)  # [B, 192]
+        # CRITICAL: Clamp embeddings for stability
+        return torch.clamp(cond, min=-10.0, max=10.0)
 
 
 class FiLMLayer(nn.Module):
-    """
-    Feature-wise Linear Modulation: Applies affine transformation conditioned on CRF+Preset.
-    
-    Math: output = γ(cond) ⊙ features + β(cond)
-    
-    Args:
-        cond_dim: Dimension of conditioning vector (default: 192)
-        feature_channels: Number of feature channels to modulate
-    """
+    """Feature-wise Linear Modulation with stability constraints."""
     def __init__(self, cond_dim: int, feature_channels: int):
         super().__init__()
         self.mlp = nn.Sequential(
             nn.Linear(cond_dim, cond_dim),
             nn.GELU(),
-            nn.Linear(cond_dim, feature_channels * 2)  # γ and β
+            nn.Linear(cond_dim, feature_channels * 2)
         )
     
     def forward(self, features: torch.Tensor, conditioning: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            features: [B, C, H, W]
-            conditioning: [B, cond_dim]
-        
-        Returns:
-            [B, C, H, W] modulated features
-        """
         B, C, H, W = features.shape
+        params = self.mlp(conditioning)
+        gamma, beta = params.chunk(2, dim=1)
         
-        # Generate scale (γ) and shift (β)
-        params = self.mlp(conditioning)  # [B, 2C]
-        gamma, beta = params.chunk(2, dim=1)  # [B, C], [B, C]
-
         # ========== CRITICAL FIX: Clamp FiLM parameters ==========
-        # Prevents feature explosion: γ ∈ [-5, 5], β ∈ [-5, 5]
         gamma = torch.clamp(gamma, min=-5.0, max=5.0)
         beta = torch.clamp(beta, min=-5.0, max=5.0)
         # =========================================================
         
-        # Reshape for broadcasting: [B, C] → [B, C, 1, 1]
         gamma = gamma.view(B, C, 1, 1)
         beta = beta.view(B, C, 1, 1)
-        
-        # Apply affine transformation
         return gamma * features + beta
 
 
 # ==============================================================================
-# SECTION 3: Main U-Net Architecture
+# SECTION 2: Main U-Net Architecture
 # ==============================================================================
 
-class AV1ConditionalUNetCRF(nn.Module):
+class AV1ConditionalUNet(nn.Module):
     """
-    CRF-ONLY Conditional U-Net.
+    Complete AV1 artifact removal U-Net with FiLM conditioning.
+    Unified U-Net capable of CRF (128-dim) or CRF-Preset (192-dim) conditioning.    
+
+    Architecture:
+      - 5-level U-Net with skip connections.
+      - EfficientResBlocks with GroupNorm for stable, high-performance training.
+      - FiLM conditioning for adapting to CRF and Preset values.
+      - SimpleSelfAttention at the bottleneck to capture global context.
+      - SOTA Upsampling (Bilinear + DepthwiseConv) to prevent checkerboard artifacts.
+      - Residual learning (model predicts the artifacts to be removed).
     
-    This version is identical to AV1ConditionalUNet but ONLY conditions
-    on CRF, removing all 'preset' dependencies.
+    Args:
+        config (dict): Configuration with keys:
+          - channels (list): Channel counts per level, e.g., [24, 48, 96, 192, 256]
+          - blocks (list): Number of EfficientResBlocks per level, e.g., [2, 2, 3, 3, 6]
+          - crf_range (tuple): (min, max) for CRF normalization
+          - preset_range (tuple): (min, max) for Preset normalization
     
-    cond_dim is 128 (from CRF) instead of 192 (CRF + Preset).
+    Example config:
+        config = {
+            'channels': [24, 48, 96, 192, 256],
+            'blocks': [2, 2, 3, 3, 6],
+            'crf_range': (23, 63),
+            'preset_range': (4, 4)
+            'norm_range': (-1, 1)
+        }
     """
-    
     def __init__(self, config: dict):
         super().__init__()
         
         ch = config['channels']  # e.g., [24, 48, 96, 192, 256]
         blocks = config['blocks']  # e.g., [2, 2, 3, 3, 6]
         crf_range = config.get('crf_range', (23, 63))
+        preset_range = config.get('preset_range', (0, 8))
         norm_range = tuple(config.get('norm_range', (0, 1)))
         self.clamp_min, self.clamp_max = norm_range
-        cond_dim = 128  # Fixed: 128 (CRF-only)
+        # Model adapts its conditioning dimension based on the preset_range
+        self.cond_dim = 128 if preset_range[0] == preset_range[1] else 192 
             
         logger.info("="*60)
-        logger.info("Initializing AV1ConditionalUNetCRF") # <-- MODIFIED
+        logger.info("Initializing AV1ConditionalUNet")
+        logger.info(f"  Cond Dim: {self.cond_dim}")
         logger.info(f"  Channels: {ch}")
         logger.info(f"  Blocks: {blocks}")
         logger.info(f"  CRF Range: {crf_range}")
         logger.info(f"  Norm Range: [{self.clamp_min}, {self.clamp_max}]")
+        logger.info(f"  Upsampling: Bilinear + DepthwiseSeparable (SOTA)")
         logger.info("="*60)
         
         # ===== CONDITIONING SYSTEM =====
-        # --- MODIFIED ---
-        self.conditioning_embedder = CRFConditioningEmbedder(
-            crf_min=crf_range[0],
-            crf_max=crf_range[1]
+        self.conditioning_embedder = ConditioningEmbedder(
+            crf_range=crf_range, preset_range=preset_range
         )
-        # --- END MODIFIED ---
         
-        # ===== INPUT HEAD (Level 0) =====
+        # ===== INPUT HEAD =====
         self.head = nn.Sequential(
-            nn.Conv2d(3, ch[0], kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(ch[0]),
+            nn.Conv2d(3, ch[0], kernel_size=3, padding=1, padding_mode='reflect', bias=False),
+            nn.GroupNorm(choose_num_groups(ch[0]), ch[0]),
             nn.GELU(),
             *[EfficientResBlock(ch[0]) for _ in range(blocks[0])]
         )
         
         # ===== ENCODER =====
-        # All FiLM layers are now created with cond_dim=128
-        self.encoder1 = self._build_encoder_level(ch[0], ch[1], blocks[1], cond_dim)
-        self.encoder2 = self._build_encoder_level(ch[1], ch[2], blocks[2], cond_dim)
-        self.encoder3 = self._build_encoder_level(ch[2], ch[3], blocks[3], cond_dim)
+        self.encoder1 = self._build_encoder_level(ch[0], ch[1], blocks[1], self.cond_dim)
+        self.encoder2 = self._build_encoder_level(ch[1], ch[2], blocks[2], self.cond_dim)
+        self.encoder3 = self._build_encoder_level(ch[2], ch[3], blocks[3], self.cond_dim)
         
         # ===== BOTTLENECK =====
-        self.bottleneck_down = nn.Conv2d(ch[3], ch[4], kernel_size=3, stride=2, padding=1, bias=False)
-        self.bottleneck_bn = nn.BatchNorm2d(ch[4])
+        self.bottleneck_down = nn.Conv2d(
+            ch[3], ch[4], kernel_size=3, stride=2, padding=1, padding_mode='reflect', bias=False
+        )
+
+        self.bottleneck_gn = nn.GroupNorm(choose_num_groups(ch[4]), ch[4])
         
         self.bottleneck_pre_attn = nn.Sequential(
             *[EfficientResBlock(ch[4]) for _ in range(blocks[4] // 2)]
         )
-        self.bottleneck_film1 = FiLMLayer(cond_dim, ch[4]) # cond_dim=128
-        
         self.bottleneck_attn = SimpleSelfAttention(ch[4])
-        
-        self.bottleneck_film2 = FiLMLayer(cond_dim, ch[4]) # cond_dim=128
+        self.bottleneck_film = FiLMLayer(self.cond_dim, ch[4])
         self.bottleneck_post_attn = nn.Sequential(
             *[EfficientResBlock(ch[4]) for _ in range(blocks[4] // 2)]
         )
@@ -415,61 +267,69 @@ class AV1ConditionalUNetCRF(nn.Module):
         self.decoder1 = self._build_decoder_level(ch[2], ch[1], blocks[1])
         
         # ===== OUTPUT TAIL =====
-        self.tail_up = nn.ConvTranspose2d(ch[1], ch[0], kernel_size=2, stride=2, bias=False)
-        self.tail_bn = nn.BatchNorm2d(ch[0])
+        self.tail_upsample_op = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        self.tail_upsample_conv = DepthwiseSeparable(ch[1], ch[0], stride=1)
+        self.tail_gn = nn.GroupNorm(choose_num_groups(ch[0]), ch[0])
         self.tail_fusion = nn.Conv2d(ch[0] * 2, ch[0], kernel_size=1, bias=False)
+        self.tail_fusion_gn_act = nn.Sequential(
+            nn.GroupNorm(choose_num_groups(ch[0]), ch[0]),
+            nn.GELU()
+        )
         self.tail_body = nn.Sequential(
             *[EfficientResBlock(ch[0]) for _ in range(blocks[0])]
         )
-        self.tail_pred = nn.Conv2d(ch[0], 3, kernel_size=3, padding=1)
+        self.tail_pred = nn.Conv2d(ch[0], 3, kernel_size=3, padding=1, padding_mode='reflect')
         
         self._init_weights()
         
         total_params = sum(p.numel() for p in self.parameters())
         trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        logger.info(f"✓ Model initialized (CRF-Only)")
+        logger.info(f"✓ Model initialized")
         logger.info(f"  Total parameters: {total_params:,} ({total_params/1e6:.2f}M)")
         logger.info(f"  Trainable parameters: {trainable_params:,} ({trainable_params/1e6:.2f}M)")
         logger.info("="*60)
 
-    # _build_encoder_level, _build_decoder_level, _init_weights are inherited
-    # We can just copy them for simplicity, or rely on inheritance.
-    # For a self-contained class, let's copy them.
-    
+
     def _build_encoder_level(self, in_ch: int, out_ch: int, num_blocks: int, cond_dim: int) -> nn.ModuleDict:
+        """Helper to construct one level of the U-Net encoder."""
         return nn.ModuleDict({
             'downsample': nn.Sequential(
-                nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=2, padding=1, bias=False),
-                nn.BatchNorm2d(out_ch),
+                nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=2, padding=1, padding_mode='reflect', bias=False),
+                nn.GroupNorm(choose_num_groups(out_ch), out_ch),
                 nn.GELU()
             ),
             'body': nn.Sequential(
                 *[EfficientResBlock(out_ch) for _ in range(num_blocks)]
             ),
-            'film': FiLMLayer(cond_dim, out_ch) # cond_dim will be 128
+            'film': FiLMLayer(cond_dim, out_ch)
         })
 
     def _build_decoder_level(self, in_ch: int, out_ch: int, num_blocks: int) -> nn.ModuleDict:
+        """Helper to construct one level of the U-Net decoder."""
         return nn.ModuleDict({
-            'upsample': nn.ConvTranspose2d(in_ch, out_ch, kernel_size=2, stride=2, bias=False),
-            'upsample_bn': nn.BatchNorm2d(out_ch),
+            'upsample_op': nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            'upsample_conv': DepthwiseSeparable(in_ch, out_ch, stride=1),
+            'upsample_gn': nn.GroupNorm(choose_num_groups(out_ch), out_ch),
+            
             'fusion': nn.Sequential(
                 nn.Conv2d(out_ch * 2, out_ch, kernel_size=1, bias=False),
-                nn.BatchNorm2d(out_ch),
+                nn.GroupNorm(choose_num_groups(out_ch), out_ch),
                 nn.GELU()
             ),
+            
             'body': nn.Sequential(
                 *[EfficientResBlock(out_ch) for _ in range(num_blocks)]
             )
         })
 
     def _init_weights(self):
+        """Initializes model weights, zeroing the final prediction layer."""
         for m in self.modules():
             if isinstance(m, nn.Conv2d) or isinstance(m, nn.ConvTranspose2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.BatchNorm2d):
+            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
             elif isinstance(m, nn.Linear):
@@ -477,26 +337,27 @@ class AV1ConditionalUNetCRF(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
         
+        # Initialize the final layer to zero for residual learning
         nn.init.zeros_(self.tail_pred.weight)
         nn.init.zeros_(self.tail_pred.bias)
         logger.info("✓ Weights initialized (tail_pred zeroed for residual learning)")
 
-    # --- MODIFIED forward ---
-    def forward(self, lq_image: torch.Tensor, crf: torch.Tensor) -> torch.Tensor:
+    def forward(self, lq_image: torch.Tensor, crf: torch.Tensor, preset: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        Full forward pass through the network (CRF-Only).
+        Defines the full forward pass, used for training (CRF or CRF-Preset conditioninal).
         
         Args:
             lq_image: [B, 3, H, W] Low-quality compressed image
             crf: [B, 1] CRF value, range [23, 63]
+            preset: [B, 1] Optional preset value
         
         Returns:
             [B, 3, H, W] Restored image
         """
-        # ===== 1. GENERATE CONDITIONING VECTOR =====
-        cond = self.conditioning_embedder(crf)  # [B, 128] <-- MODIFIED
-        
-        # ===== 2. ENCODER PATH =====
+        # 1. Generate conditioning vector
+        cond = self.conditioning_embedder(crf, preset)
+
+        # 2. Encoder Path
         skip0 = self.head(lq_image)
         
         e1 = self.encoder1['downsample'](skip0)
@@ -514,91 +375,154 @@ class AV1ConditionalUNetCRF(nn.Module):
         e3 = self.encoder3['film'](e3, cond)
         skip3 = e3
         
-        # ===== 3. BOTTLENECK =====
+        # 3. Bottleneck
         b = self.bottleneck_down(skip3)
-        b = F.gelu(self.bottleneck_bn(b))
-
-        # ========== CLAMP 1: Init activation in Bottleneck =========
+        b = F.gelu(self.bottleneck_gn(b))
         b = torch.clamp(b, min=-10.0, max=10.0)
-        # ====================================================================
-
+        
         b = self.bottleneck_pre_attn(b)
-        b = self.bottleneck_film1(b, cond)
-
-        # ========== CLAMP 2: After first FiLM application ==========
-        b = torch.clamp(b, min=-10.0, max=10.0)
-        # ===========================================================
-
         b = self.bottleneck_attn(b)
-
-        b = self.bottleneck_film2(b, cond)
-
-        # ========== CLAMP 3: After second FiLM application ==========
+        b = self.bottleneck_film(b, cond)
         b = torch.clamp(b, min=-10.0, max=10.0)
-        # ===========================================================
-
         b = self.bottleneck_post_attn(b)
         
-        # ===== 4. DECODER PATH =====
-        d3 = self.decoder3['upsample'](b)
-        d3 = F.gelu(self.decoder3['upsample_bn'](d3))
+        # 4. Decoder Path (with skip connections)
+        d3 = self.decoder3['upsample_op'](b)
+        d3 = self.decoder3['upsample_conv'](d3)
+        d3 = F.gelu(self.decoder3['upsample_gn'](d3))
         d3 = torch.cat([d3, skip3], dim=1)
         d3 = self.decoder3['fusion'](d3)
         d3 = self.decoder3['body'](d3)
         
-        d2 = self.decoder2['upsample'](d3)
-        d2 = F.gelu(self.decoder2['upsample_bn'](d2))
+        d2 = self.decoder2['upsample_op'](d3)
+        d2 = self.decoder2['upsample_conv'](d2)
+        d2 = F.gelu(self.decoder2['upsample_gn'](d2))
         d2 = torch.cat([d2, skip2], dim=1)
         d2 = self.decoder2['fusion'](d2)
         d2 = self.decoder2['body'](d2)
         
-        d1 = self.decoder1['upsample'](d2)
-        d1 = F.gelu(self.decoder1['upsample_bn'](d1))
+        d1 = self.decoder1['upsample_op'](d2)
+        d1 = self.decoder1['upsample_conv'](d1)
+        d1 = F.gelu(self.decoder1['upsample_gn'](d1))
         d1 = torch.cat([d1, skip1], dim=1)
         d1 = self.decoder1['fusion'](d1)
         d1 = self.decoder1['body'](d1)
         
-        # ===== 5. OUTPUT TAIL =====
-        t = self.tail_up(d1)
-        t = F.gelu(self.tail_bn(t))
+        # 5. Output Tail
+        t = self.tail_upsample_op(d1)
+        t = self.tail_upsample_conv(t)
+        t = F.gelu(self.tail_gn(t))
         t = torch.cat([t, skip0], dim=1)
         t = self.tail_fusion(t)
+        t = self.tail_fusion_gn_act(t)
         t = self.tail_body(t)
         residual = self.tail_pred(t)
         
-        # ===== 6. RESIDUAL LEARNING =====
+        # 6. Residual Connection
         restored = lq_image + residual
         restored = torch.clamp(restored, self.clamp_min, self.clamp_max)
         
         return restored
 
-    # --- MODIFIED inference ---
+    # ==========================================================================
+    # --- SOTA INFERENCE & HELPER METHODS
+    # ==========================================================================
+
+    def _model_pass(self, tile: torch.Tensor, base_crf: torch.Tensor, base_preset: Optional[torch.Tensor]):
+        """
+        Internal helper for `inference`. Handles conditioning tensor batching.
+        
+        This function correctly expands the (B=1) CRF/Preset tensors to match
+        the (B=8) batch size used during Test-Time Augmentation (TTA).
+        """
+        is_crf_only_mode = (self.cond_dim == 128)
+        
+        # Check if tile batch is larger than cond batch (i.e., TTA is active)
+        num_augs = tile.shape[0] // base_crf.shape[0]
+        
+        if num_augs > 1:
+            # TTA is active, repeat cond tensors to match the TTA batch size
+            crf_batch = base_crf.repeat_interleave(num_augs, dim=0)
+            preset_batch = base_preset.repeat_interleave(num_augs, dim=0) if base_preset is not None else None
+        else:
+            # No TTA, use cond tensors as-is (batch size is already correct)
+            crf_batch = base_crf
+            preset_batch = base_preset
+
+        # Call the appropriate forward pass based on model's conditioning mode
+        if is_crf_only_mode:
+            return self.forward(tile, crf_batch)
+        else:
+            if preset_batch is None:
+                 raise ValueError("Preset input missing in CRF+Preset mode inference.")
+            return self.forward(tile, crf_batch, preset_batch)
+
+    def _forward_pass_tta(self, tile: torch.Tensor, crf: torch.Tensor, preset: Optional[torch.Tensor], use_tta: bool) -> torch.Tensor:
+        """
+        Internal helper for `inference`. Wraps the model pass with optional TTA.
+        
+        If TTA is True, this runs the model 8 times (flips/rotations) and
+        averages the results for a higher-quality, more stable output.
+        """
+        if not use_tta:
+            return self._model_pass(tile, crf, preset)
+        
+        # 1. Augment: Create 8 versions of the tile
+        augmented_tiles = self._tta_forward(tile)
+        
+        # 2. Predict: Run all 8 augmentations through the model in one batch
+        restored_augmented = self._model_pass(augmented_tiles, crf, preset)
+        
+        # 3. Invert: Revert the 8 augmentations on the output
+        restored_tiles = self._tta_inverse(restored_augmented)
+        
+        # 4. Average: Combine the 8 results
+        return torch.mean(restored_tiles, dim=0, keepdim=True)
+
+    def _pad_tensor(self, tensor: torch.Tensor, pad_h: int, pad_w: int) -> torch.Tensor:
+        """
+        Applies robust padding.
+        
+        Falls back to 'replicate' padding if the tile is smaller than the
+        required padding, preventing a 'reflect' mode crash.
+        """
+        h, w = tensor.shape[-2:]
+        padding_mode = 'reflect'
+        
+        # Check if padding is larger than the tile dimension
+        if (pad_h > h and h > 0) or (pad_w > w and w > 0):
+             logger.warning(f"Padding ({pad_h}, {pad_w}) > tile size ({h}, {w})." 
+                           " Falling back to 'replicate' padding.")
+             padding_mode = 'replicate'
+             
+        return F.pad(tensor, (0, pad_w, 0, pad_h), mode=padding_mode)
+
     @torch.no_grad()
     def inference(
         self,
         lq_image: torch.Tensor,
         crf: torch.Tensor,
+        preset: Optional[torch.Tensor] = None,
         tile_size: int = 512,
         tile_overlap: int = 64,
-        center_crop: bool = False
+        center_crop: bool = False,
+        use_tta: bool = False  # TTA is off by default for speed
     ) -> torch.Tensor:
         """
-        Memory-efficient tiled inference (CRF-Only).
+        SOTA inference with robust tiling, padding, and Test-Time Augmentation (TTA).
         
-        Args:
-            lq_image: [B, 3, H, W] Input image
-            crf: [B, 1] CRF value
-            tile_size: ...
-            tile_overlap: ...
-            center_crop: ...
-        
-        Returns:
-            [B, 3, H, W] Restored image
+        This is the main function called by inference scripts. It handles
+        three cases:
+        1. Center Crop: Fast preview of just the center tile.
+        2. Small Image: Processes the whole image in one pass (with padding).
+        3. Large Image: Splits the image into overlapping tiles and stitches
+           the results seamlessly.
         """
         self.eval()
         B, C, H, W = lq_image.shape
-        
-        # ===== MODE 1: CENTER CROP ONLY =====
+        min_div = 32  # Model needs 5 levels of 2x downsampling (2^5 = 32)
+
+        # ===== MODE 1: CENTER CROP ONLY (Fast Preview) =====
         if center_crop:
             crop_h = min(tile_size, H)
             crop_w = min(tile_size, W)
@@ -606,31 +530,32 @@ class AV1ConditionalUNetCRF(nn.Module):
             start_w = (W - crop_w) // 2
             center_tile = lq_image[:, :, start_h:start_h+crop_h, start_w:start_w+crop_w]
             
-            pad_h = (32 - crop_h % 32) % 32
-            pad_w = (32 - crop_w % 32) % 32
+            pad_h = (min_div - crop_h % min_div) % min_div
+            pad_w = (min_div - crop_w % min_div) % min_div
             
             if pad_h > 0 or pad_w > 0:
-                center_tile = F.pad(center_tile, (0, pad_w, 0, pad_h), mode='reflect')
-                output = self.forward(center_tile, crf) # <-- MODIFIED
-                output = output[:, :, :crop_h, :crop_w]
+                center_tile_padded = self._pad_tensor(center_tile, pad_h, pad_w)
+                output = self._forward_pass_tta(center_tile_padded, crf, preset, use_tta)
+                output = output[:, :, :crop_h, :crop_w] # Un-pad
             else:
-                output = self.forward(center_tile, crf) # <-- MODIFIED
+                output = self._forward_pass_tta(center_tile, crf, preset, use_tta)
             return output
         
-        # ===== MODE 2: SMALL IMAGE (FITS IN SINGLE TILE) =====
+        # ===== MODE 2: SMALL IMAGE (No Tiling Needed) =====
         if H <= tile_size and W <= tile_size:
-            pad_h = (32 - H % 32) % 32
-            pad_w = (32 - W % 32) % 32
+            pad_h = (min_div - H % min_div) % min_div
+            pad_w = (min_div - W % min_div) % min_div
             
             if pad_h > 0 or pad_w > 0:
-                lq_padded = F.pad(lq_image, (0, pad_w, 0, pad_h), mode='reflect')
-                output = self.forward(lq_padded, crf) # <-- MODIFIED
-                return output[:, :, :H, :W]
+                lq_padded = self._pad_tensor(lq_image, pad_h, pad_w)
+                output = self._forward_pass_tta(lq_padded, crf, preset, use_tta)
+                return output[:, :, :H, :W] # Un-pad
             else:
-                return self.forward(lq_image, crf) # <-- MODIFIED
+                return self._forward_pass_tta(lq_image, crf, preset, use_tta)
         
-        # ===== MODE 3: LARGE IMAGE (REQUIRES TILING) =====
-        logger.info(f"Tiled inference: {H}×{W} image → {tile_size}×{tile_size} tiles (overlap: {tile_overlap}px)")
+        # ===== MODE 3: LARGE IMAGE (Tiling) =====
+        if not center_crop:
+             logger.info(f"Tiled inference: {H}×{W} image → {tile_size}×{tile_size} tiles (overlap: {tile_overlap}px, TTA: {use_tta})")
         
         output = torch.zeros_like(lq_image)
         weight = torch.zeros_like(lq_image)
@@ -641,24 +566,28 @@ class AV1ConditionalUNetCRF(nn.Module):
         
         for i in range(h_tiles):
             for j in range(w_tiles):
+                # Calculate coordinates for the current tile
                 h_start = i * stride
                 w_start = j * stride
                 h_end = min(h_start + tile_size, H)
                 w_end = min(w_start + tile_size, W)
                 
+                # Extract the tile
                 tile = lq_image[:, :, h_start:h_end, w_start:w_end]
-                tile_h, tile_w = tile.shape[2:]
+                tile_h, tile_w = tile.shape[-2:]
                 
-                pad_h = (32 - tile_h % 32) % 32
-                pad_w = (32 - tile_w % 32) % 32
+                # Pad the tile if it's not divisible by min_div
+                pad_h = (min_div - tile_h % min_div) % min_div
+                pad_w = (min_div - tile_w % min_div) % min_div
                 
                 if pad_h > 0 or pad_w > 0:
-                    tile_padded = F.pad(tile, (0, pad_w, 0, pad_h), mode='reflect')
-                    restored_tile = self.forward(tile_padded, crf) # <-- MODIFIED
-                    restored_tile = restored_tile[:, :, :tile_h, :tile_w]
+                    tile_padded = self._pad_tensor(tile, pad_h, pad_w)
+                    restored_tile = self._forward_pass_tta(tile_padded, crf, preset, use_tta)
+                    restored_tile = restored_tile[:, :, :tile_h, :tile_w] # Un-pad
                 else:
-                    restored_tile = self.forward(tile, crf) # <-- MODIFIED
+                    restored_tile = self._forward_pass_tta(tile, crf, preset, use_tta)
                 
+                # Create a blend mask for seamless stitching
                 blend = self._create_blend_mask(
                     tile_h, tile_w, tile_overlap,
                     is_top=(i == 0), is_bottom=(h_end >= H),
@@ -666,13 +595,46 @@ class AV1ConditionalUNetCRF(nn.Module):
                     device=lq_image.device
                 )
                 
+                # Add the blended tile to the output canvas
                 output[:, :, h_start:h_end, w_start:w_end] += restored_tile * blend
                 weight[:, :, h_start:h_end, w_start:w_end] += blend
         
+        # Normalize the output by the blend weights
         output = output / (weight + 1e-8)
         return output
 
-    # _create_blend_mask is identical, so we can copy it
+    def _tta_forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Helper: Applies 8 augmentations (4 rotations, 4 flips)."""
+        x_rot90 = x.rot90(1, [-2, -1])
+        x_rot180 = x.rot90(2, [-2, -1])
+        x_rot270 = x.rot90(3, [-2, -1])
+        
+        x_flip = x.flip(-1)
+        x_flip_rot90 = x_flip.rot90(1, [-2, -1])
+        x_flip_rot180 = x_flip.rot90(2, [-2, -1])
+        x_flip_rot270 = x_flip.rot90(3, [-2, -1])
+        
+        return torch.cat([
+            x, x_rot90, x_rot180, x_rot270,
+            x_flip, x_flip_rot90, x_flip_rot180, x_flip_rot270
+        ], dim=0)
+
+    def _tta_inverse(self, x: torch.Tensor) -> torch.Tensor:
+        """Helper: Reverts the 8 augmentations."""
+        tta_outs = x.chunk(8, dim=0)
+        
+        o0 = tta_outs[0]
+        o1 = tta_outs[1].rot90(-1, [-2, -1])
+        o2 = tta_outs[2].rot90(-2, [-2, -1])
+        o3 = tta_outs[3].rot90(-3, [-2, -1])
+        
+        o4 = tta_outs[4].flip(-1)
+        o5 = tta_outs[5].rot90(-1, [-2, -1]).flip(-1)
+        o6 = tta_outs[6].rot90(-2, [-2, -1]).flip(-1)
+        o7 = tta_outs[7].rot90(-3, [-2, -1]).flip(-1)
+
+        return torch.stack([o0, o1, o2, o3, o4, o5, o6, o7], dim=0)
+
     def _create_blend_mask(
         self,
         tile_h: int,
@@ -684,10 +646,12 @@ class AV1ConditionalUNetCRF(nn.Module):
         is_right: bool,
         device: torch.device
     ) -> torch.Tensor:
+        """Creates a linear blend mask for seamless tile stitching."""
         
         blend = torch.ones(1, 1, tile_h, tile_w, device=device)
-        fade = min(overlap // 2, 32)
+        fade = min(overlap // 2, 32) # Use a fade ramp up to 32px
         
+        # Create 1D ramps
         if not is_top:
             fade_h = min(fade, tile_h)
             ramp = torch.linspace(0, 1, fade_h, device=device).view(-1, 1)
@@ -708,575 +672,180 @@ class AV1ConditionalUNetCRF(nn.Module):
             ramp = torch.linspace(1, 0, fade_w, device=device).view(1, -1)
             blend[:, :, :, -fade_w:] *= ramp
             
-        return blend
-
-
-class AV1ConditionalUNet(nn.Module):
-    """
-    Complete AV1 artifact removal U-Net with FiLM conditioning.
-    
-    Architecture:
-      - 5 levels: Head + 3 encoder levels + bottleneck + 3 decoder levels + tail
-      - Skip connections at all encoder-decoder pairs
-      - FiLM conditioning at: Encoder (3 levels) + Bottleneck (2 points)
-      - SimpleSelfAttention at bottleneck only
-      - Residual learning: output = input + predicted_residual
-    
-    Args:
-        config (dict): Configuration with keys:
-          - channels (list): Channel counts per level, e.g., [24, 48, 96, 192, 256]
-          - blocks (list): Number of EfficientResBlocks per level, e.g., [2, 2, 3, 3, 6]
-          - crf_range (tuple): (min, max) for CRF normalization
-          - preset_range (tuple): (min, max) for Preset normalization
-    
-    Example config:
-        config = {
-            'channels': [24, 48, 96, 192, 256],
-            'blocks': [2, 2, 3, 3, 6],
-            'crf_range': (23, 63),
-            'preset_range': (0, 8)
-        }
-    """
-    
-    def __init__(self, config: dict):
-        super().__init__()
-        
-        ch = config['channels']  # e.g., [24, 48, 96, 192, 256]
-        blocks = config['blocks']  # e.g., [2, 2, 3, 3, 6]
-        crf_range = config.get('crf_range', (23, 63))
-        preset_range = config.get('preset_range', (0, 8))
-        norm_range = tuple(config.get('norm_range', (0, 1)))
-        self.clamp_min, self.clamp_max = norm_range
-        cond_dim = 192  # Fixed: 128 (CRF) + 64 (Preset)
-            
-        logger.info("="*60)
-        logger.info("Initializing AV1ConditionalUNet")
-        logger.info(f"  Channels: {ch}")
-        logger.info(f"  Blocks: {blocks}")
-        logger.info(f"  CRF Range: {crf_range}")
-        logger.info(f"  Preset Range: {preset_range}")
-        logger.info(f"  Norm Range: [{self.clamp_min}, {self.clamp_max}]")
-        logger.info("="*60)
-        
-        # ===== CONDITIONING SYSTEM =====
-        self.conditioning_embedder = ConditioningEmbedder(
-            crf_min=crf_range[0],
-            crf_max=crf_range[1],
-            preset_min=preset_range[0],
-            preset_max=preset_range[1]
-        )
-        
-        # ===== INPUT HEAD (Level 0) =====
-        self.head = nn.Sequential(
-            nn.Conv2d(3, ch[0], kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(ch[0]),
-            nn.GELU(),
-            *[EfficientResBlock(ch[0]) for _ in range(blocks[0])]
-        )
-        
-        # ===== ENCODER =====
-        self.encoder1 = self._build_encoder_level(ch[0], ch[1], blocks[1], cond_dim)
-        self.encoder2 = self._build_encoder_level(ch[1], ch[2], blocks[2], cond_dim)
-        self.encoder3 = self._build_encoder_level(ch[2], ch[3], blocks[3], cond_dim)
-        
-        # ===== BOTTLENECK =====
-        self.bottleneck_down = nn.Conv2d(ch[3], ch[4], kernel_size=3, stride=2, padding=1, bias=False)
-        self.bottleneck_bn = nn.BatchNorm2d(ch[4])
-        
-        # Pre-attention processing
-        self.bottleneck_pre_attn = nn.Sequential(
-            *[EfficientResBlock(ch[4]) for _ in range(blocks[4] // 2)]
-        )
-        self.bottleneck_film1 = FiLMLayer(cond_dim, ch[4])
-        
-        # Self-attention
-        self.bottleneck_attn = SimpleSelfAttention(ch[4])
-        
-        # Post-attention processing
-        self.bottleneck_film2 = FiLMLayer(cond_dim, ch[4])
-        self.bottleneck_post_attn = nn.Sequential(
-            *[EfficientResBlock(ch[4]) for _ in range(blocks[4] // 2)]
-        )
-        
-        # ===== DECODER =====
-        self.decoder3 = self._build_decoder_level(ch[4], ch[3], blocks[3])
-        self.decoder2 = self._build_decoder_level(ch[3], ch[2], blocks[2])
-        self.decoder1 = self._build_decoder_level(ch[2], ch[1], blocks[1])
-        
-        # ===== OUTPUT TAIL =====
-        self.tail_up = nn.ConvTranspose2d(ch[1], ch[0], kernel_size=2, stride=2, bias=False)
-        self.tail_bn = nn.BatchNorm2d(ch[0])
-        self.tail_fusion = nn.Conv2d(ch[0] * 2, ch[0], kernel_size=1, bias=False)
-        self.tail_body = nn.Sequential(
-            *[EfficientResBlock(ch[0]) for _ in range(blocks[0])]
-        )
-        self.tail_pred = nn.Conv2d(ch[0], 3, kernel_size=3, padding=1)
-        
-        # Initialize weights
-        self._init_weights()
-        
-        # Log parameter count
-        total_params = sum(p.numel() for p in self.parameters())
-        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        logger.info(f"✓ Model initialized")
-        logger.info(f"  Total parameters: {total_params:,} ({total_params/1e6:.2f}M)")
-        logger.info(f"  Trainable parameters: {trainable_params:,} ({trainable_params/1e6:.2f}M)")
-        logger.info("="*60)
-
-    def _build_encoder_level(self, in_ch: int, out_ch: int, num_blocks: int, cond_dim: int) -> nn.ModuleDict:
-        """Build one encoder level with downsampling, processing blocks, and FiLM."""
-        return nn.ModuleDict({
-            'downsample': nn.Sequential(
-                nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=2, padding=1, bias=False),
-                nn.BatchNorm2d(out_ch),
-                nn.GELU()
-            ),
-            'body': nn.Sequential(
-                *[EfficientResBlock(out_ch) for _ in range(num_blocks)]
-            ),
-            'film': FiLMLayer(cond_dim, out_ch)
-        })
-
-    def _build_decoder_level(self, in_ch: int, out_ch: int, num_blocks: int) -> nn.ModuleDict:
-        """Build one decoder level with upsampling, skip fusion, and processing blocks."""
-        return nn.ModuleDict({
-            'upsample': nn.ConvTranspose2d(in_ch, out_ch, kernel_size=2, stride=2, bias=False),
-            'upsample_bn': nn.BatchNorm2d(out_ch),
-            'fusion': nn.Sequential(
-                nn.Conv2d(out_ch * 2, out_ch, kernel_size=1, bias=False),
-                nn.BatchNorm2d(out_ch),
-                nn.GELU()
-            ),
-            'body': nn.Sequential(
-                *[EfficientResBlock(out_ch) for _ in range(num_blocks)]
-            )
-        })
-
-    def _init_weights(self):
-        """Initialize network weights for stable training."""
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d) or isinstance(m, nn.ConvTranspose2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.ones_(m.weight)
-                nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.Linear):
-                # CRITICAL FIX: Use smaller init for Linear layers to avoid NaN on MPS
-                nn.init.xavier_uniform_(m.weight, gain=0.5)  # <-- Changed from kaiming
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-        
-        # Zero-initialize final prediction layer for residual learning
-        nn.init.zeros_(self.tail_pred.weight)
-        nn.init.zeros_(self.tail_pred.bias)
-        logger.info("✓ Weights initialized (tail_pred zeroed for residual learning)")
-
-    def forward(self, lq_image: torch.Tensor, crf: torch.Tensor, preset: torch.Tensor) -> torch.Tensor:
-        """
-        Full forward pass through the network.
-        
-        Args:
-            lq_image: [B, 3, H, W] Low-quality compressed image, range [0, 1]
-            crf: [B, 1] CRF value, range [23, 63]
-            preset: [B, 1] Preset value, range [0, 8]
-        
-        Returns:
-            [B, 3, H, W] Restored image, range [0, 1]
-        """
-        # ===== 1. GENERATE CONDITIONING VECTOR =====
-        cond = self.conditioning_embedder(crf, preset)  # [B, 192]
-        
-        # ===== 2. ENCODER PATH =====
-        # Head (Level 0)
-        skip0 = self.head(lq_image)  # [B, ch[0], H, W]
-        
-        # Encoder Level 1
-        e1 = self.encoder1['downsample'](skip0)  # [B, ch[1], H/2, W/2]
-        e1 = self.encoder1['body'](e1)
-        e1 = self.encoder1['film'](e1, cond)  # FiLM conditioning
-        skip1 = e1
-        
-        # Encoder Level 2
-        e2 = self.encoder2['downsample'](skip1)  # [B, ch[2], H/4, W/4]
-        e2 = self.encoder2['body'](e2)
-        e2 = self.encoder2['film'](e2, cond)
-        skip2 = e2
-        
-        # Encoder Level 3
-        e3 = self.encoder3['downsample'](skip2)  # [B, ch[3], H/8, W/8]
-        e3 = self.encoder3['body'](e3)
-        e3 = self.encoder3['film'](e3, cond)
-        skip3 = e3
-        
-        # ===== 3. BOTTLENECK =====
-        b = self.bottleneck_down(skip3)  # [B, ch[4], H/16, W/16]
-        b = F.gelu(self.bottleneck_bn(b))
-        
-        # Pre-attention
-        b = self.bottleneck_pre_attn(b)
-        b = self.bottleneck_film1(b, cond)  # FiLM #1
-        
-        # Self-attention (global context)
-        b = self.bottleneck_attn(b)
-        
-        # Post-attention
-        b = self.bottleneck_film2(b, cond)  # FiLM #2
-        b = self.bottleneck_post_attn(b)
-        
-        # ===== 4. DECODER PATH =====
-        # Decoder Level 3
-        d3 = self.decoder3['upsample'](b)  # [B, ch[3], H/8, W/8]
-        d3 = F.gelu(self.decoder3['upsample_bn'](d3))
-        d3 = torch.cat([d3, skip3], dim=1)  # Skip connection
-        d3 = self.decoder3['fusion'](d3)
-        d3 = self.decoder3['body'](d3)
-        
-        # Decoder Level 2
-        d2 = self.decoder2['upsample'](d3)  # [B, ch[2], H/4, W/4]
-        d2 = F.gelu(self.decoder2['upsample_bn'](d2))
-        d2 = torch.cat([d2, skip2], dim=1)
-        d2 = self.decoder2['fusion'](d2)
-        d2 = self.decoder2['body'](d2)
-        
-        # Decoder Level 1
-        d1 = self.decoder1['upsample'](d2)  # [B, ch[1], H/2, W/2]
-        d1 = F.gelu(self.decoder1['upsample_bn'](d1))
-        d1 = torch.cat([d1, skip1], dim=1)
-        d1 = self.decoder1['fusion'](d1)
-        d1 = self.decoder1['body'](d1)
-        
-        # ===== 5. OUTPUT TAIL =====
-        t = self.tail_up(d1)  # [B, ch[0], H, W]
-        t = F.gelu(self.tail_bn(t))
-        t = torch.cat([t, skip0], dim=1)  # Skip connection
-        t = self.tail_fusion(t)
-        t = self.tail_body(t)
-        residual = self.tail_pred(t)  # [B, 3, H, W] - predicted artifact correction
-        
-        # ===== 6. RESIDUAL LEARNING =====
-        restored = lq_image + residual
-        
-        # Optional: Clamp to valid range [0, 1]
-        restored = torch.clamp(restored, self.clamp_min, self.clamp_max)
-        
-        return restored
-
-    @torch.no_grad()
-    def inference(
-        self,
-        lq_image: torch.Tensor,
-        crf: torch.Tensor,
-        preset: torch.Tensor,
-        tile_size: int = 512,
-        tile_overlap: int = 64,
-        center_crop: bool = False
-    ) -> torch.Tensor:
-        """
-        Memory-efficient tiled inference for images of any size with seamless blending.
-        
-        This method handles three scenarios:
-        1. Center crop mode: Extract and process only the center tile
-        2. Small images (≤ tile_size): Process entire image with padding
-        3. Large images (> tile_size): Tiled processing with smooth blending
-        
-        Args:
-            lq_image: [B, 3, H, W] Input image (any size)
-            crf: [B, 1] CRF value for conditioning
-            preset: [B, 1] Preset value for conditioning
-            tile_size: Maximum tile dimensions for processing (default: 512)
-            tile_overlap: Overlap pixels between tiles for blending (default: 64)
-            center_crop: If True, only process center tile_size×tile_size region
-        
-        Returns:
-            [B, 3, H, W] Restored image (full size or center crop)
-        
-        Notes:
-            - All images are padded to multiples of 32 (2^5 for 5 downsample layers)
-            - Tiles use Gaussian-like edge blending for seamless stitching
-            - Center crop is useful for quick quality checks on large images
-        """
-        self.eval()
-        B, C, H, W = lq_image.shape
-        
-        # ===== MODE 1: CENTER CROP ONLY =====
-        if center_crop:
-            # Extract center tile
-            crop_h = min(tile_size, H)
-            crop_w = min(tile_size, W)
-            
-            start_h = (H - crop_h) // 2
-            start_w = (W - crop_w) // 2
-            
-            center_tile = lq_image[:, :, start_h:start_h+crop_h, start_w:start_w+crop_w]
-            
-            # Pad to multiple of 32
-            pad_h = (32 - crop_h % 32) % 32
-            pad_w = (32 - crop_w % 32) % 32
-            
-            if pad_h > 0 or pad_w > 0:
-                center_tile = F.pad(center_tile, (0, pad_w, 0, pad_h), mode='reflect')
-                output = self.forward(center_tile, crf, preset)
-                # Crop back to original tile size
-                output = output[:, :, :crop_h, :crop_w]
-            else:
-                output = self.forward(center_tile, crf, preset)
-            
-            return output
-        
-        # ===== MODE 2: SMALL IMAGE (FITS IN SINGLE TILE) =====
-        if H <= tile_size and W <= tile_size:
-            # Pad to multiple of 32 for U-Net compatibility
-            pad_h = (32 - H % 32) % 32
-            pad_w = (32 - W % 32) % 32
-            
-            if pad_h > 0 or pad_w > 0:
-                lq_padded = F.pad(lq_image, (0, pad_w, 0, pad_h), mode='reflect')
-                output = self.forward(lq_padded, crf, preset)
-                # Crop back to original size
-                return output[:, :, :H, :W]
-            else:
-                return self.forward(lq_image, crf, preset)
-        
-        # ===== MODE 3: LARGE IMAGE (REQUIRES TILING) =====
-        logger.info(f"Tiled inference: {H}×{W} image → {tile_size}×{tile_size} tiles (overlap: {tile_overlap}px)")
-        
-        # Initialize output accumulators
-        output = torch.zeros_like(lq_image)
-        weight = torch.zeros_like(lq_image)
-        
-        # Calculate grid parameters
-        stride = tile_size - tile_overlap
-        h_tiles = (H + stride - 1) // stride
-        w_tiles = (W + stride - 1) // stride
-        
-        # Process each tile
-        for i in range(h_tiles):
-            for j in range(w_tiles):
-                # Calculate tile boundaries
-                h_start = i * stride
-                w_start = j * stride
-                h_end = min(h_start + tile_size, H)
-                w_end = min(w_start + tile_size, W)
-                
-                # Extract tile
-                tile = lq_image[:, :, h_start:h_end, w_start:w_end]
-                tile_h, tile_w = tile.shape[2:]
-                
-                # Pad tile to multiple of 32
-                pad_h = (32 - tile_h % 32) % 32
-                pad_w = (32 - tile_w % 32) % 32
-                
-                if pad_h > 0 or pad_w > 0:
-                    tile_padded = F.pad(tile, (0, pad_w, 0, pad_h), mode='reflect')
-                    restored_tile = self.forward(tile_padded, crf, preset)
-                    # Crop back to original tile size
-                    restored_tile = restored_tile[:, :, :tile_h, :tile_w]
-                else:
-                    restored_tile = self.forward(tile, crf, preset)
-                
-                # Create smooth blending weights
-                blend = self._create_blend_mask(
-                    tile_h, tile_w, tile_overlap,
-                    is_top=(i == 0),
-                    is_bottom=(h_end >= H),
-                    is_left=(j == 0),
-                    is_right=(w_end >= W),
-                    device=lq_image.device
-                )
-                
-                # Accumulate weighted tiles
-                output[:, :, h_start:h_end, w_start:w_end] += restored_tile * blend
-                weight[:, :, h_start:h_end, w_start:w_end] += blend
-        
-        # Normalize by total weight
-        output = output / (weight + 1e-8)
-        
-        return output
-
-    def _create_blend_mask(
-        self,
-        tile_h: int,
-        tile_w: int,
-        overlap: int,
-        is_top: bool,
-        is_bottom: bool,
-        is_left: bool,
-        is_right: bool,
-        device: torch.device
-    ) -> torch.Tensor:
-        """
-        Create a smooth blending mask for seamless tile stitching.
-        
-        Uses linear gradients at tile edges to avoid visible seams.
-        Edge tiles (touching image boundaries) don't fade on those edges.
-        
-        Args:
-            tile_h, tile_w: Tile dimensions
-            overlap: Overlap width in pixels
-            is_top, is_bottom, is_left, is_right: Edge flags
-            device: Tensor device
-        
-        Returns:
-            [1, 1, tile_h, tile_w] blending weight mask
-        """
-        # Start with uniform weights
-        blend = torch.ones(1, 1, tile_h, tile_w, device=device)
-        
-        # Determine fade width (half of overlap, capped at 32px)
-        fade = min(overlap // 2, 32)
-        
-        # Apply linear fade at each edge (skip if at image boundary)
-        # Top edge
-        if not is_top:
-            fade_h = min(fade, tile_h)
-            ramp = torch.linspace(0, 1, fade_h, device=device).view(-1, 1)
-            blend[:, :, :fade_h, :] *= ramp
-        
-        # Bottom edge
-        if not is_bottom:
-            fade_h = min(fade, tile_h)
-            ramp = torch.linspace(1, 0, fade_h, device=device).view(-1, 1)
-            blend[:, :, -fade_h:, :] *= ramp
-        
-        # Left edge
-        if not is_left:
-            fade_w = min(fade, tile_w)
-            ramp = torch.linspace(0, 1, fade_w, device=device).view(1, -1)
-            blend[:, :, :, :fade_w] *= ramp
-        
-        # Right edge
-        if not is_right:
-            fade_w = min(fade, tile_w)
-            ramp = torch.linspace(1, 0, fade_w, device=device).view(1, -1)
-            blend[:, :, :, -fade_w:] *= ramp
-        
         return blend
 
 # ==============================================================================
-# SECTION 4: Unified Model Factory
+# SECTION 3: Unified Model Factory
 # ==============================================================================
 
 def create_av1_restorer(
-    size: str = 'base',
+    size: str = 'large', # Defaulting to ~20M target
     crf_range: Tuple[int, int] = (23, 63),
     preset_range: Tuple[int, int] = (0, 8),
-    norm_range: Tuple[int, int] = (-1, 1)
-) -> Union[AV1ConditionalUNet, AV1ConditionalUNetCRF]: # <-- Updated return type hint
+    norm_range: Tuple[float, float] = (-1, 1)
+) -> AV1ConditionalUNet:
     """
-    Unified factory function for Conditional AV1 U-Net Restorers.
+    Factory for SOTA-inspired, empirically calibrated AV1 Conditional U-Nets.
 
-    Automatically creates either:
-        - AV1ConditionalUNet (CRF+Preset): If preset_range has different min/max.
-        - AV1ConditionalUNetCRF: If preset_range has the same min/max.
+    Creates architectures based on measured parameter counts, labeled with clean,
+    rounded target sizes (multiples of 2M or 5M). Uses GroupNorm, efficient
+    blocks, and bottleneck attention, ensuring Base Width >= 16.
+
+    Size Options & Target / Actual Parameters (Approx. CRF-Only):
+    ----------------------------------------------------------
+    nano:    Target ~2M  (Actual: ~2.3M)  - Minimal viable conditional
+    tiny:    Target ~4M  (Actual: ~5.0M)  - Lightweight conditional
+    small:   Target ~8M (Actual: ~9.2M)  - Standard balanced conditional (Note: Actual < Target)
+    base:   Target ~12M (Actual: ~12.8M) - Enhanced standard conditional
+    large:  Target ~20M (Actual: ~19.7M) - RECOMMENDED High quality default
+    huge:   Target ~32M (Actual: ~32.3M) - High quality conditional
+    pro:    Target ~48M (Actual: ~50.3M) - Maximum quality conditional
 
     Args:
-        size: Model size variant ('tiny', 'small', 'base', 'large')
-        crf_range: (min, max) for CRF normalization
-        preset_range: (min, max) for Preset normalization (determines model type)
-        norm_range: (min, max) for output clamping
+        size (str): Model variant ('nano' to 'pro'). Defaults to 'large'.
+        crf_range (Tuple[int, int]): CRF normalization range (min, max).
+        preset_range (Tuple[int, int]): Preset range. Use identical min/max
+                                         (e.g., [4, 4]) for CRF-only mode.
+        norm_range (Tuple[float, float]): Image normalization range (e.g., [-1, 1]).
 
     Returns:
-        Initialized AV1ConditionalUNet or AV1ConditionalUNetCRF model.
-    """
+        AV1ConditionalUNet: Initialized model instance with GroupNorm.
 
+    Raises:
+        ValueError: If an unknown size string is provided.
+
+    Example:
+        >>> # Create the recommended ~20M target model for CRF-only
+        >>> model = create_av1_restorer(size='large', preset_range=[4, 4])
+        >>> params = sum(p.numel() for p in model.parameters()) / 1e6
+        >>> print(f"Model size 'large' has {params:.2f}M parameters.") # Actual count
+        Model size 'large' has 19.69M parameters.
+    """
+    # FINAL Configurations - Based on Empirical Parameter Counts (Oct 25 Run)
+    # Comments reflect clean targets; architecture yields known actual counts.
     configs = {
-        'tiny': { # ~4M
-            'channels': [24, 48, 64, 128, 224],
-            'blocks': [2, 2, 2, 2, 4]
-        },
-        'small': { # ~10M
-            'channels': [20, 40, 80, 160, 320],
-            'blocks': [2, 2, 3, 3, 6]
-        },
-        'base': { # ~16M
-            'channels': [48, 64, 128, 224, 384],
-            'blocks': [2, 2, 3, 3, 6]
-        },
-        'large': { # ~32M
-            'channels': [64, 96, 128, 256, 512],
-            'blocks': [2, 3, 4, 4, 8]
-        }
+        # Target: ~2M params (Actual: ~2.3M) - Minimum Viable Conditional
+        'nano':   {'channels': [16, 32, 64, 128, 192], 'blocks': [2, 2, 2, 3, 3]},
+        # Target: ~4M params (Actual: ~5.0M) - Improved Lightweight
+        'tiny':   {'channels': [20, 40, 80, 160, 240], 'blocks': [2, 2, 3, 4, 5]},
+        # Target: ~8M params (Actual: ~9.2M) - Standard Balanced (Slightly under target)
+        'small':  {'channels': [24, 48, 96, 192, 288], 'blocks': [3, 3, 4, 5, 6]},
+        # Target: ~12M params (Actual: ~12.8M) - Enhanced Standard
+        'base':   {'channels': [30, 60, 120, 240, 320], 'blocks': [3, 3, 4, 5, 6]},
+        # Target: ~20M params (Actual: ~19.7M) - Recommended Default
+        'large':  {'channels': [32, 64, 128, 256, 384], 'blocks': [3, 4, 4, 6, 8]},
+        # Target: ~32M params (Actual: ~32.3M) - High Quality
+        'huge':   {'channels': [32, 64, 128, 256, 512], 'blocks': [3, 4, 6, 6, 10]},
+        # Target: ~48M params (Actual: ~50.3M) - Max Quality / Research
+        'pro':    {'channels': [40, 80, 160, 320, 640], 'blocks': [3, 4, 6, 6, 10]},
     }
 
+
     if size not in configs:
-        raise ValueError(f"Unknown size '{size}'. Choose from: {list(configs.keys())}")
-
-    # --- Prepare base config ---
-    config = configs[size].copy() # Use .copy() to avoid modifying the template
-    config['crf_range'] = crf_range
-    config['norm_range'] = norm_range
-    # preset_range is handled below
-
-    # --- Logic to select model type ---
-    if preset_range[0] == preset_range[1]:
-        # CRF-Only Mode
-        logger.info(
-            f"Preset range is single value ({preset_range[0]}). "
-            f"Creating AV1ConditionalUNetCRF (size={size})"
+        valid_sizes = ", ".join(configs.keys())
+        raise ValueError(
+            f"Unknown size '{size}'. Choose from: {valid_sizes}\n"
+            f"Recommended: 'large' (Target ~20M / Actual ~19.7M params)" # Updated recommendation
         )
-        # Note: preset_range is NOT added to config for CRFOnly constructor
-        return AV1ConditionalUNetCRF(config)
-    else:
-        # Standard CRF + Preset Mode
-        logger.info(
-            f"Preset range is variable {preset_range}. "
-            f"Creating AV1ConditionalUNet (size={size})"
-        )
-        config['preset_range'] = preset_range # Add preset_range for standard constructor
-        return AV1ConditionalUNet(config)
+
+    cfg = configs[size]
+    model_config = {
+        'channels': cfg['channels'],
+        'blocks': cfg['blocks'],
+        'crf_range': crf_range,
+        'preset_range': preset_range,
+        'norm_range': norm_range
+    }
+
+    # Determine conditioning mode for logging
+    is_crf_only = (preset_range[0] == preset_range[1])
+    cond_mode = "CRF-Only" if is_crf_only else "CRF+Preset"
+
+    # Professional Logging Output using Clean Target Parameter Counts
+    # Mapping clean targets for logging
+    param_targets = {
+        'nano': '~2M', 
+        'tiny': '~4M', 
+        'small': '~8M', 
+        'base': '~12M',
+        'large': '~20M',
+        'huge': '~32M',
+        'pro': '~48M'
+    }
+    param_target_log = param_targets.get(size, 'Unknown Target')
+
+    logger.info("=" * 70)
+    logger.info(f"Creating AV1ConditionalUNet - Size: {size.upper()} (Target: {param_target_log} params - FINAL EMPIRICAL ARCH)") # Updated note
+    logger.info(f"  Conditioning Mode: {cond_mode}")
+    logger.info(f"  Channel Progression: {cfg['channels']}")
+    logger.info(f"  Blocks per Level: {cfg['blocks']}")
+    logger.info(f"  CRF Normalization Range: {crf_range}")
+    if not is_crf_only:
+        logger.info(f"  Preset Normalization Range: {preset_range}")
+    logger.info(f"  Image Normalization Range: {norm_range}")
+    logger.info("=" * 70)
+
+    # Instantiate the model (ensure AV1ConditionalUNet uses GroupNorm)
+    model = AV1ConditionalUNet(model_config)
+
+    # --- Verification Step (Shows ACTUAL count) ---
+    actual_params = sum(p.numel() for p in model.parameters())
+    logger.info(f"  ✓ Model Instantiated - Actual Parameters: {actual_params:,} ({actual_params/1e6:.2f}M)")
+    # --- End Verification ---
+
+    return model
+
 
 # ==============================================================================
-# SECTION 5: Example Usage & Testing
+# SECTION 4: Example Usage & Testing
 # ==============================================================================
 
 if __name__ == "__main__":
     import logging
     logging.basicConfig(level=logging.INFO)
-    model_size = 'tiny' # 'small', 'base', 'large'
+    model_sizes = ['nano', 'tiny', 'small', 'base', 'large', 'huge', 'pro']
+    for model_size in model_sizes:
+        # --- Test Case 1: Standard CRF + Preset ---
+        print("\n--- Testing Standard Model (CRF + Preset) ---")
+        model_std = create_av1_restorer(
+            size=model_size,
+            crf_range=(23, 63),
+            preset_range=(0, 8), # Variable preset range
+            norm_range=(-1, 1)
+        )
+        print(f"Instantiated model type: {type(model_std).__name__}")
+        # (Optional: Add forward pass test for model_std if needed)
 
-    # --- Test Case 1: Standard CRF + Preset ---
-    print("\n--- Testing Standard Model (CRF + Preset) ---")
-    model_std = create_av1_restorer(
-        size=model_size,
-        crf_range=(23, 63),
-        preset_range=(0, 8), # Variable preset range
-        norm_range=(-1, 1)
-    )
-    print(f"Instantiated model type: {type(model_std).__name__}")
-    # (Optional: Add forward pass test for model_std if needed)
+        # --- Test Case 2: CRF-Only ---
+        print("\n--- Testing CRF-Only Model ---")
+        model_crf_only = create_av1_restorer(
+            size=model_size,
+            crf_range=(44, 53),
+            preset_range=(4, 4), # Single value preset range
+            norm_range=(0, 1)
+        )
+        print(f"Instantiated model type: {type(model_crf_only).__name__}")
 
-    # --- Test Case 2: CRF-Only ---
-    print("\n--- Testing CRF-Only Model ---")
-    model_crf_only = create_av1_restorer(
-        size=model_size,
-        crf_range=(44, 53),
-        preset_range=(4, 4), # Single value preset range
-        norm_range=(0, 1)
-    )
-    print(f"Instantiated model type: {type(model_crf_only).__name__}")
+        # Test forward pass for CRF-Only model
+        batch_size = 1
+        lq = torch.randn(batch_size, 3, 128, 128)
+        crf = torch.tensor([[48.0]])
 
-    # Test forward pass for CRF-Only model
-    batch_size = 1
-    lq = torch.randn(batch_size, 3, 128, 128)
-    crf = torch.tensor([[48.0]])
+        print(f"\nCRF-Only Input shapes:")
+        print(f"  LQ: {lq.shape}")
+        print(f"  CRF: {crf.shape} - values: {crf.squeeze().tolist()}")
 
-    print(f"\nCRF-Only Input shapes:")
-    print(f"  LQ: {lq.shape}")
-    print(f"  CRF: {crf.shape} - values: {crf.squeeze().tolist()}")
+        with torch.no_grad():
+            model_crf_only.eval() # Ensure model is in eval mode for testing
+            restored = model_crf_only(lq, crf) # Correctly call with only lq, crf
 
-    with torch.no_grad():
-        model_crf_only.eval() # Ensure model is in eval mode for testing
-        restored = model_crf_only(lq, crf) # Correctly call with only lq, crf
+        print(f"\nCRF-Only Output:")
+        print(f"  Shape: {restored.shape}")
+        print(f"  Range: [{restored.min():.3f}, {restored.max():.3f}]")
 
-    print(f"\nCRF-Only Output:")
-    print(f"  Shape: {restored.shape}")
-    print(f"  Range: [{restored.min():.3f}, {restored.max():.3f}]")
-
-    # --- Parameter Count Check (Example using the CRF-Only model) ---
-    print("\n--- Parameter Count Check (using CRF-Only 'tiny' model) ---")
-    total_params = sum(p.numel() for p in model_crf_only.parameters())
-    trainable_params = sum(p.numel() for p in model_crf_only.parameters() if p.requires_grad)
-    print(f"  Total parameters: {total_params:,} ({total_params/1e6:.2f}M)")
-    print(f"  Trainable parameters: {trainable_params:,} ({trainable_params/1e6:.2f}M)")
+        # --- Parameter Count Check (Example using the CRF-Only model) ---
+        print(f"\n--- Parameter Count Check (using CRF-Only '{model_size}' model) ---")
+        total_params = sum(p.numel() for p in model_crf_only.parameters())
+        trainable_params = sum(p.numel() for p in model_crf_only.parameters() if p.requires_grad)
+        print(f"  Total parameters: {total_params:,} ({total_params/1e6:.2f}M)")
+        print(f"  Trainable parameters: {trainable_params:,} ({trainable_params/1e6:.2f}M)")
