@@ -60,6 +60,10 @@ dataset:
   # [0, 1] is simpler, often used with Sigmoid outputs (though less common now).
   norm_range: [-1, 1] # or [0, 1]
 
+  train_augment_factor: 64  # NEW: 64 crops per image per epoch
+  val_augment_factor: 9     # NEW: 3x3 centered grid for validation
+
+
 # ------------------------------------------------------------------------------
 # Training Curriculum (Progressive Learning)
 # ------------------------------------------------------------------------------

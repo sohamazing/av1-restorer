@@ -64,13 +64,11 @@ sys.path.append(str(project_root))
 
 # from av1_restorer.models.av1_conditional_unet_restorer import create_av1_restorer # V1
 from av1_restorer.models.av1_conditional_unet_restorer_v2 import create_av1_restorer # V2
-
 try:
     from utils.loss import CombinedLoss
-    from utils.av1_dataset import AV1Dataset
-    from utils.av1_dataset_fast import AV1DatasetFast
+    from utils.av1_dataset import create_dataset
 except ImportError as e:
-    print(f"Failed to import utilities: {e}")
+    print(f"Failed to import utilities (CombinedLoss, create_dataset): {e}")
     sys.exit(1)
 
 try:
@@ -182,7 +180,6 @@ class ConditionalUNetTrainer:
         
         # Summary
         self._print_summary()
-        # self.val_samples = self._get_fixed_val_samples() # depreciated
         self.val_samples = None # val_samples moved to train() loop 
 
         
@@ -405,72 +402,76 @@ class ConditionalUNetTrainer:
         logger.info(f"Device: {self.device} | AMP: {self.use_amp} | EMA: {self.ema is not None}")
         logger.info("=" * 80)
     
-    def _get_fixed_val_samples(self, stage_cfg: dict) -> Optional[Dict[str, Any]]:
+    def _get_val_samples(
+        self, 
+        val_loader: DataLoader
+    ) -> Optional[Dict[str, Any]]:
         """
-        Sample fixed validation images for W&B visualization per stage
+        SOTA Fix: Grabs one batch from the val_loader and slices it down
+        to 'num_val_samples_to_log' for efficient W&B logging.
         """
+        if self.val_samples is not None:
+            logger.debug("Validation samples already loaded for this stage, skipping.")
+            return # Already have samples
+
+        if not val_loader:
+            logger.warning("Validation loader is not available, cannot sample.")
+            return None
+            
+        # 1. Get the desired number of samples from the config
         try:
-            data_cfg = self.config['data']
-            dset_cfg = self.config['dataset']
-            num_samples = self.config['training'].get('num_val_samples_to_log', 4)
+            num_to_log = self.config['training'].get('num_val_samples_to_log', 4)
+        except Exception:
+            logger.warning("Could not read 'num_val_samples_to_log' from config, defaulting to 4.")
+            num_to_log = 4
             
-            # --- Get patch size from CURRENT stage ---
-            patch_size = stage_cfg['patch_size']
-            if isinstance(patch_size, list):
-                patch_size = patch_size[-1] # Use final patch size of a progressive stage
-            # ----------------------------------------------
+        try:
+            logger.info(f"Sampling one validation batch (will keep {num_to_log} images for W&B logging)...")
             
-            logger.info(f"Sampling {num_samples} validation images at {patch_size}px...")
-
-            # Check cache for file list
-            val_cache_key = f"{data_cfg['val_lq_root']}_{tuple(dset_cfg['crf_range'])}"
-            cached_val_image_pairs = self.val_image_pairs_cache.get(val_cache_key)
+            # 2. Get the full batch from the iterator
+            samples_full_batch = next(iter(val_loader))
             
-            # Create validation dataset
-            val_dataset = AV1Dataset(
-                lq_root_dir=data_cfg['val_lq_root'],
-                hq_root_dir=data_cfg['val_hq_root'],
-                hq_ext=data_cfg.get('hq_ext', '.png'),
-                patch_size=patch_size, # This will now be 128, 256, etc.
-                crf_range=tuple(dset_cfg['crf_range']),
-                preset_range=tuple(dset_cfg['preset_range']),
-                norm_range=tuple(dset_cfg.get('norm_range', [-1, 1])),
-                crop_mode='center',
-                augment=False,
-                return_metadata=True,
-                cached_image_pairs=cached_val_image_pairs
-            )
-
-            # Cache file list for future use
-            if cached_val_image_pairs is None and hasattr(val_dataset, 'image_pairs'):
-                self.val_image_pairs_cache[val_cache_key] = val_dataset.image_pairs
+            # 3. Determine the actual number of samples to keep
+            # We need to find the batch size from the first tensor we see
+            actual_batch_size = 0
+            for v in samples_full_batch.values():
+                if isinstance(v, torch.Tensor):
+                    actual_batch_size = v.size(0)
+                    break
             
-            if len(val_dataset) == 0:
-                logger.warning("Validation dataset is empty, cannot sample images.")
+            if actual_batch_size == 0:
+                logger.warning("Could not determine batch size from validation batch. Cannot sample.")
                 return None
-            
-            # Ensure num_samples is not larger than dataset
-            num_samples = min(num_samples, len(val_dataset))
-            if num_samples == 0:
-                 logger.warning("No samples to log.")
+                
+            # Don't try to take more samples than are in the batch
+            num_to_keep = min(num_to_log, actual_batch_size)
+            if num_to_keep == 0:
+                 logger.warning("Validation batch was empty. Cannot sample.")
                  return None
 
-            loader = DataLoader(val_dataset, batch_size=num_samples, shuffle=False)
-            batch = next(iter(loader))
+            # 4. Create the new, *sliced* dictionary
+            samples_sliced = {}
+            for k, v in samples_full_batch.items():
+                if isinstance(v, torch.Tensor):
+                    # Slice the tensor (e.g., [60, 3, 128, 128] -> [4, 3, 128, 128])
+                    samples_sliced[k] = v[0:num_to_keep].to(self.device)
+                elif isinstance(v, (list, tuple)):
+                    # Also slice lists (e.g., 'base_name')
+                    samples_sliced[k] = v[0:num_to_keep]
+                else:
+                    # Keep any other metadata as-is
+                    samples_sliced[k] = v
+
+            logger.info(f"Sampled and sliced to {num_to_keep} images for logging.")
+            return samples_sliced
             
-            # Move to device
-            result = {
-                k: v.to(self.device) if isinstance(v, torch.Tensor) else v
-                for k, v in batch.items()
-            }
-            
-            logger.info(f"Sampled {num_samples} validation images for visualization")
-            return result
-        
-        except Exception as e:
-            logger.warning(f"Could not sample validation images: {e}", exc_info=True)
+        except StopIteration:
+            logger.warning("Validation loader is empty, cannot sample for logging.")
             return None
-    
+        except Exception as e:
+            logger.error(f"Could not sample validation batch: {e}", exc_info=True)
+            return None
+
     # --------------------------------------------------------------------------
     # Dataset & Optimizer Setup
     # --------------------------------------------------------------------------
@@ -479,99 +480,102 @@ class ConditionalUNetTrainer:
         self,
         stage_config: dict
     ) -> Tuple[DataLoader, DataLoader]:
-        """Create train and validation dataloaders for a curriculum stage."""
+        """
+        Create train and validation dataloaders for a curriculum stage
+        using the intelligent dataset factory.
+        """
+        
+        # 1. --- Configuration Setup ---
         data_cfg = self.config['data']
         dset_cfg = self.config['dataset']
         sys_cfg = self.config['system']
         
-        # Extract stage parameters
+        # 2. --- Extract Stage Parameters ---
         patch_size = stage_config['patch_size']
         batch_size = stage_config['batch_size']
+        
+        # Use stage-specific params or fall back to global
         crf_range = stage_config.get('crf_range', dset_cfg['crf_range'])
+        train_aug = stage_config.get(
+            'train_augment_factor', dset_cfg.get('train_augment_factor', 1)
+        )
+        val_aug = stage_config.get(
+            'val_augment_factor', dset_cfg.get('val_augment_factor', 1)
+        )
 
-        # Check cache for file lists
+        # 3. --- Handle Caching ---
         train_cache_key = f"{data_cfg['train_lq_root']}_{tuple(crf_range)}"
         val_cache_key = f"{data_cfg['val_lq_root']}_{tuple(crf_range)}"
         cached_train_image_pairs = self.train_image_pairs_cache.get(train_cache_key)
         cached_val_image_pairs = self.val_image_pairs_cache.get(val_cache_key)
         
-        # Handle progressive training (use first sub-stage for dataloader)
+        # 4. --- Handle Progressive Training ---
         if isinstance(patch_size, list):
             patch_size = patch_size[0]
             batch_size = batch_size[0]
-        
-        # Select dataset class based on file extension
-        lq_ext = data_cfg.get('lq_ext', '.avif').lower()
-        if lq_ext == '.npy' and 'AV1DatasetFast' in globals():
-            DatasetClass = AV1DatasetFast
-            logger.info("Using pre-processed .npy dataset (fast)")
-        else:
-            DatasetClass = AV1Dataset
-            if lq_ext != '.avif':
-                logger.warning(f"Using on-the-fly {lq_ext} loading (slow)")
-        
-        # Common dataset arguments
-        common_args = {
+            
+        # 5. --- [SOTA] Unified Parameter Aggregation (Common Args) ---
+        # These are all the params the factory needs
+        dataset_args = {
+            'hq_ext': data_cfg.get('hq_ext', '.png'),
+            'lq_ext': data_cfg.get('lq_ext', '.avif').lower(),
             'patch_size': patch_size,
             'crf_range': tuple(crf_range),
             'preset_range': tuple(dset_cfg['preset_range']),
             'norm_range': tuple(dset_cfg.get('norm_range', [-1, 1])),
-            'hq_ext': data_cfg.get('hq_ext', '.png')
         }
-        
-        # Create datasets
-        train_dset = DatasetClass(
-            lq_root_dir=data_cfg['train_lq_root'],
-            hq_root_dir=data_cfg['train_hq_root'],
+
+        # 6. --- [SOTA] Call Intelligent Factory for Training ---
+        # We pass 'crop_mode=random', which the factory knows means 'training'
+        train_dataset = create_dataset(
+            lq_root=data_cfg['train_lq_root'],
+            hq_root=data_cfg['train_hq_root'],
+            crop_mode='random', # random crops and random flips
+            augment_factor=train_aug,
             cached_image_pairs=cached_train_image_pairs,
-            crop_mode='random',
-            augment=True,
-            **common_args
-        )
-        
-        val_dset = DatasetClass(
-            lq_root_dir=data_cfg['val_lq_root'],
-            hq_root_dir=data_cfg['val_hq_root'],
-            cached_image_pairs=cached_val_image_pairs,
-            crop_mode='center',
-            augment=False,
-            **common_args
+            **dataset_args
         )
 
-        # Cache file lists for future use
-        if cached_train_image_pairs is None and hasattr(train_dset, 'image_pairs'):
-            self.train_image_pairs_cache[train_cache_key] = train_dset.image_pairs
-        if cached_val_image_pairs is None and hasattr(val_dset, 'image_pairs'):
-            self.val_image_pairs_cache[val_cache_key] = val_dset.image_pairs
+        # 7. --- [SOTA] Call Intelligent Factory for Validation ---
+        # We pass 'crop_mode=center', which the factory knows means 'validation'
+        # and it will intelligently decide between single-crop or grid.
+        val_dataset = create_dataset(
+            lq_root=data_cfg['val_lq_root'], 
+            hq_root=data_cfg['val_hq_root'], 
+            crop_mode='center', # deterministic centered patches 
+            augment_factor=val_aug, # centered grid instead of single crop (must be square)
+            cached_image_pairs=cached_val_image_pairs,
+            **dataset_args
+        )
+
+        # 8. --- Update File List Cache ---
+        if cached_train_image_pairs is None and hasattr(train_dataset, 'image_pairs'):
+            self.train_image_pairs_cache[train_cache_key] = train_dataset.image_pairs
+        if cached_val_image_pairs is None and hasattr(val_dataset, 'image_pairs'):
+            self.val_image_pairs_cache[val_cache_key] = val_dataset.image_pairs
         
-        # Dataloader config
+        # 9. --- Create Dataloaders ---
         num_workers = sys_cfg.get('num_workers', 8)
         pin_memory = (self.device.type == 'cuda')
+        train_persistent = (num_workers > 0)
+        val_persistent = (num_workers > 0)
         
         train_loader = DataLoader(
-            train_dset,
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            drop_last=True,
-            persistent_workers=(num_workers > 0),
-            prefetch_factor=4 if num_workers > 0 else None
+            train_dataset, batch_size=batch_size, shuffle=True,
+            num_workers=num_workers, pin_memory=pin_memory, drop_last=True,
+            persistent_workers=train_persistent,
+            prefetch_factor=4 if train_persistent else None
         )
         
         val_loader = DataLoader(
-            val_dset,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=max(2, num_workers // 2),
-            pin_memory=pin_memory,
-            drop_last=False,
-            persistent_workers=(num_workers > 0),
-            prefetch_factor=2 if num_workers > 0 else None
+            val_dataset, batch_size=batch_size, shuffle=False,
+            num_workers=max(2, num_workers // 2), pin_memory=pin_memory,
+            drop_last=False, persistent_workers=val_persistent,
+            prefetch_factor=2 if val_persistent else None
         )
         
         logger.info(
-            f"Dataloaders: {len(train_dset):,} train, {len(val_dset):,} val samples"
+            f"Dataloaders: {len(train_dataset):,} train, {len(val_dataset):,} val samples"
         )
         
         return train_loader, val_loader
@@ -692,8 +696,8 @@ class ConditionalUNetTrainer:
             stage_cfg = curriculum[stage_idx]
             logger.info(f"\n▶ Starting Stage {stage_idx + 1}/{len(curriculum)}")
             
-            # Get val samples for this stage
-            self.val_samples = self._get_fixed_val_samples(stage_cfg)
+            # Get val samples for this stage # DEPRECIATED
+            # self.val_samples = self._get_fixed_val_samples(stage_cfg)
 
             current_stage_loader_len = stage_loader_lengths[stage_idx]
             self._run_stage(stage_idx, stage_cfg, optimizer, scheduler, current_stage_loader_len)
@@ -794,6 +798,11 @@ class ConditionalUNetTrainer:
                 # Determine start epoch within this sub-stage
                 start_epoch_in_sub = max(0, self.start_epoch - cumulative_epochs)
 
+                # fix - Get val samples from the val_loader instead of separate loader
+                # Only grab samples on the *first* run of each stage
+                if start_epoch_in_sub == 0:
+                    self.val_samples = self._get_val_samples(val_loader)
+
                 # Run epochs for this sub-stage
                 self._run_epochs(
                     stage_idx, start_epoch_in_sub, sub_epochs,
@@ -809,6 +818,8 @@ class ConditionalUNetTrainer:
             epochs = stage_cfg['epochs']
             logger.info(f"Simple stage: {epochs} epochs")
             train_loader, val_loader = self._create_dataloaders(stage_cfg)
+            if self.start_epoch == 0: 
+                self.val_samples = self._get_val_samples(val_loader)
 
             self._run_epochs(
                 stage_idx, self.start_epoch, epochs,
@@ -1311,7 +1322,6 @@ class ConditionalUNetTrainer:
             #     "preset_range": self.config['dataset'].get("preset_range"),
             # },
         }
-
         if optimizer:
             state['optimizer_state_dict'] = optimizer.state_dict()
         if scheduler:
