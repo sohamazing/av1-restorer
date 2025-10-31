@@ -96,7 +96,7 @@ class DepthwiseSeparable(nn.Module):
     """
     def __init__(self, in_ch: int, out_ch: int, stride: int = 1, num_groups: int = 16):
         super().__init__()
-        self.depthwise = nn.Conv2d(in_ch, in_ch, 3, stride, 1, groups=in_ch, bias=False)
+        self.depthwise = nn.Conv2d(in_ch, in_ch, 3, stride, 1, padding_mode='reflect', groups=in_ch, bias=False)
         self.pointwise = nn.Conv2d(in_ch, out_ch, 1, bias=False)
         self.norm = nn.GroupNorm(choose_num_groups(out_ch, num_groups), out_ch)
         self.act = nn.GELU()
@@ -206,7 +206,7 @@ class EfficientResBlock(nn.Module):
         
         # Depthwise spatial processing
         self.dwconv = DepthwiseSeparable(hidden, hidden, stride=1, num_groups=num_groups)
-          
+
         # Channel attention
         self.attn = ECA(hidden)
         

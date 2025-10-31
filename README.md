@@ -16,14 +16,14 @@ Both architectures are built on SOTA principles, including GroupNorm, GELU, effi
 Your AV1 dataset should be organized as follows for the training and testing scripts:
 ```
 av1_data/                          # Div2K + Flickr2K master dataset
-├── train/                          # 80% of master dataset  
+├── train/                          # 90% of master dataset  
 │   ├── lq/                         # AV1-compressed images (.avif)  
 │   │   ├── crf_23/preset_4/      # crf_XX/preset_y/image_crfXX_pY.avif
 │   │   ├── crf_24/preset_4/  
 │   │   └── ... (up to crf_63)  
 │   └── hq/                         # High-quality reference images (.png)  
 │  
-├── val/                            # 20% of master dataset  
+├── val/                            # 10% of master dataset  
 │   ├── lq/                         # AV1-compressed images  
 │   └── hq/                         # High-quality reference images  
 │  
@@ -272,7 +272,7 @@ python scripts/degrade_av1.py \
 ln -s $(pwd)/DIV2K_valid_HR ./av1_data/test/hq
 ```
 
-### **4\. Split Master into Train/Val (80/20)**
+### **4\. Split Master into Train/Val (90/10)**
 ```
 python scripts/split_av1_dataset.py \  
     --input_lq ./av1_data/master/lq \  
@@ -281,7 +281,7 @@ python scripts/split_av1_dataset.py \
     --output_train_hq ./av1_data/train/hq \  
     --output_val_lq ./av1_data/val/lq \  
     --output_val_hq ./av1_data/val/hq \  
-    --split_ratio 0.8
+    --split_ratio 0.9
 ```
 ## **🎓 Training Workflows**
 
@@ -593,14 +593,14 @@ aura/
 │   └── nano_models/                    # Configs for Nano models  
 │  
 ├── av1_data/                           # master dataset (Div2K + Flickr2K)  
-├── train/                              # 80% of master dataset  
+├── train/                              # 90% of master dataset  
 │   ├── lq/                             # AV1-compressed images (.avif)  
 │   │   ├── crf_23/preset_4/  
 │   │   ├── crf_24/preset_4/  
 │   │   └── ... (up to crf_63)  
 │   └── hq/                             # High-quality reference images (.png)  
 │  
-├── val/                                # 20% of master dataset  
+├── val/                                # 10% of master dataset  
 │   ├── lq/                             # AV1-compressed images  
 │   └── hq/                             # High-quality reference images  
 │  

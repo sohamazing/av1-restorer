@@ -88,6 +88,56 @@ curriculum:
     epochs: 20
 
 # ------------------------------------------------------------------------------
+# Advanced Curriculum (multistage with different crf ranges and loss functions)
+# ------------------------------------------------------------------------------
+# curriculum:
+#   # Stage 1: 128px Warm-up. Focus on structure in a narrow CRF range.
+#   - patch_size: 128
+#     batch_size: 64
+#     epochs: 50
+#     crf_range: [33, 43] # Narrow CRF range
+#     loss:
+#       charbonnier: {enabled: true, weight: 1.0, params: {eps: 0.001}}
+#       perceptual:  {enabled: true, weight: 0.01, params: {network: 'vgg'}} # Very low weight
+#       ms_ssim:     {enabled: false}
+#       frequency:   {enabled: false}
+
+#   # Stage 2: 128px Main. Expand CRF range and enable all losses.
+#   - patch_size: 128
+#     batch_size: 64
+#     epochs: 100
+#     crf_range: [23, 53] # Wider CRF range
+#     loss:
+#       charbonnier: {enabled: true, weight: 1.0, params: {eps: 0.001}}
+#       perceptual:  {enabled: true, weight: 0.05, params: {network: 'vgg'}}
+#       ms_ssim:     {enabled: true, weight: 0.1}
+#       frequency:   {enabled: true, weight: 0.01, params: {alpha: 1.0}}
+
+#   # Stage 3: 192px Intermediate. Uses GLOBAL loss & GLOBAL CRF range [23, 63].
+#   - patch_size: 192
+#     batch_size: 24   # (Approx 64 / (1.5*1.5))
+#     epochs: 50
+#     # No 'loss' or 'crf_range' specified, so it uses the global defaults.
+
+#   # Stage 4: 256px Main. Uses GLOBAL loss & GLOBAL CRF range.
+#   - patch_size: 256
+#     batch_size: 16
+#     epochs: 100
+#     # No 'loss' or 'crf_range' specified, so it uses the global defaults.
+
+#   # Stage 5: 384px Intermediate. Uses GLOBAL loss & GLOBAL CRF range.
+#   - patch_size: 384
+#     batch_size: 8    # (Approx 16 / (1.5*1.5))
+#     epochs: 20
+#     # No 'loss' or 'crf_range' specified, so it uses the global defaults.
+
+#   # Stage 6: 512px Final Polish. Uses GLOBAL loss & GLOBAL CRF range.
+#   - patch_size: 512
+#     batch_size: 4
+#     epochs: 40       # Increased epochs for final polish
+#     # No 'loss' or 'crf_range' specified, so it uses the global defaults.
+
+# ------------------------------------------------------------------------------
 # Model Configuration (Generator - Conditional U-Net Only)
 # ------------------------------------------------------------------------------
 model:

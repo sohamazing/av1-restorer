@@ -182,12 +182,12 @@ class AV1ConditionalUNet(nn.Module):
     Unified U-Net capable of CRF (128-dim) or CRF-Preset (192-dim) conditioning.    
 
     Architecture:
-      - 5 levels: Head + 3 encoder levels + bottleneck + 3 decoder levels + tail
-      - Skip connections at all encoder-decoder pairs
-      - FiLM conditioning at: Encoder (3 levels) + Bottleneck (1 point)
-      - SimpleSelfAttention at bottleneck only
-      - Residual learning: output = input + predicted_residual
-      - SOTA UPSAMPLING: Bilinear + Conv (NO checkerboard artifacts!)
+      - 5-level U-Net with skip connections.
+      - EfficientResBlocks with GroupNorm for stable, high-performance training.
+      - FiLM conditioning for adapting to CRF and Preset values.
+      - SimpleSelfAttention at the bottleneck to capture global context.
+      - SOTA Upsampling (Bilinear + DepthwiseConv) to prevent checkerboard artifacts.
+      - Residual learning (model predicts the artifacts to be removed).
     
     Args:
         config (dict): Configuration with keys:
@@ -201,20 +201,21 @@ class AV1ConditionalUNet(nn.Module):
             'channels': [24, 48, 96, 192, 256],
             'blocks': [2, 2, 3, 3, 6],
             'crf_range': (23, 63),
-            'preset_range': (0, 8)
+            'preset_range': (4, 4)
+            'norm_range': (-1, 1)
         }
     """
-    
     def __init__(self, config: dict):
         super().__init__()
         
         ch = config['channels']  # e.g., [24, 48, 96, 192, 256]
         blocks = config['blocks']  # e.g., [2, 2, 3, 3, 6]
         crf_range = config.get('crf_range', (23, 63))
-        norm_range = tuple(config.get('norm_range', (0, 1)))
         preset_range = config.get('preset_range', (0, 8))
+        norm_range = tuple(config.get('norm_range', (0, 1)))
         self.clamp_min, self.clamp_max = norm_range
-        self.cond_dim = 128 if preset_range[0] == preset_range[1] else 192        
+        # Model adapts its conditioning dimension based on the preset_range
+        self.cond_dim = 128 if preset_range[0] == preset_range[1] else 192 
             
         logger.info("="*60)
         logger.info("Initializing AV1ConditionalUNet")
@@ -231,9 +232,9 @@ class AV1ConditionalUNet(nn.Module):
             crf_range=crf_range, preset_range=preset_range
         )
         
-        # ===== INPUT HEAD (Level 0) =====
+        # ===== INPUT HEAD =====
         self.head = nn.Sequential(
-            nn.Conv2d(3, ch[0], kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(3, ch[0], kernel_size=3, padding=1, padding_mode='reflect', bias=False),
             nn.GroupNorm(choose_num_groups(ch[0]), ch[0]),
             nn.GELU(),
             *[EfficientResBlock(ch[0]) for _ in range(blocks[0])]
@@ -244,27 +245,28 @@ class AV1ConditionalUNet(nn.Module):
         self.encoder2 = self._build_encoder_level(ch[1], ch[2], blocks[2], self.cond_dim)
         self.encoder3 = self._build_encoder_level(ch[2], ch[3], blocks[3], self.cond_dim)
         
-        # ===== BOTTLENECK (Consolidated and Stabilized) =====
-        self.bottleneck_down = nn.Conv2d(ch[3], ch[4], kernel_size=3, stride=2, padding=1, bias=False)
+        # ===== BOTTLENECK =====
+        self.bottleneck_down = nn.Conv2d(
+            ch[3], ch[4], kernel_size=3, stride=2, padding=1, padding_mode='reflect', bias=False
+        )
+
         self.bottleneck_gn = nn.GroupNorm(choose_num_groups(ch[4]), ch[4])
         
         self.bottleneck_pre_attn = nn.Sequential(
             *[EfficientResBlock(ch[4]) for _ in range(blocks[4] // 2)]
         )
-        
         self.bottleneck_attn = SimpleSelfAttention(ch[4])
         self.bottleneck_film = FiLMLayer(self.cond_dim, ch[4])
-        
         self.bottleneck_post_attn = nn.Sequential(
             *[EfficientResBlock(ch[4]) for _ in range(blocks[4] // 2)]
         )
         
-        # ===== DECODER (FIXED: Upsample + Conv) =====
+        # ===== DECODER =====
         self.decoder3 = self._build_decoder_level(ch[4], ch[3], blocks[3])
         self.decoder2 = self._build_decoder_level(ch[3], ch[2], blocks[2])
         self.decoder1 = self._build_decoder_level(ch[2], ch[1], blocks[1])
         
-        # ===== OUTPUT TAIL (FIXED: Upsample + Conv) =====
+        # ===== OUTPUT TAIL =====
         self.tail_upsample_op = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
         self.tail_upsample_conv = DepthwiseSeparable(ch[1], ch[0], stride=1)
         self.tail_gn = nn.GroupNorm(choose_num_groups(ch[0]), ch[0])
@@ -276,7 +278,7 @@ class AV1ConditionalUNet(nn.Module):
         self.tail_body = nn.Sequential(
             *[EfficientResBlock(ch[0]) for _ in range(blocks[0])]
         )
-        self.tail_pred = nn.Conv2d(ch[0], 3, kernel_size=3, padding=1)
+        self.tail_pred = nn.Conv2d(ch[0], 3, kernel_size=3, padding=1, padding_mode='reflect')
         
         self._init_weights()
         
@@ -289,9 +291,10 @@ class AV1ConditionalUNet(nn.Module):
 
 
     def _build_encoder_level(self, in_ch: int, out_ch: int, num_blocks: int, cond_dim: int) -> nn.ModuleDict:
+        """Helper to construct one level of the U-Net encoder."""
         return nn.ModuleDict({
             'downsample': nn.Sequential(
-                nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=2, padding=1, bias=False),
+                nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=2, padding=1, padding_mode='reflect', bias=False),
                 nn.GroupNorm(choose_num_groups(out_ch), out_ch),
                 nn.GELU()
             ),
@@ -302,7 +305,7 @@ class AV1ConditionalUNet(nn.Module):
         })
 
     def _build_decoder_level(self, in_ch: int, out_ch: int, num_blocks: int) -> nn.ModuleDict:
-
+        """Helper to construct one level of the U-Net decoder."""
         return nn.ModuleDict({
             'upsample_op': nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
             'upsample_conv': DepthwiseSeparable(in_ch, out_ch, stride=1),
@@ -320,6 +323,7 @@ class AV1ConditionalUNet(nn.Module):
         })
 
     def _init_weights(self):
+        """Initializes model weights, zeroing the final prediction layer."""
         for m in self.modules():
             if isinstance(m, nn.Conv2d) or isinstance(m, nn.ConvTranspose2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
@@ -333,13 +337,14 @@ class AV1ConditionalUNet(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
         
+        # Initialize the final layer to zero for residual learning
         nn.init.zeros_(self.tail_pred.weight)
         nn.init.zeros_(self.tail_pred.bias)
         logger.info("✓ Weights initialized (tail_pred zeroed for residual learning)")
 
     def forward(self, lq_image: torch.Tensor, crf: torch.Tensor, preset: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        Full forward pass through the network (CRF or CRF-Preset conditioning).
+        Defines the full forward pass, used for training (CRF or CRF-Preset conditioninal).
         
         Args:
             lq_image: [B, 3, H, W] Low-quality compressed image
@@ -349,10 +354,10 @@ class AV1ConditionalUNet(nn.Module):
         Returns:
             [B, 3, H, W] Restored image
         """
-        # ===== 1. GENERATE CONDITIONING VECTOR =====
+        # 1. Generate conditioning vector
         cond = self.conditioning_embedder(crf, preset)
 
-        # ===== 2. ENCODER PATH (FiLM application) =====
+        # 2. Encoder Path
         skip0 = self.head(lq_image)
         
         e1 = self.encoder1['downsample'](skip0)
@@ -370,7 +375,7 @@ class AV1ConditionalUNet(nn.Module):
         e3 = self.encoder3['film'](e3, cond)
         skip3 = e3
         
-        # ===== 3. BOTTLENECK =====
+        # 3. Bottleneck
         b = self.bottleneck_down(skip3)
         b = F.gelu(self.bottleneck_gn(b))
         b = torch.clamp(b, min=-10.0, max=10.0)
@@ -381,43 +386,116 @@ class AV1ConditionalUNet(nn.Module):
         b = torch.clamp(b, min=-10.0, max=10.0)
         b = self.bottleneck_post_attn(b)
         
-        # ===== 4. DECODER PATH (FIXED: Upsample + Conv) =====
-        d3 = self.decoder3['upsample_op'](b)        # Bilinear upsample
-        d3 = self.decoder3['upsample_conv'](d3)     # Then convolve
+        # 4. Decoder Path (with skip connections)
+        d3 = self.decoder3['upsample_op'](b)
+        d3 = self.decoder3['upsample_conv'](d3)
         d3 = F.gelu(self.decoder3['upsample_gn'](d3))
         d3 = torch.cat([d3, skip3], dim=1)
         d3 = self.decoder3['fusion'](d3)
         d3 = self.decoder3['body'](d3)
         
-        d2 = self.decoder2['upsample_op'](d3)       # Bilinear upsample
-        d2 = self.decoder2['upsample_conv'](d2)     # Then convolve
+        d2 = self.decoder2['upsample_op'](d3)
+        d2 = self.decoder2['upsample_conv'](d2)
         d2 = F.gelu(self.decoder2['upsample_gn'](d2))
         d2 = torch.cat([d2, skip2], dim=1)
         d2 = self.decoder2['fusion'](d2)
         d2 = self.decoder2['body'](d2)
         
-        d1 = self.decoder1['upsample_op'](d2)       # Bilinear upsample
-        d1 = self.decoder1['upsample_conv'](d1)     # Then convolve
+        d1 = self.decoder1['upsample_op'](d2)
+        d1 = self.decoder1['upsample_conv'](d1)
         d1 = F.gelu(self.decoder1['upsample_gn'](d1))
         d1 = torch.cat([d1, skip1], dim=1)
         d1 = self.decoder1['fusion'](d1)
         d1 = self.decoder1['body'](d1)
         
-        # ===== 5. OUTPUT TAIL (FIXED: Upsample + Conv) =====
-        t = self.tail_upsample_op(d1)               # Bilinear upsample
-        t = self.tail_upsample_conv(t)              # Then convolve
+        # 5. Output Tail
+        t = self.tail_upsample_op(d1)
+        t = self.tail_upsample_conv(t)
         t = F.gelu(self.tail_gn(t))
         t = torch.cat([t, skip0], dim=1)
         t = self.tail_fusion(t)
-        t = self.tail_fusion_gn_act(t)              # Added consistency
+        t = self.tail_fusion_gn_act(t)
         t = self.tail_body(t)
         residual = self.tail_pred(t)
         
-        # ===== 6. RESIDUAL LEARNING =====
+        # 6. Residual Connection
         restored = lq_image + residual
         restored = torch.clamp(restored, self.clamp_min, self.clamp_max)
         
         return restored
+
+    # ==========================================================================
+    # --- SOTA INFERENCE & HELPER METHODS
+    # ==========================================================================
+
+    def _model_pass(self, tile: torch.Tensor, base_crf: torch.Tensor, base_preset: Optional[torch.Tensor]):
+        """
+        Internal helper for `inference`. Handles conditioning tensor batching.
+        
+        This function correctly expands the (B=1) CRF/Preset tensors to match
+        the (B=8) batch size used during Test-Time Augmentation (TTA).
+        """
+        is_crf_only_mode = (self.cond_dim == 128)
+        
+        # Check if tile batch is larger than cond batch (i.e., TTA is active)
+        num_augs = tile.shape[0] // base_crf.shape[0]
+        
+        if num_augs > 1:
+            # TTA is active, repeat cond tensors to match the TTA batch size
+            crf_batch = base_crf.repeat_interleave(num_augs, dim=0)
+            preset_batch = base_preset.repeat_interleave(num_augs, dim=0) if base_preset is not None else None
+        else:
+            # No TTA, use cond tensors as-is (batch size is already correct)
+            crf_batch = base_crf
+            preset_batch = base_preset
+
+        # Call the appropriate forward pass based on model's conditioning mode
+        if is_crf_only_mode:
+            return self.forward(tile, crf_batch)
+        else:
+            if preset_batch is None:
+                 raise ValueError("Preset input missing in CRF+Preset mode inference.")
+            return self.forward(tile, crf_batch, preset_batch)
+
+    def _forward_pass_tta(self, tile: torch.Tensor, crf: torch.Tensor, preset: Optional[torch.Tensor], use_tta: bool) -> torch.Tensor:
+        """
+        Internal helper for `inference`. Wraps the model pass with optional TTA.
+        
+        If TTA is True, this runs the model 8 times (flips/rotations) and
+        averages the results for a higher-quality, more stable output.
+        """
+        if not use_tta:
+            return self._model_pass(tile, crf, preset)
+        
+        # 1. Augment: Create 8 versions of the tile
+        augmented_tiles = self._tta_forward(tile)
+        
+        # 2. Predict: Run all 8 augmentations through the model in one batch
+        restored_augmented = self._model_pass(augmented_tiles, crf, preset)
+        
+        # 3. Invert: Revert the 8 augmentations on the output
+        restored_tiles = self._tta_inverse(restored_augmented)
+        
+        # 4. Average: Combine the 8 results
+        return torch.mean(restored_tiles, dim=0, keepdim=True)
+
+    def _pad_tensor(self, tensor: torch.Tensor, pad_h: int, pad_w: int) -> torch.Tensor:
+        """
+        Applies robust padding.
+        
+        Falls back to 'replicate' padding if the tile is smaller than the
+        required padding, preventing a 'reflect' mode crash.
+        """
+        h, w = tensor.shape[-2:]
+        padding_mode = 'reflect'
+        
+        # Check if padding is larger than the tile dimension
+        if (pad_h > h and h > 0) or (pad_w > w and w > 0):
+             logger.warning(f"Padding ({pad_h}, {pad_w}) > tile size ({h}, {w})." 
+                           " Falling back to 'replicate' padding.")
+             padding_mode = 'replicate'
+             
+        return F.pad(tensor, (0, pad_w, 0, pad_h), mode=padding_mode)
 
     @torch.no_grad()
     def inference(
@@ -427,23 +505,24 @@ class AV1ConditionalUNet(nn.Module):
         preset: Optional[torch.Tensor] = None,
         tile_size: int = 512,
         tile_overlap: int = 64,
-        center_crop: bool = False
+        center_crop: bool = False,
+        use_tta: bool = False  # TTA is off by default for speed
     ) -> torch.Tensor:
-        """Memory-efficient tiled inference with seamless blending."""
+        """
+        SOTA inference with robust tiling, padding, and Test-Time Augmentation (TTA).
+        
+        This is the main function called by inference scripts. It handles
+        three cases:
+        1. Center Crop: Fast preview of just the center tile.
+        2. Small Image: Processes the whole image in one pass (with padding).
+        3. Large Image: Splits the image into overlapping tiles and stitches
+           the results seamlessly.
+        """
         self.eval()
         B, C, H, W = lq_image.shape
-        
-        is_crf_only_mode = (self.cond_dim == 128)
+        min_div = 32  # Model needs 5 levels of 2x downsampling (2^5 = 32)
 
-        def _forward_pass(tile: torch.Tensor):
-            if is_crf_only_mode:
-                return self.forward(tile, crf)
-            else:
-                if preset is None:
-                    raise ValueError("Preset input missing in CRF+Preset mode inference.")
-                return self.forward(tile, crf, preset)
-
-        # ===== MODE 1: CENTER CROP ONLY =====
+        # ===== MODE 1: CENTER CROP ONLY (Fast Preview) =====
         if center_crop:
             crop_h = min(tile_size, H)
             crop_w = min(tile_size, W)
@@ -451,31 +530,32 @@ class AV1ConditionalUNet(nn.Module):
             start_w = (W - crop_w) // 2
             center_tile = lq_image[:, :, start_h:start_h+crop_h, start_w:start_w+crop_w]
             
-            pad_h = (32 - crop_h % 32) % 32
-            pad_w = (32 - crop_w % 32) % 32
+            pad_h = (min_div - crop_h % min_div) % min_div
+            pad_w = (min_div - crop_w % min_div) % min_div
             
             if pad_h > 0 or pad_w > 0:
-                center_tile = F.pad(center_tile, (0, pad_w, 0, pad_h), mode='reflect')
-                output = _forward_pass(center_tile)
-                output = output[:, :, :crop_h, :crop_w]
+                center_tile_padded = self._pad_tensor(center_tile, pad_h, pad_w)
+                output = self._forward_pass_tta(center_tile_padded, crf, preset, use_tta)
+                output = output[:, :, :crop_h, :crop_w] # Un-pad
             else:
-                output = _forward_pass(center_tile)
+                output = self._forward_pass_tta(center_tile, crf, preset, use_tta)
             return output
         
-        # ===== MODE 2: SMALL IMAGE (FITS IN SINGLE TILE) =====
+        # ===== MODE 2: SMALL IMAGE (No Tiling Needed) =====
         if H <= tile_size and W <= tile_size:
-            pad_h = (32 - H % 32) % 32
-            pad_w = (32 - W % 32) % 32
+            pad_h = (min_div - H % min_div) % min_div
+            pad_w = (min_div - W % min_div) % min_div
             
             if pad_h > 0 or pad_w > 0:
-                lq_padded = F.pad(lq_image, (0, pad_w, 0, pad_h), mode='reflect')
-                output = _forward_pass(lq_padded)
-                return output[:, :, :H, :W]
+                lq_padded = self._pad_tensor(lq_image, pad_h, pad_w)
+                output = self._forward_pass_tta(lq_padded, crf, preset, use_tta)
+                return output[:, :, :H, :W] # Un-pad
             else:
-                return _forward_pass(lq_image)
+                return self._forward_pass_tta(lq_image, crf, preset, use_tta)
         
-        # ===== MODE 3: LARGE IMAGE (REQUIRES TILING) =====
-        logger.info(f"Tiled inference: {H}×{W} image → {tile_size}×{tile_size} tiles (overlap: {tile_overlap}px)")
+        # ===== MODE 3: LARGE IMAGE (Tiling) =====
+        if not center_crop:
+             logger.info(f"Tiled inference: {H}×{W} image → {tile_size}×{tile_size} tiles (overlap: {tile_overlap}px, TTA: {use_tta})")
         
         output = torch.zeros_like(lq_image)
         weight = torch.zeros_like(lq_image)
@@ -486,24 +566,28 @@ class AV1ConditionalUNet(nn.Module):
         
         for i in range(h_tiles):
             for j in range(w_tiles):
+                # Calculate coordinates for the current tile
                 h_start = i * stride
                 w_start = j * stride
                 h_end = min(h_start + tile_size, H)
                 w_end = min(w_start + tile_size, W)
                 
+                # Extract the tile
                 tile = lq_image[:, :, h_start:h_end, w_start:w_end]
-                tile_h, tile_w = tile.shape[2:]
+                tile_h, tile_w = tile.shape[-2:]
                 
-                pad_h = (32 - tile_h % 32) % 32
-                pad_w = (32 - tile_w % 32) % 32
+                # Pad the tile if it's not divisible by min_div
+                pad_h = (min_div - tile_h % min_div) % min_div
+                pad_w = (min_div - tile_w % min_div) % min_div
                 
                 if pad_h > 0 or pad_w > 0:
-                    tile_padded = F.pad(tile, (0, pad_w, 0, pad_h), mode='reflect')
-                    restored_tile = _forward_pass(tile_padded)
-                    restored_tile = restored_tile[:, :, :tile_h, :tile_w]
+                    tile_padded = self._pad_tensor(tile, pad_h, pad_w)
+                    restored_tile = self._forward_pass_tta(tile_padded, crf, preset, use_tta)
+                    restored_tile = restored_tile[:, :, :tile_h, :tile_w] # Un-pad
                 else:
-                    restored_tile = _forward_pass(tile)
+                    restored_tile = self._forward_pass_tta(tile, crf, preset, use_tta)
                 
+                # Create a blend mask for seamless stitching
                 blend = self._create_blend_mask(
                     tile_h, tile_w, tile_overlap,
                     is_top=(i == 0), is_bottom=(h_end >= H),
@@ -511,11 +595,45 @@ class AV1ConditionalUNet(nn.Module):
                     device=lq_image.device
                 )
                 
+                # Add the blended tile to the output canvas
                 output[:, :, h_start:h_end, w_start:w_end] += restored_tile * blend
                 weight[:, :, h_start:h_end, w_start:w_end] += blend
         
+        # Normalize the output by the blend weights
         output = output / (weight + 1e-8)
         return output
+
+    def _tta_forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Helper: Applies 8 augmentations (4 rotations, 4 flips)."""
+        x_rot90 = x.rot90(1, [-2, -1])
+        x_rot180 = x.rot90(2, [-2, -1])
+        x_rot270 = x.rot90(3, [-2, -1])
+        
+        x_flip = x.flip(-1)
+        x_flip_rot90 = x_flip.rot90(1, [-2, -1])
+        x_flip_rot180 = x_flip.rot90(2, [-2, -1])
+        x_flip_rot270 = x_flip.rot90(3, [-2, -1])
+        
+        return torch.cat([
+            x, x_rot90, x_rot180, x_rot270,
+            x_flip, x_flip_rot90, x_flip_rot180, x_flip_rot270
+        ], dim=0)
+
+    def _tta_inverse(self, x: torch.Tensor) -> torch.Tensor:
+        """Helper: Reverts the 8 augmentations."""
+        tta_outs = x.chunk(8, dim=0)
+        
+        o0 = tta_outs[0]
+        o1 = tta_outs[1].rot90(-1, [-2, -1])
+        o2 = tta_outs[2].rot90(-2, [-2, -1])
+        o3 = tta_outs[3].rot90(-3, [-2, -1])
+        
+        o4 = tta_outs[4].flip(-1)
+        o5 = tta_outs[5].rot90(-1, [-2, -1]).flip(-1)
+        o6 = tta_outs[6].rot90(-2, [-2, -1]).flip(-1)
+        o7 = tta_outs[7].rot90(-3, [-2, -1]).flip(-1)
+
+        return torch.stack([o0, o1, o2, o3, o4, o5, o6, o7], dim=0)
 
     def _create_blend_mask(
         self,
@@ -528,10 +646,12 @@ class AV1ConditionalUNet(nn.Module):
         is_right: bool,
         device: torch.device
     ) -> torch.Tensor:
+        """Creates a linear blend mask for seamless tile stitching."""
         
         blend = torch.ones(1, 1, tile_h, tile_w, device=device)
-        fade = min(overlap // 2, 32)
+        fade = min(overlap // 2, 32) # Use a fade ramp up to 32px
         
+        # Create 1D ramps
         if not is_top:
             fade_h = min(fade, tile_h)
             ramp = torch.linspace(0, 1, fade_h, device=device).view(-1, 1)

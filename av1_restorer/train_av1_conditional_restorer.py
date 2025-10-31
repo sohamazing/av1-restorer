@@ -41,6 +41,7 @@ import sys
 import yaml
 import argparse
 import logging
+import time
 from pathlib import Path
 from typing import Dict, Any, Tuple, Optional
 from collections import defaultdict
@@ -166,7 +167,8 @@ class ConditionalUNetTrainer:
         
         # Model and loss
         self.model = self._setup_model()
-        self.loss_fn = self._setup_loss()
+        # Pass the global loss config as the default
+        self.loss_fn = self._setup_loss(self.config['loss'])
         
         # EMA if enabled
         ema_cfg = self.config['optimizer']
@@ -321,10 +323,11 @@ class ConditionalUNetTrainer:
         
         return model.to(self.device)
     
-    def _setup_loss(self) -> nn.Module:
-        """Initialize loss function from config."""
+    def _setup_loss(self, loss_config: dict) -> nn.Module:
+        """Initialize loss function from a given config dict."""
         norm_range = tuple(self.config['dataset'].get('norm_range', [-1, 1]))
-        loss_fn = CombinedLoss(self.config['loss'], norm_range=norm_range)
+        # Use the provided loss_config dictionary
+        loss_fn = CombinedLoss(loss_config, norm_range=norm_range)
         logger.info("Loss function initialized")
         return loss_fn.to(self.device)
     
@@ -726,6 +729,16 @@ class ConditionalUNetTrainer:
         loader_len_estimate: int
     ):
         """Run a single curriculum stage with optional progressive sub-stages."""
+
+        # Get the stage's loss config, or fall back to the global config
+        current_loss_config = stage_cfg.get('loss', self.config['loss'])
+        # Re-initialize the loss function for this stage
+        self.loss_fn = self._setup_loss(current_loss_config)
+        if 'loss' in stage_cfg:
+            logger.info(f"Stage {stage_idx+1}: Initialized with STAGE-SPECIFIC loss config.")
+        else:
+            logger.info(f"Stage {stage_idx+1}: Initialized with GLOBAL loss config.")
+
         is_progressive = isinstance(stage_cfg.get('patch_size'), list)
 
         # Restore optimizer/scheduler state if resuming mid-stage
@@ -1289,6 +1302,14 @@ class ConditionalUNetTrainer:
             'global_step': self.global_step,
             'best_val_loss': self.best_val_loss,
             'wandb_id': self.wandb_id
+            # "model_metadata": {
+            #     "type": self.config['model'].get("type"),
+            #     "size": self.config['model'].get("size"),
+            #     "timestamp": time.strftime("%Y-%m-%d_%H-%M-%S"),
+            #     "device": str(self.device),
+            #     "crf_range": self.config['dataset'].get("crf_range"),
+            #     "preset_range": self.config['dataset'].get("preset_range"),
+            # },
         }
         if optimizer:
             state['optimizer_state_dict'] = optimizer.state_dict()
