@@ -193,6 +193,9 @@ class AV1Dataset(Dataset):
                 T.RandomHorizontalFlip(p=0.5),
                 T.RandomVerticalFlip(p=0.5),
             ])
+        
+        if not transforms_list:
+            return T.Identity()
             
         return T.Compose(transforms_list)
 
