@@ -593,20 +593,20 @@ aura/
 │   └── nano_models/                    # Configs for Nano models  
 │  
 ├── av1_data/                           # master dataset (Div2K + Flickr2K)  
-├── train/                              # 90% of master dataset  
-│   ├── lq/                             # AV1-compressed images (.avif)  
-│   │   ├── crf_23/preset_4/  
-│   │   ├── crf_24/preset_4/  
-│   │   └── ... (up to crf_63)  
-│   └── hq/                             # High-quality reference images (.png)  
-│  
-├── val/                                # 10% of master dataset  
-│   ├── lq/                             # AV1-compressed images  
-│   └── hq/                             # High-quality reference images  
-│  
-├── test/                               # Separate test set (e.g., DIV2K_valid)  
-│   ├── lq/                             # AV1-compressed images  
-│   └── hq/                             # High-quality reference images  
+│   ├── train/                              # 90% of master dataset  
+│   │   ├── lq/                             # AV1-compressed images (.avif)  
+│   │   │   ├── crf_23/preset_4/  
+│   │   │   ├── crf_24/preset_4/  
+│   │   │   └── ... (up to crf_63)  
+│   │   └── hq/                             # High-quality reference images (.png)  
+│   │  
+│   ├── val/                                # 10% of master dataset  
+│   │   ├── lq/                             # AV1-compressed images  
+│   │   └── hq/                             # High-quality reference images  
+│   │  
+│   └── test/                               # Separate test set (e.g., DIV2K_valid)  
+│       ├── lq/                             # AV1-compressed images  
+│       └── hq/                             # High-quality reference images  
 │  
 └── checkpoints/                        # Saved models
 ```

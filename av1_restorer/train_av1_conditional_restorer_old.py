@@ -1311,7 +1311,7 @@ class ConditionalUNetTrainer:
             #     "preset_range": self.config['dataset'].get("preset_range"),
             # },
         }
-
+            
         if optimizer:
             state['optimizer_state_dict'] = optimizer.state_dict()
         if scheduler:

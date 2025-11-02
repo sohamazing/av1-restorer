@@ -1,7 +1,7 @@
 # ==============================================================================
-# AURA-Net Requirements (Revised & Corrected)
+# AURA-Net Requirements
 # ==============================================================================
-# This file is based on the provided Python code (train_*, restore_*,
+# This file is for the AV1 Restorer codebase (train_*, restore_*,
 # degrade_*, blocks.py, loss.py, etc.) and lists only the required
 # dependencies, grouped for clarity.
 # ==============================================================================

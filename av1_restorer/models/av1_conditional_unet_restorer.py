@@ -24,7 +24,10 @@ from typing import Tuple, List, Union, Optional
 import logging
 logger = logging.getLogger(__name__)
 
-from .blocks import DepthwiseSeparable, ECA, EfficientResBlock, choose_num_groups
+try:
+    from .blocks import DepthwiseSeparable, ECA, EfficientResBlock, choose_num_groups
+except:
+    from blocks import DepthwiseSeparable, ECA, EfficientResBlock, choose_num_groups
 
 # ==============================================================================
 # SECTION 1: Conditioning + Channel Attention 
