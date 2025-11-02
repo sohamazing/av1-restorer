@@ -166,16 +166,19 @@ class AV1_EfficientRestorer(nn.Module):
         e1 = self.encoder1['downsample'](skip0)
         e1 = self.encoder1['body'](e1)
         e1 = self.encoder1['film'](e1, cond)
+        e1 = torch.clamp(e1, -10.0, 10.0)
         skip1 = e1
 
         e2 = self.encoder2['downsample'](skip1)
         e2 = self.encoder2['body'](e2)
         e2 = self.encoder2['film'](e2, cond)
+        e2 = torch.clamp(e2, -10.0, 10.0)
         skip2 = e2
         
         e3 = self.encoder3['downsample'](skip2)
         e3 = self.encoder3['body'](e3)
         e3 = self.encoder3['film'](e3, cond)
+        e3 = torch.clamp(e3, -10.0, 10.0)
         skip3 = e3
         
         b = self.bottleneck_down(skip3); b = F.gelu(self.bottleneck_gn(b)); b = torch.clamp(b, -10., 10.)
@@ -405,6 +408,7 @@ class AV1_QualityRestorer(nn.Module):
             x = encoder['downsample'](x)
             x = encoder['body'](x)
             x = encoder['film'](x, cond)
+            x = torch.clamp(x, -10.0, 10.0)
             x = encoder['wavelet'](x) # V3 Feature
             skips.append(x) # skips = [s0, s1, s2, s3, s4]
             

@@ -172,11 +172,11 @@ class FrequencyLoss(nn.Module):
         if not (0.0 <= alpha <= 1.0):
             raise ValueError("alpha must be in [0, 1]")
         
-        logger.info(
-            f"FrequencyLoss: alpha={alpha}, "
-            f"phase={use_phase}, log_mag={use_log_magnitude}, "
-            f"base_loss={loss_func_type}"
-        )
+        # logger.info(
+        #     f"FrequencyLoss: alpha={alpha}, "
+        #     f"phase={use_phase}, log_mag={use_log_magnitude}, "
+        #     f"base_loss={loss_func_type}"
+        # )
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """

@@ -1073,7 +1073,16 @@ class ConditionalUNetTrainer:
         ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
         
         # Restore model
-        missing, unexpected = self.model.load_state_dict(ckpt['model_state_dict'], strict=False)
+        #missing, unexpected = self.model.load_state_dict(ckpt['model_state_dict'], strict=False)
+        from collections import OrderedDict
+        ckpt_state_dict = ckpt['model_state_dict']
+        new_state_dict = OrderedDict()
+
+        for k, v in ckpt_state_dict.items():
+            name = k[10:] if k.startswith('_orig_mod.') else k
+            new_state_dict[name] = v
+
+        missing, unexpected = self.model.load_state_dict(new_state_dict, strict=False)
         if unexpected:
             logger.warning(f"Unexpected keys: {unexpected}")
         if missing:
