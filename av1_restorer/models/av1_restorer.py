@@ -425,6 +425,7 @@ class AV1_QualityRestorer(nn.Module):
         x = skips.pop() # x = s4 (ch[4])
         x = torch.clamp(x, -10.0, 10.0) # Stability
         x = self.bottleneck(x)
+        x = torch.clamp(x, -10.0, 10.0) # Stability
         x = self.bottleneck_film(x, cond)
         x = torch.clamp(x, -10.0, 10.0) # Stability
         
