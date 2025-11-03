@@ -66,9 +66,9 @@ class AV1_EfficientRestorer(nn.Module):
         
         # Input head
         self.head = nn.Sequential(
-            nn.Conv2d(3, ch[0], 3, 1, 1, padding_mode='reflect', bias=False),
-            nn.GroupNorm(choose_num_groups(ch[0]), ch[0]),
-            nn.GELU(),
+            nn.ReflectionPad2d(1),
+            nn.Conv2d(3, ch[0], 3, 1, 0, bias=False), # padding=0
+            nn.GroupNorm(choose_num_groups(ch[0]), ch[0]), nn.GELU(),
             *[EfficientResBlock(ch[0]) for _ in range(blocks[0])]
         )
         
@@ -78,7 +78,7 @@ class AV1_EfficientRestorer(nn.Module):
         self.encoder3 = self._build_encoder_level(ch[2], ch[3], blocks[3], self.cond_dim)
         
         # Bottleneck with simple self-attention
-        self.bottleneck_down = nn.Conv2d(ch[3], ch[4], 3, 2, 1, padding_mode='reflect', bias=False)
+        self.bottleneck_down = nn.Sequential(nn.ReflectionPad2d(1), nn.Conv2d(ch[3], ch[4], 3, 2, 0, bias=False))
         self.bottleneck_gn = nn.GroupNorm(choose_num_groups(ch[4]), ch[4])
         self.bottleneck_pre_attn = nn.Sequential(*[EfficientResBlock(ch[4]) for _ in range(blocks[4] // 2)])
         self.bottleneck_attn = SimpleSelfAttention(ch[4])
@@ -91,13 +91,16 @@ class AV1_EfficientRestorer(nn.Module):
         self.decoder1 = self._build_decoder_level(ch[2], ch[1], blocks[1])
         
         # Output tail (upsample + residual)
-        self.tail_upsample_op = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        self.tail_upsample_op = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
         self.tail_upsample_conv = DepthwiseSeparable(ch[1], ch[0], stride=1)
         self.tail_gn = nn.GroupNorm(choose_num_groups(ch[0]), ch[0])
         self.tail_fusion = nn.Conv2d(ch[0] * 2, ch[0], 1, bias=False)
         self.tail_fusion_gn_act = nn.Sequential(nn.GroupNorm(choose_num_groups(ch[0]), ch[0]), nn.GELU())
         self.tail_body = nn.Sequential(*[EfficientResBlock(ch[0]) for _ in range(blocks[0])])
-        self.tail_pred = nn.Conv2d(ch[0], 3, 3, 1, 1, padding_mode='reflect')
+        self.tail_pred = nn.Sequential(
+            nn.ReflectionPad2d(1),
+            nn.Conv2d(ch[0], 3, 3, 1, 0)
+        )
         
         self._init_weights()
 
@@ -106,7 +109,8 @@ class AV1_EfficientRestorer(nn.Module):
         """Build a single encoder stage with downsampling, residual blocks, and FiLM conditioning."""
         return nn.ModuleDict({
             'downsample': nn.Sequential(
-                nn.Conv2d(in_ch, out_ch, 3, 2, 1, padding_mode='reflect', bias=False),
+                nn.ReflectionPad2d(1),                         # symmetric reflection pad
+                nn.Conv2d(in_ch, out_ch, 3, 2, 0, bias=False), # stride=2 conv with padding=0
                 nn.GroupNorm(choose_num_groups(out_ch), out_ch),
                 nn.GELU()
             ),
@@ -117,7 +121,7 @@ class AV1_EfficientRestorer(nn.Module):
     def _build_decoder_level(self, in_ch, out_ch, num_blocks):
         """Build a single decoder stage with upsampling, residual blocks, and skip fusion."""
         return nn.ModuleDict({
-            'upsample_op': nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            'upsample_op': nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
             'upsample_conv': DepthwiseSeparable(in_ch, out_ch, stride=1),
             'upsample_gn': nn.GroupNorm(choose_num_groups(out_ch), out_ch),
             'fusion': nn.Sequential(
@@ -217,7 +221,10 @@ class AV1_EfficientRestorer(nn.Module):
         t = self.tail_fusion(t)
         t = self.tail_fusion_gn_act(t)
         # run Wavelet block in float32 for stability
-        if isinstance(self.tail_body, nn.Sequential) and any(isinstance(m, WaveletRestorationBlock) for m in self.tail_body):
+        if isinstance(self.tail_body, WaveletRestorationBlock) or (
+            (isinstance(self.tail_body, nn.Sequential) and 
+            any(isinstance(m, WaveletRestorationBlock) for m in self.tail_body))
+        ):
             with torch.amp.autocast(device_type=str(lq_image.device.type), enabled=False):
                 t = self.tail_body(t.float())
         else:
@@ -261,7 +268,8 @@ class AV1_BalancedRestorer(nn.Module):
         
         # --- Input head (V1) ---
         self.head = nn.Sequential(
-            nn.Conv2d(3, ch[0], 3, 1, 1, padding_mode='reflect', bias=False),
+            nn.ReflectionPad2d(1),
+            nn.Conv2d(3, ch[0], 3, 1, 0, bias=False), # padding=0
             nn.GroupNorm(choose_num_groups(ch[0]), ch[0]), nn.GELU(),
             *[EfficientResBlock(ch[0]) for _ in range(blocks[0])]
         )
@@ -272,7 +280,7 @@ class AV1_BalancedRestorer(nn.Module):
         self.encoder3 = self._build_encoder_level(ch[2], ch[3], blocks[3], self.cond_dim)
         
         # --- Bottleneck (V3) ---
-        self.bottleneck_down = nn.Conv2d(ch[3], ch[4], 3, 2, 1, padding_mode='reflect', bias=False)
+        self.bottleneck_down = nn.Sequential(nn.ReflectionPad2d(1), nn.Conv2d(ch[3], ch[4], 3, 2, 0, bias=False))
         self.bottleneck_gn = nn.GroupNorm(choose_num_groups(ch[4]), ch[4])
         self.bottleneck_pre_attn = nn.Sequential(*[EfficientResBlock(ch[4]) for _ in range(blocks[4] // 2)])
         self.bottleneck_attn = SwinBottleneck(channels=ch[4], depth=4, num_heads=8, window_size=8)
@@ -285,13 +293,16 @@ class AV1_BalancedRestorer(nn.Module):
         self.decoder1 = self._build_decoder_level(ch[2], ch[1], blocks[1])
         
         # --- Output Tail (V1 fusion + V3 Wavelet) ---
-        self.tail_upsample_op = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        self.tail_upsample_op = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
         self.tail_upsample_conv = DepthwiseSeparable(ch[1], ch[0], stride=1)
         self.tail_gn = nn.GroupNorm(choose_num_groups(ch[0]), ch[0])
         self.tail_fusion = nn.Conv2d(ch[0] * 2, ch[0], 1, bias=False)
         self.tail_fusion_gn_act = nn.Sequential(nn.GroupNorm(choose_num_groups(ch[0]), ch[0]), nn.GELU())
         self.tail_body = WaveletRestorationBlock(ch[0])
-        self.tail_pred = nn.Conv2d(ch[0], 3, 3, 1, 1, padding_mode='reflect')
+        self.tail_pred = nn.Sequential(
+            nn.ReflectionPad2d(1),
+            nn.Conv2d(ch[0], 3, 3, 1, 0) # padding=0
+        )
         
         self._init_weights()
     
@@ -343,7 +354,8 @@ class AV1_QualityRestorer(nn.Module):
         
         # --- Input Head ---
         self.head = nn.Sequential(
-            nn.Conv2d(3, ch[0], 3, 1, 1, padding_mode='reflect', bias=False),
+            nn.ReflectionPad2d(1),
+            nn.Conv2d(3, ch[0], 3, 1, 0, bias=False), # padding=0
             nn.GroupNorm(choose_num_groups(ch[0]), ch[0]), nn.GELU(),
             *[EfficientResBlock(ch[0]) for _ in range(blocks[0])]
         )
@@ -372,7 +384,10 @@ class AV1_QualityRestorer(nn.Module):
             *[EfficientResBlock(ch[0]) for _ in range(blocks[0])],
             WaveletRestorationBlock(ch[0])
         )
-        self.tail_pred = nn.Conv2d(ch[0], 3, 3, 1, 1, padding_mode='reflect')
+        self.tail_pred = nn.Sequential(
+            nn.ReflectionPad2d(1),
+            nn.Conv2d(ch[0], 3, 3, 1, 0)
+        )
         
         self._init_weights()
 
@@ -380,8 +395,10 @@ class AV1_QualityRestorer(nn.Module):
         """V3 Encoder level with residuals, FiLM conditioning, and Wavelet blocks."""
         return nn.ModuleDict({
             'downsample': nn.Sequential(
-                nn.Conv2d(in_ch, out_ch, 3, 2, 1, padding_mode='reflect', bias=False),
-                nn.GroupNorm(choose_num_groups(out_ch), out_ch), nn.GELU()
+                nn.ReflectionPad2d(1),                         # symmetric reflection pad
+                nn.Conv2d(in_ch, out_ch, 3, 2, 0, bias=False), # stride=2 conv with padding=0
+                nn.GroupNorm(choose_num_groups(out_ch), out_ch),
+                nn.GELU()
             ),
             'body': nn.Sequential(*[EfficientResBlock(out_ch) for _ in range(num_blocks)]),
             'film': FiLMLayer(cond_dim, out_ch),
@@ -392,7 +409,7 @@ class AV1_QualityRestorer(nn.Module):
         """V3 Decoder level with upsample, residual body, and Wavelet."""
         return nn.ModuleDict({
             'upsample': nn.Sequential(
-                nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+                nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
                 DepthwiseSeparable(in_ch, out_ch, stride=1),
                 nn.GroupNorm(choose_num_groups(out_ch), out_ch), nn.GELU()
             ),
@@ -449,7 +466,7 @@ class AV1_QualityRestorer(nn.Module):
             # Add lateral (bottom-up) connection from previous (deeper) level
             if x_pff_prev is not None:
                 bottom_up = F.interpolate(
-                    x_pff_prev, size=x_fused.shape[-2:], mode='bilinear', align_corners=False
+                    x_pff_prev, size=x_fused.shape[-2:], mode='bilinear', align_corners=True
                 )
                 bottom_up = self.progressive_fusion.lateral[i-1](bottom_up) # V3 Feature
                 x_fused = x_fused + bottom_up

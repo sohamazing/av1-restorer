@@ -181,7 +181,10 @@ class DepthwiseSeparable(nn.Module):
     """
     def __init__(self, in_ch: int, out_ch: int, stride: int = 1, num_groups: int = 16):
         super().__init__()
-        self.depthwise = nn.Conv2d(in_ch, in_ch, 3, stride, 1, padding_mode='reflect', groups=in_ch, bias=False)
+        self.depthwise = nn.Sequential(
+            nn.ReflectionPad2d(1),
+            nn.Conv2d(in_ch, in_ch, 3, stride, 0, groups=in_ch, bias=False)
+        )
         self.pointwise = nn.Conv2d(in_ch, out_ch, 1, bias=False)
         self.norm = nn.GroupNorm(choose_num_groups(out_ch, num_groups), out_ch)
         self.act = nn.GELU()
@@ -323,7 +326,7 @@ class SimpleSelfAttention(nn.Module):
         self.out_proj = nn.Conv2d(self.hidden_ch, channels, 1)
         
         # Upsample back
-        self.upsample = nn.Upsample(scale_factor=reduction_factor, mode='bilinear', align_corners=False)
+        self.upsample = nn.Upsample(scale_factor=reduction_factor, mode='bilinear', align_corners=True)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         identity = x
@@ -690,10 +693,22 @@ class LearnableWaveletTransform(nn.Module):
         super().__init__()
         
         # Learnable analysis filters (decomposition)
-        self.conv_ll = nn.Conv2d(channels, channels, 3, stride=2, padding=1, groups=channels)
-        self.conv_lh = nn.Conv2d(channels, channels, 3, stride=2, padding=1, groups=channels)
-        self.conv_hl = nn.Conv2d(channels, channels, 3, stride=2, padding=1, groups=channels)
-        self.conv_hh = nn.Conv2d(channels, channels, 3, stride=2, padding=1, groups=channels)
+        self.conv_ll = nn.Sequential(
+            nn.ReflectionPad2d(1),
+            nn.Conv2d(channels, channels, 3, stride=2, padding=0, groups=channels)
+        )
+        self.conv_lh = nn.Sequential(
+            nn.ReflectionPad2d(1),
+            nn.Conv2d(channels, channels, 3, stride=2, padding=0, groups=channels)
+        )
+        self.conv_hl = nn.Sequential(
+            nn.ReflectionPad2d(1),
+            nn.Conv2d(channels, channels, 3, stride=2, padding=0, groups=channels)
+        )
+        self.conv_hh = nn.Sequential(
+            nn.ReflectionPad2d(1),
+            nn.Conv2d(channels, channels, 3, stride=2, padding=0, groups=channels)
+        )
         
         # Initialize with Haar-like patterns
         self._init_wavelet_filters()
@@ -785,7 +800,14 @@ class WaveletRestorationBlock(nn.Module):
         
         # Reconstruction (inverse wavelet)
         self.reconstruct = nn.Sequential(
-            nn.ConvTranspose2d(channels * 4, channels, 3, stride=2, padding=1, output_padding=1),
+            # --- SYMMETRY FIX 1: Upsampling is corner-aligned ---
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
+            
+            # --- SYMMETRY FIX 2: Padding is external and symmetric ---
+            nn.ReflectionPad2d(1),
+            nn.Conv2d(channels * 4, channels, 3, stride=1, padding=0), # <-- padding=0
+            # --- END FIX ---
+
             nn.GroupNorm(choose_num_groups(channels), channels),
             nn.GELU()
         )
@@ -990,9 +1012,9 @@ class DenseFeatureFusion(nn.Module):
         B, C, H, W = encoder_feat.shape
         
         # 1. Multi-scale pyramid context
-        p1 = F.interpolate(self.pyramid_1(decoder_feat), size=(H, W), mode='bilinear', align_corners=False)
-        p2 = F.interpolate(self.pyramid_2(decoder_feat), size=(H, W), mode='bilinear', align_corners=False)
-        p4 = F.interpolate(self.pyramid_4(decoder_feat), size=(H, W), mode='bilinear', align_corners=False)
+        p1 = F.interpolate(self.pyramid_1(decoder_feat), size=(H, W), mode='bilinear', align_corners=True)
+        p2 = F.interpolate(self.pyramid_2(decoder_feat), size=(H, W), mode='bilinear', align_corners=True)
+        p4 = F.interpolate(self.pyramid_4(decoder_feat), size=(H, W), mode='bilinear', align_corners=True)
         p8 = self.pyramid_8(decoder_feat)
         
         pyramid_feat = self.pyramid_fusion(torch.cat([p1, p2, p4, p8], dim=1))
@@ -1061,7 +1083,7 @@ class ProgressiveFeatureFusion(nn.Module):
                     refined_feats[-1], 
                     size=fused.shape[-2:], 
                     mode='bilinear', 
-                    align_corners=False
+                    align_corners=True
                 )
                 bottom_up = self.lateral[i-1](bottom_up)
                 fused = fused + bottom_up
