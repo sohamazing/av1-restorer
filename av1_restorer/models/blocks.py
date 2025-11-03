@@ -717,22 +717,23 @@ class LearnableWaveletTransform(nn.Module):
         """Initialize filters with Haar wavelet patterns (will be refined during training)."""
         with torch.no_grad():
             # LL: Low-pass (averaging)
-            self.conv_ll.weight.fill_(0.25)
+            # Access the Conv2d layer at index 1
+            self.conv_ll[1].weight.fill_(0.25)
             
             # LH: Horizontal high-pass
             lh_pattern = torch.tensor([[-1, -1, -1], [0, 0, 0], [1, 1, 1]]) / 6.0
-            for i in range(self.conv_lh.weight.size(0)):
-                self.conv_lh.weight[i, 0] = lh_pattern
+            for i in range(self.conv_lh[1].weight.size(0)):
+                self.conv_lh[1].weight[i, 0] = lh_pattern
             
             # HL: Vertical high-pass  
             hl_pattern = torch.tensor([[-1, 0, 1], [-1, 0, 1], [-1, 0, 1]]) / 6.0
-            for i in range(self.conv_hl.weight.size(0)):
-                self.conv_hl.weight[i, 0] = hl_pattern
+            for i in range(self.conv_hl[1].weight.size(0)):
+                self.conv_hl[1].weight[i, 0] = hl_pattern
             
             # HH: Diagonal high-pass
             hh_pattern = torch.tensor([[-1, 0, 1], [0, 0, 0], [1, 0, -1]]) / 4.0
-            for i in range(self.conv_hh.weight.size(0)):
-                self.conv_hh.weight[i, 0] = hh_pattern
+            for i in range(self.conv_hh[1].weight.size(0)):
+                self.conv_hh[1].weight[i, 0] = hh_pattern
     
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
