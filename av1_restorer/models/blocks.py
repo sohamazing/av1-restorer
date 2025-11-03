@@ -789,6 +789,8 @@ class WaveletRestorationBlock(nn.Module):
             nn.GroupNorm(choose_num_groups(channels), channels),
             nn.GELU()
         )
+
+        self.residual_scale = 0.1
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
