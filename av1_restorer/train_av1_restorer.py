@@ -249,9 +249,11 @@ class ConditionalUNetTrainer:
         
         # CUDA optimizations
         if self.device.type == 'cuda':
-            # torch.backends.cuda.matmul.allow_tf32 = True
-            # torch.backends.cudnn.allow_tf32 = True
-            torch.backends.cuda.matmul.fp32_precision = 'tf32'
+            # old api
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            # new api
+            # torch.backends.cuda.matmul.fp32_precision = 'tf32' 
             logger.info("Enabled TF32 for CUDA")
         
         # Random seed
