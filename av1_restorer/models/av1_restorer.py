@@ -166,32 +166,29 @@ class AV1_EfficientRestorer(nn.Module):
         e1 = self.encoder1['downsample'](skip0)
         e1 = self.encoder1['body'](e1)
         e1 = self.encoder1['film'](e1, cond)
-        e1 = torch.clamp(e1, -10.0, 10.0)
         skip1 = e1
 
         e2 = self.encoder2['downsample'](skip1)
         e2 = self.encoder2['body'](e2)
         e2 = self.encoder2['film'](e2, cond)
-        e2 = torch.clamp(e2, -10.0, 10.0)
         skip2 = e2
         
         e3 = self.encoder3['downsample'](skip2)
         e3 = self.encoder3['body'](e3)
         e3 = self.encoder3['film'](e3, cond)
-        e3 = torch.clamp(e3, -10.0, 10.0)
         skip3 = e3
         
         b = self.bottleneck_down(skip3)
         b = F.gelu(self.bottleneck_gn(b))
-        b = torch.clamp(b, -10., 10.)
+        b = torch.clamp(b, -10.0, 10.0)
         b = self.bottleneck_pre_attn(b)
-        # --- Add new stability clamps around the SwinBottleneck ---
-        b = torch.clamp(b, -10., 10.)  # <-- CLAMP INPUT to Swin
-        b = self.bottleneck_attn(b)
-        b = torch.clamp(b, -10., 10.)  # <-- CLAMP OUTPUT of Swin
-        # --- End fix ---
+        
+        # run SimpleSelfAttention in float32 for stability 
+        with torch.amp.autocast(device_type=str(lq_image.device.type), enabled=False):
+            b = self.bottleneck_attn(b.float())
+        
         b = self.bottleneck_film(b, cond)
-        b = torch.clamp(b, -10., 10.)
+        b = torch.clamp(b, -10.0, 10.0)
         b = self.bottleneck_post_attn(b)
         
         d3 = self.decoder3['upsample_op'](b)
@@ -219,7 +216,12 @@ class AV1_EfficientRestorer(nn.Module):
         t = torch.cat([t, skip0], dim=1)
         t = self.tail_fusion(t)
         t = self.tail_fusion_gn_act(t)
-        t = self.tail_body(t)
+        # run Wavelet block in float32 for stability
+        if isinstance(self.tail_body, nn.Sequential) and any(isinstance(m, WaveletRestorationBlock) for m in self.tail_body):
+            with torch.amp.autocast(device_type=str(lq_image.device.type), enabled=False):
+                t = self.tail_body(t.float())
+        else:
+            t = self.tail_body(t)
 
         residual = self.tail_pred(t)
         
@@ -418,14 +420,16 @@ class AV1_QualityRestorer(nn.Module):
             x = encoder['body'](x)
             x = encoder['film'](x, cond)
             x = torch.clamp(x, -10.0, 10.0)
-            x = encoder['wavelet'](x) # V3 Feature
+            with torch.amp.autocast(device_type=str(lq_image.device.type), enabled=False):
+                x = encoder['wavelet'](x.float())
             skips.append(x) # skips = [s0, s1, s2, s3, s4]
             
         # 4. Bottleneck
         x = skips.pop() # x = s4 (ch[4])
-        x = torch.clamp(x, -10.0, 10.0) # Stability
-        x = self.bottleneck(x)
-        x = torch.clamp(x, -10.0, 10.0) # Stability
+        # run SwinBottleneck in float32 for stability
+        with torch.amp.autocast(device_type=str(lq_image.device.type), enabled=False):
+            x = self.bottleneck(x.float())
+
         x = self.bottleneck_film(x, cond)
         x = torch.clamp(x, -10.0, 10.0) # Stability
         
@@ -452,13 +456,15 @@ class AV1_QualityRestorer(nn.Module):
                 
             # Run the main body of this decoder level
             x = decoder['body'](x_fused)
-            x = decoder['wavelet'](x) # V3 Feature
+            with torch.amp.autocast(device_type=str(lq_image.device.type), enabled=False):
+                x = decoder['wavelet'](x.float()) # run Wavelet block in float32 for stability
                 
             x_pff_prev = x # Store this output for the next iteration
             
         # 6. Tail
         # x is now the final, full-res output from the decoder loop (ch[0])
-        x = self.tail_body(x)
+        with torch.amp.autocast(device_type=str(lq_image.device.type), enabled=False):
+            x = self.tail_body(x.float()) # run Wavelet block in float32 for stability
         residual = self.tail_pred(x)
         
         # 7. Residual Connection

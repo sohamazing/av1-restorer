@@ -344,21 +344,30 @@ class SimpleSelfAttention(nn.Module):
         q = q.view(B, C_h, N)  # [B, hidden_ch, N]
         k = k.view(B, C_h, N)
         v = v.view(B, C_h, N)
+
+        # keep track of original dtype to cast result back
+        orig_dtype = q.dtype
+        device_type = str(x.device.type)
+
+        with torch.amp.autocast(device_type=device_type, enabled=False):
+            q_fp32 = q.float()            # [B, hidden_ch, N]
+            k_fp32 = k.float()
+            v_fp32 = v.float()
         
-        # Channel attention: Q @ K^T (attend in channel space)
-        attn_scores = torch.bmm(q, k.transpose(1, 2))  # [B, hidden_ch, hidden_ch]
-        attn_scores = attn_scores / (C_h ** 0.5)  # Scale
-        attn_weights = F.softmax(attn_scores, dim=-1)
-        
-        # Apply attention to values
-        attended = torch.bmm(attn_weights, v)  # [B, hidden_ch, N]
-        attended = attended.view(B, C_h, H_r, W_r)
-        
-        # Project back to original channels
-        out = self.out_proj(attended)  # [B, C, H/2, W/2]
-        
-        # Upsample to original resolution
-        out = self.upsample(out)  # [B, C, H, W]
+            # Channel attention: Q @ K^T (attend in channel space)
+            attn_scores = torch.bmm(q_fp32, k_fp32.transpose(1, 2))  # [B, hidden_ch, hidden_ch]
+            attn_scores = attn_scores / (C_h ** 0.5)  # Scale
+            attn_weights = F.softmax(attn_scores, dim=-1)
+            
+            # Apply attention to values
+            attended_fp32 = torch.bmm(attn_weights, v_fp32)  # [B, hidden_ch, N]
+            attended_fp32 = attended_fp32.view(B, C_h, H_r, W_r)
+
+            # Project back to original channels
+            out_fp32 = self.out_proj(attended_fp32)  # [B, C, H/2, W/2]
+
+            # Upsample to original resolution
+            out = self.upsample(out_fp32)             # [B, C, H, W]
         
         return identity + out  # Residual connection
 
@@ -494,29 +503,38 @@ class WindowAttention(nn.Module):
             mask: Attention mask for shifted windows
         """
         B_, N, C = x.shape
-        qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-        
-        q = q * self.scale
-        attn = (q @ k.transpose(-2, -1))
-        
-        # Add relative position bias
-        relative_position_bias = self.relative_position_bias_table[
-            self.relative_position_index.view(-1)
-        ].view(self.window_size * self.window_size, self.window_size * self.window_size, -1)
-        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()
-        attn = attn + relative_position_bias.unsqueeze(0)
-        
-        if mask is not None:
-            nW = mask.shape[0]
-            attn = attn.view(B_ // nW, nW, self.num_heads, N, N)
-            attn = attn + mask.unsqueeze(1).unsqueeze(0)
-            attn = attn.view(-1, self.num_heads, N, N)
-        
-        attn = F.softmax(attn, dim=-1)
-        
-        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
-        x = self.proj(x)
+        orig_dtype = x.dtype
+        device_type = str(x.device.type)
+
+        with torch.amp.autocast(device_type=device_type, enabled=False):
+            qkv = self.qkv(x.float()).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+            q, k, v = qkv[0], qkv[1], qkv[2]   # all fp32
+
+            q = q * self.scale
+            attn = (q @ k.transpose(-2, -1))   # fp32 matmul
+
+            # Relative position bias (already fp32 here)
+            relative_position_bias = self.relative_position_bias_table[
+                self.relative_position_index.view(-1)
+            ].view(self.window_size * self.window_size, self.window_size * self.window_size, -1)
+            relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()
+            relative_position_bias = relative_position_bias.unsqueeze(0)
+
+            attn = attn + relative_position_bias
+
+            if mask is not None:
+                nW = mask.shape[0]
+                attn = attn.view(B_ // nW, nW, self.num_heads, N, N)
+                attn = attn + mask.unsqueeze(1).unsqueeze(0)
+                attn = attn.view(-1, self.num_heads, N, N)
+
+            attn = F.softmax(attn, dim=-1)
+
+            x_fp32 = (attn @ v).transpose(1, 2).reshape(B_, N, C)
+            x_fp32 = self.proj(x_fp32)
+
+        # Cast back to original dtype
+        x = x_fp32.to(orig_dtype)
         return x
 
 
@@ -588,7 +606,8 @@ class SwinTransformerBlock(nn.Module):
         x_windows = x_windows.view(-1, self.window_size * self.window_size, C)
         
         # Window attention
-        attn_windows = self.attn(x_windows)
+        with torch.amp.autocast(device_type=str(x_windows.device.type), enabled=False):
+            attn_windows = self.attn(x_windows.float())
         
         # Merge windows
         attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
@@ -784,7 +803,14 @@ class WaveletRestorationBlock(nn.Module):
         identity = x
         
         # Decompose into subbands
-        ll, lh, hl, hh = self.dwt(x)
+        with torch.amp.autocast(device_type=str(x.device.type), enabled=False):
+            ll, lh, hl, hh = self.dwt(x.float())
+
+        orig_dtype = x.dtype
+        ll = ll.to(orig_dtype)
+        lh = lh.to(orig_dtype)
+        hl = hl.to(orig_dtype)
+        hh = hh.to(orig_dtype)
         
         # Process each subband independently
         ll_proc = self.process_ll(ll)
@@ -794,7 +820,11 @@ class WaveletRestorationBlock(nn.Module):
         
         # Concatenate and reconstruct
         merged = torch.cat([ll_proc, lh_proc, hl_proc, hh_proc], dim=1)
-        reconstructed = self.reconstruct(merged)
+        # run reconstruction in float32 for stability
+        with torch.amp.autocast(device_type=str(merged.device.type), enabled=False):
+            reconstructed_fp32 = self.reconstruct(merged.float())
+        # cast back to original dtype and apply residual scaling
+        reconstructed = (reconstructed_fp32 * self.residual_scale).to(orig_dtype)
         
         # Residual connection
         return identity + reconstructed
