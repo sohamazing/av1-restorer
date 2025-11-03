@@ -21,7 +21,7 @@ from typing import Tuple, Optional
 import logging
 
 # Import core building blocks
-from blocks import (
+from .blocks import (
     DepthwiseSeparable,
     EfficientResBlock,
     SimpleSelfAttention,
