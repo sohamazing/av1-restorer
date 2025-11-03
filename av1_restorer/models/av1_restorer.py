@@ -181,9 +181,18 @@ class AV1_EfficientRestorer(nn.Module):
         e3 = torch.clamp(e3, -10.0, 10.0)
         skip3 = e3
         
-        b = self.bottleneck_down(skip3); b = F.gelu(self.bottleneck_gn(b)); b = torch.clamp(b, -10., 10.)
-        b = self.bottleneck_pre_attn(b); b = self.bottleneck_attn(b); b = self.bottleneck_film(b, cond)
-        b = torch.clamp(b, -10., 10.); b = self.bottleneck_post_attn(b)
+        b = self.bottleneck_down(skip3)
+        b = F.gelu(self.bottleneck_gn(b))
+        b = torch.clamp(b, -10., 10.)
+        b = self.bottleneck_pre_attn(b)
+        # --- Add new stability clamps around the SwinBottleneck ---
+        b = torch.clamp(b, -10., 10.)  # <-- CLAMP INPUT to Swin
+        b = self.bottleneck_attn(b)
+        b = torch.clamp(b, -10., 10.)  # <-- CLAMP OUTPUT of Swin
+        # --- End fix ---
+        b = self.bottleneck_film(b, cond)
+        b = torch.clamp(b, -10., 10.)
+        b = self.bottleneck_post_attn(b)
         
         d3 = self.decoder3['upsample_op'](b)
         d3 = self.decoder3['upsample_conv'](d3)
