@@ -148,9 +148,20 @@ class AV1_EfficientRestorer(nn.Module):
                 nn.init.xavier_uniform_(m.weight, gain=0.5)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-        nn.init.zeros_(self.tail_pred.weight)
-        if self.tail_pred.bias is not None:
-            nn.init.zeros_(self.tail_pred.bias)
+        # --- FIX: Access Conv2d at index 1 within the Sequential block ---
+        if isinstance(self.tail_pred, nn.Sequential):
+            nn.init.zeros_(self.tail_pred[1].weight)
+            if self.tail_pred[1].bias is not None:
+                nn.init.zeros_(self.tail_pred[1].bias)
+        else:
+            # Fallback for old models (if any)
+            nn.init.zeros_(self.tail_pred.weight)
+            if self.tail_pred.bias is not None:
+                nn.init.zeros_(self.tail_pred.bias)
+        # --- END FIX ---
+        # nn.init.zeros_(self.tail_pred.weight)
+        # if self.tail_pred.bias is not None:
+        #     nn.init.zeros_(self.tail_pred.bias)
         logger.info("✓ Weights initialized (tail_pred zeroed for residual learning)")
 
     # --- Forward pass ---
@@ -167,20 +178,40 @@ class AV1_EfficientRestorer(nn.Module):
         cond = self.conditioning_embedder(crf, preset)
         skip0 = self.head(lq_image)
         
+        # e1 = self.encoder1['downsample'](skip0)
+        # e1 = self.encoder1['body'](e1)
+        # e1 = self.encoder1['film'](e1, cond)
+        # skip1 = e1
+
+        # e2 = self.encoder2['downsample'](skip1)
+        # e2 = self.encoder2['body'](e2)
+        # e2 = self.encoder2['film'](e2, cond)
+        # skip2 = e2
+
+        # e3 = self.encoder3['downsample'](skip2)
+        # e3 = self.encoder3['body'](e3)
+        # e3 = self.encoder3['film'](e3, cond)
+        # skip3 = e3
+
+        # --- STABILITY FIX: Run encoder body in float32 on MPS ---
         e1 = self.encoder1['downsample'](skip0)
-        e1 = self.encoder1['body'](e1)
+        with torch.amp.autocast(device_type=str(lq_image.device.type), enabled=False):
+            e1 = self.encoder1['body'](e1.float())
         e1 = self.encoder1['film'](e1, cond)
         skip1 = e1
 
         e2 = self.encoder2['downsample'](skip1)
-        e2 = self.encoder2['body'](e2)
+        with torch.amp.autocast(device_type=str(lq_image.device.type), enabled=False):
+            e2 = self.encoder2['body'](e2.float())
         e2 = self.encoder2['film'](e2, cond)
         skip2 = e2
-        
+
         e3 = self.encoder3['downsample'](skip2)
-        e3 = self.encoder3['body'](e3)
+        with torch.amp.autocast(device_type=str(lq_image.device.type), enabled=False):
+            e3 = self.encoder3['body'](e3.float())
         e3 = self.encoder3['film'](e3, cond)
         skip3 = e3
+        # --- END STABILITY FIX ---
         
         b = self.bottleneck_down(skip3)
         b = F.gelu(self.bottleneck_gn(b))
@@ -195,24 +226,54 @@ class AV1_EfficientRestorer(nn.Module):
         b = torch.clamp(b, -10.0, 10.0)
         b = self.bottleneck_post_attn(b)
         
+        # d3 = self.decoder3['upsample_op'](b)
+        # d3 = self.decoder3['upsample_conv'](d3)
+        # d3 = F.gelu(self.decoder3['upsample_gn'](d3))
+        # d3 = torch.cat([d3, skip3], dim=1)
+        # d3 = self.decoder3['fusion'](d3)
+        # d3 = self.decoder3['body'](d3)
+        
+        # d2 = self.decoder2['upsample_op'](d3)
+        # d2 = self.decoder2['upsample_conv'](d2)
+        # d2 = F.gelu(self.decoder2['upsample_gn'](d2))
+        # d2 = torch.cat([d2, skip2], dim=1)
+        # d2 = self.decoder2['fusion'](d2)
+        # d2 = self.decoder2['body'](d2)
+        
+        # d1 = self.decoder1['upsample_op'](d2)
+        # d1 = self.decoder1['upsample_conv'](d1)
+        # d1 = F.gelu(self.decoder1['upsample_gn'](d1))
+        # d1 = torch.cat([d1, skip1], dim=1); d1 = self.decoder1['fusion'](d1); d1 = self.decoder1['body'](d1)
+
         d3 = self.decoder3['upsample_op'](b)
         d3 = self.decoder3['upsample_conv'](d3)
         d3 = F.gelu(self.decoder3['upsample_gn'](d3))
         d3 = torch.cat([d3, skip3], dim=1)
         d3 = self.decoder3['fusion'](d3)
-        d3 = self.decoder3['body'](d3)
+        # --- STABILITY FIX: Run decoder body in float32 on MPS ---
+        with torch.amp.autocast(device_type=str(lq_image.device.type), enabled=False):
+            d3 = self.decoder3['body'](d3.float())
+        # --- END STABILITY FIX ---
         
         d2 = self.decoder2['upsample_op'](d3)
         d2 = self.decoder2['upsample_conv'](d2)
         d2 = F.gelu(self.decoder2['upsample_gn'](d2))
         d2 = torch.cat([d2, skip2], dim=1)
         d2 = self.decoder2['fusion'](d2)
-        d2 = self.decoder2['body'](d2)
+        # --- STABILITY FIX: Run decoder body in float32 on MPS ---
+        with torch.amp.autocast(device_type=str(lq_image.device.type), enabled=False):
+            d2 = self.decoder2['body'](d2.float())
+        # --- END STABILITY FIX ---
         
         d1 = self.decoder1['upsample_op'](d2)
         d1 = self.decoder1['upsample_conv'](d1)
         d1 = F.gelu(self.decoder1['upsample_gn'](d1))
-        d1 = torch.cat([d1, skip1], dim=1); d1 = self.decoder1['fusion'](d1); d1 = self.decoder1['body'](d1)
+        d1 = torch.cat([d1, skip1], dim=1)
+        d1 = self.decoder1['fusion'](d1)
+        # --- STABILITY FIX: Run decoder body in float32 on MPS ---
+        with torch.amp.autocast(device_type=str(lq_image.device.type), enabled=False):
+            d1 = self.decoder1['body'](d1.float())
+        # --- END STABILITY FIX ---
         
         t = self.tail_upsample_op(d1)
         t = self.tail_upsample_conv(t)
@@ -221,14 +282,8 @@ class AV1_EfficientRestorer(nn.Module):
         t = self.tail_fusion(t)
         t = self.tail_fusion_gn_act(t)
         # run Wavelet block in float32 for stability
-        if isinstance(self.tail_body, WaveletRestorationBlock) or (
-            (isinstance(self.tail_body, nn.Sequential) and 
-            any(isinstance(m, WaveletRestorationBlock) for m in self.tail_body))
-        ):
-            with torch.amp.autocast(device_type=str(lq_image.device.type), enabled=False):
-                t = self.tail_body(t.float())
-        else:
-            t = self.tail_body(t)
+        with torch.amp.autocast(device_type=str(lq_image.device.type), enabled=False):
+            t = self.tail_body(t.float())
 
         residual = self.tail_pred(t)
         

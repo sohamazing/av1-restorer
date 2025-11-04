@@ -360,6 +360,7 @@ class SimpleSelfAttention(nn.Module):
             # Channel attention: Q @ K^T (attend in channel space)
             attn_scores = torch.bmm(q_fp32, k_fp32.transpose(1, 2))  # [B, hidden_ch, hidden_ch]
             attn_scores = attn_scores / (C_h ** 0.5)  # Scale
+            attn_scores = torch.clamp(attn_scores, -50.0, 50.0) # clamp
             attn_weights = F.softmax(attn_scores, dim=-1)
             
             # Apply attention to values
@@ -531,6 +532,7 @@ class WindowAttention(nn.Module):
                 attn = attn + mask.unsqueeze(1).unsqueeze(0)
                 attn = attn.view(-1, self.num_heads, N, N)
 
+            attn = torch.clamp(attn, -50.0, 50.0) # clamp
             attn = F.softmax(attn, dim=-1)
 
             x_fp32 = (attn @ v).transpose(1, 2).reshape(B_, N, C)
