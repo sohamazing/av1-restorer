@@ -400,6 +400,7 @@ class AV1_BalancedRestorer(nn.Module):
         self.tail_fusion = nn.Conv2d(ch[0] * 2, ch[0], 1, bias=False)
         self.tail_fusion_gn_act = nn.Sequential(nn.GroupNorm(choose_num_groups(ch[0]), ch[0]), nn.GELU())
         self.tail_body = WaveletRestorationBlock(ch[0])
+        self.tail_residual_scale = nn.Parameter(torch.zeros(1))
         self.tail_pred = nn.Sequential(
             nn.ReflectionPad2d(1),
             nn.Conv2d(ch[0], 3, 3, 1, 0) # padding=0
