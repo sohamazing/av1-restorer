@@ -119,19 +119,33 @@ class ConditioningEmbedder(nn.Module):
         """
         Generates the conditioning vector (128-dim or 192-dim).
         """
-        crf_norm = self._normalize(crf, self.crf_min, self.crf_max)
-        crf_emb = self.crf_embedder(crf_norm)
+        # --- START STABILITY FIX ---
+        # 1. Replace any NaN/Inf from the dataloader. 
+        #    Use a 'reasonable' default (e.g., the min value).
+        crf = torch.nan_to_num(crf, nan=self.crf_min, posinf=self.crf_max, neginf=self.crf_min)
         
+        # 2. Clamp to the expected range *before* normalization.
+        crf_clamped = torch.clamp(crf, self.crf_min, self.crf_max)
+        # --- END STABILITY FIX ---
+
+        crf_norm = self._normalize(crf_clamped, self.crf_min, self.crf_max)
+        crf_emb = self.crf_embedder(crf_norm)
+
         # Determine conditioning mode
         if preset is not None and self.preset_max != self.preset_min:
-            # CRF + Preset Mode (192-dim)
-            preset_norm = self._normalize(preset, self.preset_min, self.preset_max)
+            # --- START STABILITY FIX ---
+            # Also sanitize the preset tensor
+            preset = torch.nan_to_num(preset, nan=self.preset_min, posinf=self.preset_max, neginf=self.preset_min)
+            preset_clamped = torch.clamp(preset, self.preset_min, self.preset_max)
+            # --- END STABILITY FIX ---
+            
+            preset_norm = self._normalize(preset_clamped, self.preset_min, self.preset_max)
             preset_emb = self.preset_embedder(preset_norm)
             cond = torch.cat([crf_emb, preset_emb], dim=1)
         else:
             # CRF-Only Mode (128-dim)
             cond = crf_emb
-        
+
         # CRITICAL: Clamp embeddings for stability
         return torch.clamp(cond, min=-10.0, max=10.0)
 

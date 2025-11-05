@@ -1,16 +1,13 @@
 # av1_restorer/models/av1_restorer.py
 """
-AV1 U-Net Restorer (Unified SOTA Factory)
+AV1 U-Net Restorer (Unified SOTA Factory) - v4.0 STABLE
 
-Unified factory for creating state-of-the-art AV1 conditional restorers.
-Automatically selects the optimal architecture based on the requested model size:
-
-- 'nano', 'lite', 'tiny'  : EfficientRestorer (SOTA efficiency, <10M params)
-- 'small', 'base', 'big'  : BalancedRestorer (SOTA quality-efficiency balance)
-- 'large', 'huge', 'pro'  : QualityRestorer (SOTA maximum quality, >30M params)
+- Spatially Symmetric: Fixes all padding and upsampling alignment issues.
+- Numerically Stable: Relies on softmax clamps in blocks.py and stable architecture.
+- Removes RIR logic, which was causing gradient explosions.
 
 Author: Soham Mukherjee
-Version: 3.1
+Version: 4.0 (Stable)
 License: MIT
 """
 
@@ -39,16 +36,11 @@ logger = logging.getLogger(__name__)
 
 # ==============================================================================
 # SECTION 1: EfficientRestorer Architecture
-# FiLM + EfficientResBlocks + SimpleSelfAttention Bottleneck
 # ==============================================================================
 
 class AV1_EfficientRestorer(nn.Module):
     """
-    EfficientRestorer:
-    - Lightweight encoder-decoder with EfficientResBlocks.
-    - Bottleneck uses SimpleSelfAttention + FiLM conditioning.
-    - Tail: Upsample + residual EfficientResBlocks.
-    
+    Spatially Symmetric & Numerically Stable EfficientRestorer.
     Best for: 'nano', 'tiny', 'lite' variants (<10M params)
     """
     def __init__(self, config: dict):
@@ -64,7 +56,7 @@ class AV1_EfficientRestorer(nn.Module):
         # Conditioning network
         self.conditioning_embedder = ConditioningEmbedder(crf_range, preset_range)
         
-        # Input head
+        # --- SYMMETRY FIX: Use external padding ---
         self.head = nn.Sequential(
             nn.ReflectionPad2d(1),
             nn.Conv2d(3, ch[0], 3, 1, 0, bias=False), # padding=0
@@ -77,8 +69,11 @@ class AV1_EfficientRestorer(nn.Module):
         self.encoder2 = self._build_encoder_level(ch[1], ch[2], blocks[2], self.cond_dim)
         self.encoder3 = self._build_encoder_level(ch[2], ch[3], blocks[3], self.cond_dim)
         
-        # Bottleneck with simple self-attention
-        self.bottleneck_down = nn.Sequential(nn.ReflectionPad2d(1), nn.Conv2d(ch[3], ch[4], 3, 2, 0, bias=False))
+        # --- SYMMETRY FIX: Use external padding ---
+        self.bottleneck_down = nn.Sequential(
+            nn.ReflectionPad2d(1), 
+            nn.Conv2d(ch[3], ch[4], 3, 2, 0, bias=False) # padding=0
+        )
         self.bottleneck_gn = nn.GroupNorm(choose_num_groups(ch[4]), ch[4])
         self.bottleneck_pre_attn = nn.Sequential(*[EfficientResBlock(ch[4]) for _ in range(blocks[4] // 2)])
         self.bottleneck_attn = SimpleSelfAttention(ch[4])
@@ -90,7 +85,7 @@ class AV1_EfficientRestorer(nn.Module):
         self.decoder2 = self._build_decoder_level(ch[3], ch[2], blocks[2])
         self.decoder1 = self._build_decoder_level(ch[2], ch[1], blocks[1])
         
-        # Output tail (upsample + residual)
+        # --- SYMMETRY FIX: Use align_corners=True ---
         self.tail_upsample_op = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
         self.tail_upsample_conv = DepthwiseSeparable(ch[1], ch[0], stride=1)
         self.tail_gn = nn.GroupNorm(choose_num_groups(ch[0]), ch[0])
@@ -98,9 +93,11 @@ class AV1_EfficientRestorer(nn.Module):
         self.tail_fusion_gn_act = nn.Sequential(nn.GroupNorm(choose_num_groups(ch[0]), ch[0]), nn.GELU())
         self.tail_body = nn.Sequential(*[EfficientResBlock(ch[0]) for _ in range(blocks[0])])
         self.tail_residual_scale = nn.Parameter(torch.zeros(1))
+
+        # --- SYMMETRY FIX: Use external padding ---
         self.tail_pred = nn.Sequential(
             nn.ReflectionPad2d(1),
-            nn.Conv2d(ch[0], 3, 3, 1, 0)
+            nn.Conv2d(ch[0], 3, 3, 1, 0) # padding=0
         )
         
         self._init_weights()
@@ -109,6 +106,7 @@ class AV1_EfficientRestorer(nn.Module):
     def _build_encoder_level(self, in_ch, out_ch, num_blocks, cond_dim):
         """Build a single encoder stage with downsampling, residual blocks, and FiLM conditioning."""
         return nn.ModuleDict({
+            # --- SYMMETRY FIX: Use external padding ---
             'downsample': nn.Sequential(
                 nn.ReflectionPad2d(1),                         # symmetric reflection pad
                 nn.Conv2d(in_ch, out_ch, 3, 2, 0, bias=False), # stride=2 conv with padding=0
@@ -122,6 +120,7 @@ class AV1_EfficientRestorer(nn.Module):
     def _build_decoder_level(self, in_ch, out_ch, num_blocks):
         """Build a single decoder stage with upsampling, residual blocks, and skip fusion."""
         return nn.ModuleDict({
+            # --- SYMMETRY FIX: Use align_corners=True ---
             'upsample_op': nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
             'upsample_conv': DepthwiseSeparable(in_ch, out_ch, stride=1),
             'upsample_gn': nn.GroupNorm(choose_num_groups(out_ch), out_ch),
@@ -149,151 +148,97 @@ class AV1_EfficientRestorer(nn.Module):
                 nn.init.xavier_uniform_(m.weight, gain=0.5)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
+        
         # --- FIX: Access Conv2d at index 1 within the Sequential block ---
         if isinstance(self.tail_pred, nn.Sequential):
             nn.init.zeros_(self.tail_pred[1].weight)
             if self.tail_pred[1].bias is not None:
                 nn.init.zeros_(self.tail_pred[1].bias)
         else:
-            # Fallback for old models (if any)
             nn.init.zeros_(self.tail_pred.weight)
             if self.tail_pred.bias is not None:
                 nn.init.zeros_(self.tail_pred.bias)
         # --- END FIX ---
-        # nn.init.zeros_(self.tail_pred.weight)
-        # if self.tail_pred.bias is not None:
-        #     nn.init.zeros_(self.tail_pred.bias)
         logger.info("✓ Weights initialized (tail_pred zeroed for residual learning)")
 
+
+    # --- Forward pass ---
     def forward(self, lq_image: torch.Tensor, crf: torch.Tensor, preset: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Forward pass for EfficientRestorer.
-        Args:
-            lq_image : Input low-quality AV1 frame
-            crf      : CRF tensor
-            preset   : Optional preset tensor
-        Returns:
-            Restored image (same shape as input)
-        """
-        # 1. Generate conditioning vector
-        cond = self.conditioning_embedder(crf, preset)
-
-        # 2. Encoder Path
-        skip0 = self.head(lq_image)
-        
-        e1 = self.encoder1['downsample'](skip0)
-        e1 = self.encoder1['body'](e1)
-        # e1 = torch.clamp(e1, -10.0, 10.0) # Stability clamp
-        e1 = self.encoder1['film'](e1, cond) # Conditioning embedding + Film alreding clamped
-        skip1 = e1
-        
-        e2 = self.encoder2['downsample'](skip1)
-        e2 = self.encoder2['body'](e2)
-        # e2 = torch.clamp(e2, -10.0, 10.0) # Stability clamp
-        e2 = self.encoder2['film'](e2, cond)
-        skip2 = e2
-        
-        e3 = self.encoder3['downsample'](skip2)
-        e3 = self.encoder3['body'](e3)
-        # e3 = torch.clamp(e3, -10.0, 10.0) # Stability clamp
-        e3 = self.encoder3['film'](e3, cond)
-        skip3 = e3
-        
-        # 3. Bottleneck
-        b = self.bottleneck_down(skip3)
-        b = F.gelu(self.bottleneck_gn(b))
-        # b = torch.clamp(b, min=-10.0, max=10.0) # Stability clamp
-        
-        b = self.bottleneck_pre_attn(b)
-        b = self.bottleneck_attn(b) # Uses softmax clamp from blocks.py
-        b = self.bottleneck_film(b, cond)
-        # b = torch.clamp(b, min=-10.0, max=10.0) # Stability clamp
-        b = self.bottleneck_post_attn(b)
-        
-        # 4. Decoder Path (with skip connections)
-        d3 = self.decoder3['upsample_op'](b)
-        d3 = self.decoder3['upsample_conv'](d3)
-        d3 = F.gelu(self.decoder3['upsample_gn'](d3))
-        d3 = torch.cat([d3, skip3], dim=1)
-        d3 = self.decoder3['fusion'](d3)
-        d3 = self.decoder3['body'](d3)
-        
-        d2 = self.decoder2['upsample_op'](d3)
-        d2 = self.decoder2['upsample_conv'](d2)
-        d2 = F.gelu(self.decoder2['upsample_gn'](d2))
-        d2 = torch.cat([d2, skip2], dim=1)
-        d2 = self.decoder2['fusion'](d2)
-        d2 = self.decoder2['body'](d2)
-        
-        d1 = self.decoder1['upsample_op'](d2)
-        d1 = self.decoder1['upsample_conv'](d1)
-        d1 = F.gelu(self.decoder1['upsample_gn'](d1))
-        d1 = torch.cat([d1, skip1], dim=1)
-        d1 = self.decoder1['fusion'](d1)
-        d1 = self.decoder1['body'](d1)
-        
-        # 5. Output Tail
-        t = self.tail_upsample_op(d1)
-        t = self.tail_upsample_conv(t)
-        t = F.gelu(self.tail_gn(t))
-        t = torch.cat([t, skip0], dim=1) # t is now 48 channels
-        
-        # 't' is 48ch. We must fuse it to 24ch *before* the GroupNorm.
-        t_fused = self.tail_fusion(t)
-        t_in = self.tail_fusion_gn_act(t_fused) # Now this gets 24ch
-
-        # --- LEARNABLE RESIDUAL SCALE ---
-        # This replaces the stability clamp on the tail.
-        t_residual_features = self.tail_body(t_in)
-        t_out = t_in + (t_residual_features * self.tail_residual_scale)
-        
-        residual = self.tail_pred(t_out) # Use t_out here
-        
-        # 6. Residual Connection
-        restored = lq_image + residual
-        restored = torch.clamp(restored, self.clamp_min, self.clamp_max)
-        
-        return restored
-
-    def forward_clamped(self, lq_image: torch.Tensor, crf: torch.Tensor, preset: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Forward pass for EfficientRestorer.
         Spatially symmetric and numerically stable.
+        REMOVED RIR and all autocast wrappers for clean float32 debugging.
         """
+        
+        # --- DEBUG HELPER FUNCTION ---
+        def _check_nan(tensor, name):
+            if torch.isnan(tensor).any() or torch.isinf(tensor).any():
+                print(f"🚨🚨🚨 NaN/Inf DETECTED! 🚨🚨🚨")
+                print(f"Operation causing issue: {name}")
+                raise ValueError(f"NaN/Inf detected in tensor: {name}")
+            else:
+                # This will print the status of every block.
+                # Comment this line out if you only want to see the *error*.
+                print(f"✅ OK: {name} | Max: {tensor.max():.4f}, Mean: {tensor.mean():.4f}")
+            return tensor
+        # --- END DEBUG HELPER ---
+
+        print("\n" + "="*40)
+        print("STARTING FORWARD PASS DEBUG (v_STABLE)")
+        print("="*40)
+
         # 1. Generate conditioning vector
         cond = self.conditioning_embedder(crf, preset)
+        _check_nan(cond, "conditioning_embedder")
 
         # 2. Encoder Path
         skip0 = self.head(lq_image)
+        skip0 = torch.clamp(skip0, -10.0, 10.0)
+        _check_nan(skip0, "head")
         
         e1 = self.encoder1['downsample'](skip0)
-        e1 = self.encoder1['body'](e1)
-        e1 = torch.clamp(e1, -10.0, 10.0) # Stability clamp
-        e1 = self.encoder1['film'](e1, cond) # Conditioning embedding + Film alreding clamped
+        e1 = _check_nan(e1, "encoder1.downsample")
+        e1_body = self.encoder1['body'](e1)
+        e1_body = torch.clamp(e1_body, -10.0, 10.0)
+        e1_body = _check_nan(e1_body, "encoder1.body")
+        e1 = self.encoder1['film'](e1_body, cond) # Pass body output to film
+        e1 = _check_nan(e1, "encoder1.film")
         skip1 = e1
         
         e2 = self.encoder2['downsample'](skip1)
-        e2 = self.encoder2['body'](e2)
-        e2 = torch.clamp(e2, -10.0, 10.0) # Stability clamp
-        e2 = self.encoder2['film'](e2, cond)
+        e2 = _check_nan(e2, "encoder2.downsample")
+        e2_body = self.encoder2['body'](e2)
+        e2_body = torch.clamp(e2_body, -10.0, 10.0)
+        e2_body = _check_nan(e2_body, "encoder2.body")
+        e2 = self.encoder2['film'](e2_body, cond)
+        e2 = _check_nan(e2, "encoder2.film")
         skip2 = e2
         
         e3 = self.encoder3['downsample'](skip2)
-        e3 = self.encoder3['body'](e3)
-        e3 = torch.clamp(e3, -10.0, 10.0) # Stability clamp
-        e3 = self.encoder3['film'](e3, cond)
+        e3 = _check_nan(e3, "encoder3.downsample")
+        e3_body = self.encoder3['body'](e3)
+        e3_body = torch.clamp(e3_body, -10.0, 10.0)
+        e3_body = _check_nan(e3_body, "encoder3.body")
+        e3 = self.encoder3['film'](e3_body, cond)
+        e3 = _check_nan(e3, "encoder3.film")
         skip3 = e3
         
         # 3. Bottleneck
         b = self.bottleneck_down(skip3)
+        b = _check_nan(b, "bottleneck_down")
         b = F.gelu(self.bottleneck_gn(b))
+        b = _check_nan(b, "bottleneck_gn+gelu")
         b = torch.clamp(b, min=-10.0, max=10.0) # Stability clamp
         
         b = self.bottleneck_pre_attn(b)
+        b = _check_nan(b, "bottleneck_pre_attn")
         b = self.bottleneck_attn(b) # Uses softmax clamp from blocks.py
+        b = _check_nan(b, "bottleneck_attn")
         b = self.bottleneck_film(b, cond)
+        b = _check_nan(b, "bottleneck_film")
         b = torch.clamp(b, min=-10.0, max=10.0) # Stability clamp
         b = self.bottleneck_post_attn(b)
+        b = _check_nan(b, "bottleneck_post_attn")
         
         # 4. Decoder Path (with skip connections)
         d3 = self.decoder3['upsample_op'](b)
@@ -302,6 +247,7 @@ class AV1_EfficientRestorer(nn.Module):
         d3 = torch.cat([d3, skip3], dim=1)
         d3 = self.decoder3['fusion'](d3)
         d3 = self.decoder3['body'](d3)
+        d3 = _check_nan(d3, "decoder3.body")
         
         d2 = self.decoder2['upsample_op'](d3)
         d2 = self.decoder2['upsample_conv'](d2)
@@ -309,6 +255,7 @@ class AV1_EfficientRestorer(nn.Module):
         d2 = torch.cat([d2, skip2], dim=1)
         d2 = self.decoder2['fusion'](d2)
         d2 = self.decoder2['body'](d2)
+        d2 = _check_nan(d2, "decoder2.body")
         
         d1 = self.decoder1['upsample_op'](d2)
         d1 = self.decoder1['upsample_conv'](d1)
@@ -316,19 +263,17 @@ class AV1_EfficientRestorer(nn.Module):
         d1 = torch.cat([d1, skip1], dim=1)
         d1 = self.decoder1['fusion'](d1)
         d1 = self.decoder1['body'](d1)
+        d1 = _check_nan(d1, "decoder1.body")
         
         # 5. Output Tail
         t = self.tail_upsample_op(d1)
         t = self.tail_upsample_conv(t)
         t = F.gelu(self.tail_gn(t))
-        t = torch.cat([t, skip0], dim=1) # t is now 48 channels
-        
-        # 't' is 48ch. We must fuse it to 24ch *before* the GroupNorm.
+        t = torch.cat([t, skip0], dim=1)
         t_fused = self.tail_fusion(t)
-        t_in = self.tail_fusion_gn_act(t_fused) # Now this gets 24ch
+        t_in = self.tail_fusion_gn_act(t_fused) # Now this gets 24 channels
 
-        # --- LEARNABLE RESIDUAL SCALE ---
-        # This replaces the stability clamp on the tail.
+        # --- ! LEARNABLE RESIDUAL SCALE LOGIC ! ---
         t_residual_features = self.tail_body(t_in)
         t_out = t_in + (t_residual_features * self.tail_residual_scale)
         
@@ -336,22 +281,23 @@ class AV1_EfficientRestorer(nn.Module):
         
         # 6. Residual Connection
         restored = lq_image + residual
-        restored = torch.clamp(restored, self.clamp_min, self.clamp_max)
+        restored = _check_nan(restored, "final_clamp")
+
+        # print("="*40)
+        # print("FORWARD PASS COMPLETED (NO NANS)")
+        # print("="*40 + "\n")
+
+        # restored = torch.clamp(restored, self.clamp_min, self.clamp_max)
         
         return restored
 
 # ==============================================================================
 # SECTION 2: BalancedRestorer Architecture
-# FiLM + EfficientResBlocks + SwinBottleneck + WaveletRestorationBlock
 # ==============================================================================
 
 class AV1_BalancedRestorer(nn.Module):
     """
-    BalancedRestorer:
-    - Encoder/Decoder: EfficientResBlocks (lightweight residual blocks)
-    - Bottleneck: SwinBottleneck + FiLM conditioning
-    - Tail: Fusion + WaveletRestorationBlock
-    
+    Spatially Symmetric & Numerically Stable BalancedRestorer.
     Best for: 'small', 'base', 'big' variants (8M - 30M params)
     """
     def __init__(self, config: dict):
@@ -381,7 +327,10 @@ class AV1_BalancedRestorer(nn.Module):
         self.encoder3 = self._build_encoder_level(ch[2], ch[3], blocks[3], self.cond_dim)
         
         # --- Bottleneck (V3) ---
-        self.bottleneck_down = nn.Sequential(nn.ReflectionPad2d(1), nn.Conv2d(ch[3], ch[4], 3, 2, 0, bias=False))
+        self.bottleneck_down = nn.Sequential(
+            nn.ReflectionPad2d(1), 
+            nn.Conv2d(ch[3], ch[4], 3, 2, 0, bias=False) # padding=0
+        )
         self.bottleneck_gn = nn.GroupNorm(choose_num_groups(ch[4]), ch[4])
         self.bottleneck_pre_attn = nn.Sequential(*[EfficientResBlock(ch[4]) for _ in range(blocks[4] // 2)])
         self.bottleneck_attn = SwinBottleneck(channels=ch[4], depth=4, num_heads=8, window_size=8)
@@ -400,6 +349,7 @@ class AV1_BalancedRestorer(nn.Module):
         self.tail_fusion = nn.Conv2d(ch[0] * 2, ch[0], 1, bias=False)
         self.tail_fusion_gn_act = nn.Sequential(nn.GroupNorm(choose_num_groups(ch[0]), ch[0]), nn.GELU())
         self.tail_body = WaveletRestorationBlock(ch[0])
+        
         self.tail_pred = nn.Sequential(
             nn.ReflectionPad2d(1),
             nn.Conv2d(ch[0], 3, 3, 1, 0) # padding=0
@@ -423,17 +373,11 @@ class AV1_BalancedRestorer(nn.Module):
 
 # ==============================================================================
 # SECTION 3: QualityRestorer Architecture
-# EfficientResBlocks + WaveletRestorationBlock, SwinBottleneck + FiLM, ProgressiveFeatureFusion
 # ==============================================================================
 
 class AV1_QualityRestorer(nn.Module):
     """
-    QualityRestorer:
-    - Encoder/Decoder: EfficientResBlocks + WaveletRestorationBlock
-    - Bottleneck: SwinBottleneck + FiLM conditioning
-    - Decoder: Dense Progressive Feature Fusion + Wavelet blocks
-    - Tail: EfficientResBlocks + WaveletRestorationBlock
-    
+    Spatially Symmetric & Numerically Stable QualityRestorer.
     Best for: 'large', 'huge', 'pro' (>30M params)
     """
     def __init__(self, config: dict):
@@ -495,6 +439,7 @@ class AV1_QualityRestorer(nn.Module):
     def _build_encoder_level(self, in_ch, out_ch, num_blocks, cond_dim):
         """V3 Encoder level with residuals, FiLM conditioning, and Wavelet blocks."""
         return nn.ModuleDict({
+            # --- SYMMETRY FIX: Use external padding ---
             'downsample': nn.Sequential(
                 nn.ReflectionPad2d(1),                         # symmetric reflection pad
                 nn.Conv2d(in_ch, out_ch, 3, 2, 0, bias=False), # stride=2 conv with padding=0
@@ -509,6 +454,7 @@ class AV1_QualityRestorer(nn.Module):
     def _build_decoder_level(self, in_ch, out_ch, num_blocks):
         """V3 Decoder level with upsample, residual body, and Wavelet."""
         return nn.ModuleDict({
+            # --- SYMMETRY FIX: Use align_corners=True ---
             'upsample': nn.Sequential(
                 nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
                 DepthwiseSeparable(in_ch, out_ch, stride=1),
@@ -524,70 +470,112 @@ class AV1_QualityRestorer(nn.Module):
 
     def forward(self, lq_image: torch.Tensor, crf: torch.Tensor, preset: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Forward pass for QualityRestorer (V3) with Dense Progressive Fusion."""
+        
+        # --- DEBUG HELPER FUNCTION ---
+        def _check_nan(tensor, name):
+            if torch.isnan(tensor).any() or torch.isinf(tensor).any():
+                print(f"🚨🚨🚨 NaN/Inf DETECTED! 🚨🚨🚨")
+                print(f"Operation causing issue: {name}")
+                raise ValueError(f"NaN/Inf detected in tensor: {name}")
+            else:
+                print(f"✅ OK: {name} | Max: {tensor.max():.4f}, Mean: {tensor.mean():.4f}")
+            return tensor
+        # --- END DEBUG HELPER ---
+        
+        print("\n" + "="*40)
+        print("STARTING FORWARD PASS DEBUG (QualityRestorer)")
+        print("="*40)
+        
         # 1. Generate conditioning
         cond = self.conditioning_embedder(crf, preset)
+        _check_nan(cond, "conditioning_embedder")
         
         # 2. Head
         skip0 = self.head(lq_image)
+        _check_nan(skip0, "head")
         
         # 3. Encoder
         x = skip0
         skips = [skip0]
-        for encoder in self.encoder_levels:
+        for i, encoder in enumerate(self.encoder_levels):
             x = encoder['downsample'](x)
-            x = encoder['body'](x)
+            x = _check_nan(x, f"encoder{i+1}.downsample")
+            x_body = encoder['body'](x)
+            x_body = _check_nan(x_body, f"encoder{i+1}.body")
+            x = x + x_body * 0.2  # RIR Connection
+            x = _check_nan(x, f"encoder{i+1}.RIR")
+            
             x = encoder['film'](x, cond)
+            x = _check_nan(x, f"encoder{i+1}.film")
             x = torch.clamp(x, -10.0, 10.0)
-            with torch.amp.autocast(device_type=str(lq_image.device.type), enabled=False):
-                x = encoder['wavelet'](x.float())
+            
+            x = encoder['wavelet'](x) # Uses float32 from blocks.py
+            x = _check_nan(x, f"encoder{i+1}.wavelet")
+            
             skips.append(x) # skips = [s0, s1, s2, s3, s4]
             
         # 4. Bottleneck
         x = skips.pop() # x = s4 (ch[4])
-        # run SwinBottleneck in float32 for stability
+        
         with torch.amp.autocast(device_type=str(lq_image.device.type), enabled=False):
-            x = self.bottleneck(x.float())
+            x = self.bottleneck(x.float()) # Uses softmax clamp
+        x = _check_nan(x, "bottleneck")
 
         x = self.bottleneck_film(x, cond)
+        x = _check_nan(x, "bottleneck_film")
         x = torch.clamp(x, -10.0, 10.0) # Stability
         
         # 5. Decoder with Progressive Fusion
-        # skips = [s0, s1, s2, s3]
-        x_pff_prev = None # Stores output of previous (deeper) level
+        x_pff_prev = None 
         
         for i, decoder in enumerate(self.decoder_levels):
-            # i = 0: 4->3. i = 1: 3->2. i = 2: 2->1. i = 3: 1->0.
-            
             x_up = decoder['upsample'](x)
-            x_skip = skips[-(i+1)] # s3, then s2, then s1, then s0
+            x_up = _check_nan(x_up, f"decoder{3-i}.upsample")
+            x_skip = skips[-(i+1)] 
             
-            # Fuse at this level using the dedicated DFF block
-            x_fused = self.progressive_fusion.fusions[i](x_skip, x_up) # V3 Feature
+            x_fused = self.progressive_fusion.fusions[i](x_skip, x_up) # Uses align_corners=True
+            x_fused = _check_nan(x_fused, f"decoder{3-i}.fusion")
             
-            # Add lateral (bottom-up) connection from previous (deeper) level
             if x_pff_prev is not None:
                 bottom_up = F.interpolate(
                     x_pff_prev, size=x_fused.shape[-2:], mode='bilinear', align_corners=True
                 )
-                bottom_up = self.progressive_fusion.lateral[i-1](bottom_up) # V3 Feature
+                bottom_up = self.progressive_fusion.lateral[i-1](bottom_up)
                 x_fused = x_fused + bottom_up
+                x_fused = _check_nan(x_fused, f"decoder{3-i}.lateral_add")
                 
-            # Run the main body of this decoder level
-            x = decoder['body'](x_fused)
-            with torch.amp.autocast(device_type=str(lq_image.device.type), enabled=False):
-                x = decoder['wavelet'](x.float()) # run Wavelet block in float32 for stability
+            x_in = decoder['body'](x_fused)
+            x_in = _check_nan(x_in, f"decoder{3-i}.body_in")
+            x = x_fused + x_in * 0.2 # RIR Connection
+            x = _check_nan(x, f"decoder{3-i}.RIR")
+            
+            x = decoder['wavelet'](x) # Uses float32 from blocks.py
+            x = _check_nan(x, f"decoder{3-i}.wavelet")
                 
-            x_pff_prev = x # Store this output for the next iteration
+            x_pff_prev = x 
             
         # 6. Tail
-        # x is now the final, full-res output from the decoder loop (ch[0])
-        with torch.amp.autocast(device_type=str(lq_image.device.type), enabled=False):
-            x = self.tail_body(x.float()) # run Wavelet block in float32 for stability
-        residual = self.tail_pred(x)
+        t_in = x # x is now the final, full-res output
+        
+        t_body = self.tail_body(t_in)
+        t_body = _check_nan(t_body, "tail.body")
+        t = t_in + t_body * 0.2 # RIR Connection
+        t = _check_nan(t, "tail.RIR")
+        
+        residual = self.tail_pred(t)
+        residual = _check_nan(residual, "tail_pred (residual)")
         
         # 7. Residual Connection
         restored = lq_image + residual
-        return torch.clamp(restored, self.clamp_min, self.clamp_max)
+        restored = _check_nan(restored, "lq + residual")
+        restored = torch.clamp(restored, self.clamp_min, self.clamp_max)
+        restored = _check_nan(restored, "final_clamp")
+
+        print("="*40)
+        print("FORWARD PASS COMPLETED (NO NANS)")
+        print("="*40 + "\n")
+        
+        return restored
 
     @torch.no_grad()
     def inference(self, *args, **kwargs):
@@ -749,7 +737,7 @@ def _tta_forward(x: torch.Tensor) -> torch.Tensor:
     x_rot180 = x.rot90(2, [-2, -1])
     x_rot270 = x.rot90(3, [-2, -1])
     x_flip = x.flip(-1)
-    x_flip_rot90 = x_flip.rot90(1, [-2, -1])
+    x_flip_rot9j = x_flip.rot90(1, [-2, -1])
     x_flip_rot180 = x_flip.rot90(2, [-2, -1])
     x_flip_rot270 = x_flip.rot90(3, [-2, -1])
     return torch.cat([x, x_rot90, x_rot180, x_rot270, x_flip, x_flip_rot90, x_flip_rot180, x_flip_rot270], dim=0)

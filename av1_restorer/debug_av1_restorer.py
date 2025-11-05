@@ -1,4 +1,4 @@
-# train_av1_conditional_restorer.py
+# av1_restorer/train_av1_restorer.py
 """
 Training Script for Conditional AV1 U-Net Restorers
 
@@ -67,7 +67,7 @@ import torch.amp
 project_root = Path(__file__).resolve().parent.parent
 sys.path.append(str(project_root))
 
-from av1_restorer.models.av1_restorer import create_av1_restorer
+from av1_restorer.models.av1_restorer_debug import create_av1_restorer
 
 try:
     from utils.loss import CombinedLoss
@@ -144,13 +144,8 @@ class EMA:
 
 class ConditionalUNetTrainer:
     """
-    Config-driven trainer for Conditional AV1 U-Net Restorers.
-    Production-ready with zero CPU bottleneck.
-     
-    Automatically detects CRF-only vs CRF+Preset based on preset_range:
-        - If preset_range is single value (e.g., [4,4]): CRF-only mode
-        - Otherwise: CRF+Preset mode
-
+    Production-ready trainer with zero CPU bottleneck.
+    
     Features:
       - Smart dataset caching (file lists shared across stages)
       - Persistent workers (eliminate respawn overhead)
@@ -249,12 +244,9 @@ class ConditionalUNetTrainer:
         
         # CUDA optimizations
         if self.device.type == 'cuda':
-            # old api
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
-            # new api
-            # torch.backends.cuda.matmul.fp32_precision = 'tf32' 
-            logger.info("Enabled TF32 for CUDA")
+            logger.info("Enabled TF32 for CUDA (using legacy API for torch.compile)")
         
         # Random seed
         seed = sys_cfg.get('seed', 42)
@@ -769,13 +761,26 @@ class ConditionalUNetTrainer:
             except Exception as e:
                 logger.error(f"Error loading batch: {e}")
                 raise
-            
+
+            # --- ! STRATEGIC DEBUG CHECK 1: WEIGHTS ! ---
+            # Check model weights *before* the forward pass.
+            # If this triggers, it proves the PREVIOUS optimizer.step() corrupted the model.
+            if batch_idx > 0: # Only check after the first step
+                check_param = self.model.conditioning_embedder.crf_embedder[0].weight
+                if torch.isnan(check_param).any():
+                    logger.error(f"!!! WEIGHTS ARE NaN at start of step {self.global_step} !!!")
+                    logger.error("This means the PREVIOUS optimizer step (step {self.global_step - 1}) failed.")
+                    self._save_checkpoint(epoch, stage_idx, optimizer, scheduler, is_emergency=True)
+                    raise ValueError(f"Weights became NaN at step {self.global_step}. Check optimizer/grad clipping.")
+            # --- ! END DEBUG CHECK 1 ! ---
+                
             # --- STABILITY FIX: Run loss in float32 ---
-            # Forward pass (respects mixed_precision config from your YAML)
-            with torch.amp.autocast(device_type=str(self.device.type), enabled=self.use_amp):
+            # Forward pass (Model in mixed precision)
+            with torch.amp.autocast(device_type=str(self.device.type), enabled=False): # self.use_amp):
+                # This is the line that *reveals* the crash, but doesn't *cause* it
                 restored = self.model(lq, crf, preset) if self.model_needs_preset else self.model(lq, crf)
 
-            # Loss computation (Forced to float32 for stability)
+            # Loss computation (Forced to float32)
             with torch.amp.autocast(device_type=str(self.device.type), enabled=False):
                 try:
                     loss, loss_dict = self.loss_fn(restored.float(), hq.float())
@@ -785,6 +790,7 @@ class ConditionalUNetTrainer:
                         self._save_checkpoint(epoch, stage_idx, optimizer, scheduler, is_emergency=True)
                         raise RuntimeError("Loss became NaN/Inf")
                 except Exception as e:
+                    # This is the block that is catching your current crash
                     logger.error(f"Forward pass or Loss calculation error: {e}")
                     self._save_checkpoint(epoch, stage_idx, optimizer, scheduler, is_emergency=True)
                     raise
@@ -794,45 +800,35 @@ class ConditionalUNetTrainer:
             optimizer.zero_grad(set_to_none=True)
             try:
                 if self.scaler:
-                    # --- This block will run for CUDA ---
                     self.scaler.scale(loss).backward()
-
-                    # --- ! PERMANENT GRADIENT CHECK (CUDA) ! ---
-                    # This is our safety net, even for CUDA
+                    # --- ! STRATEGIC DEBUG CHECK 2: GRADIENTS ! ---
                     self.scaler.unscale_(optimizer) # Unscale before checking
                     for name, param in self.model.named_parameters():
                         if param.grad is not None and not torch.isfinite(param.grad).all():
-                            logger.error(f"!!! NaN/Inf GRADIENT (CUDA) DETECTED at step {self.global_step} !!!")
+                            logger.error(f"!!! NaN/Inf GRADIENT DETECTED at step {self.global_step} !!!")
                             logger.error(f"Parameter: {name}")
                             logger.error("This will corrupt model weights. Skipping optimizer step.")
                             optimizer.zero_grad() # Clear the bad gradients
                             raise StopIteration("NaN Gradient Detected") # Use custom error to skip batch
-                    # --- ! END CHECK ! ---
-
+                    # --- ! END DEBUG CHECK 2 ! ---
                     grad_clip = self.config['training'].get('grad_clip_norm', 0.0)
                     if grad_clip > 0:
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
                     self.scaler.step(optimizer)
                     self.scaler.update()
                 else:
-                    # --- This block will run for MPS ---
                     loss.backward()
-                    
-                    # --- ! PERMANENT MPS GRADIENT SAFETY NET ! ---
-                    # We must check for NaN grads *before* clip_grad_norm_
-                    # This acts as our safety net since GradScaler is not available.
+                    # --- ! STRATEGIC DEBUG CHECK 2: GRADIENTS ! ---
                     for name, param in self.model.named_parameters():
                         if param.grad is not None and not torch.isfinite(param.grad).all():
-                            logger.error(f"!!! NaN/Inf GRADIENT (MPS) DETECTED at step {self.global_step} !!!")
+                            logger.error(f"!!! NaN/Inf GRADIENT DETECTED at step {self.global_step} !!!")
                             logger.error(f"Parameter: {name}")
                             logger.error("This will corrupt model weights. Skipping optimizer step.")
                             optimizer.zero_grad() # Clear the bad gradients
                             raise StopIteration("NaN Gradient Detected") # Use custom error to skip batch
-                    # --- ! END MPS SAFETY NET ! ---
-
+                    # --- ! END DEBUG CHECK 2 ! ---
                     grad_clip = self.config['training'].get('grad_clip_norm', 0.0)
                     if grad_clip > 0:
-                        # This will now only run if gradients are finite
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
                     optimizer.step()
 
@@ -881,7 +877,7 @@ class ConditionalUNetTrainer:
                 }
                 wandb_log['epoch/avg_total_loss'] = avg_loss
                 wandb.log(wandb_log, step=self.global_step)
-
+    
     def _validate_and_checkpoint(self, epoch, total_epochs, stage_idx, val_loader, optimizer, scheduler):
         """Run validation and save checkpoints."""
         val_freq = self.config['training'].get('validate_every_n_epochs', 1)
@@ -925,7 +921,10 @@ class ConditionalUNetTrainer:
                 with torch.amp.autocast(device_type=str(self.device.type), enabled=self.use_amp):
                     inference_fn = getattr(self.model, 'inference', self.model.forward)
                     restored = inference_fn(lq, crf, preset) if self.model_needs_preset else inference_fn(lq, crf)
-                    loss, loss_dict = self.loss_fn(restored, hq)
+                
+                # --- STABILITY FIX: Run loss in float32 ---
+                with torch.amp.autocast(device_type=str(self.device.type), enabled=False):
+                    loss, loss_dict = self.loss_fn(restored.float(), hq.float())
                 
                 total_loss += loss.item()
                 for k, v in loss_dict.items():
@@ -947,17 +946,11 @@ class ConditionalUNetTrainer:
         avg_loss = total_loss / num_batches
         avg_baseline_l1 = baseline_l1 / num_batches
         avg_restored_l1 = restored_l1 / num_batches
-        avg_baseline_l2 = baseline_l2 / num_batches
-        avg_restored_l2 = restored_l2 / num_batches
         l1_improvement = ((avg_baseline_l1 - avg_restored_l1) / (avg_baseline_l1 + 1e-9)) * 100
-        l2_improvement = ((avg_baseline_l2 - avg_restored_l2) / (avg_baseline_l2 + 1e-9)) * 100
-
         
         logger.info(f"📊 Validation Epoch {epoch+1}/{total_epochs}:")
         logger.info(f"    Avg Loss: {avg_loss:.6f}")
         logger.info(f"    L1: {avg_restored_l1:.6f} (Baseline: {avg_baseline_l1:.6f}, ↓ {l1_improvement:.2f}%)")
-        logger.info(f"    L2: {avg_restored_l2:.6f} (Baseline: {avg_baseline_l2:.6f}, ↓ {l2_improvement:.2f}%)")
-
         
         if WANDB_AVAILABLE and wandb.run:
             wandb_dict = {
@@ -966,11 +959,8 @@ class ConditionalUNetTrainer:
                 'val/avg_total_loss': avg_loss,
                 **{f'val/avg_{k.replace("loss_", "")}': v / num_batches for k, v in total_components.items()},
                 'val/baseline_l1': avg_baseline_l1,
-                'val/baseline_l2': avg_baseline_l2,
                 'val/restored_l1': avg_restored_l1,
-                'val/restored_l2': avg_restored_l2,
-                'val/improvement_l1': l1_improvement,
-                'val/improvement_l2': l2_improvement,
+                'val/improvement_l1': l1_improvement
             }
             
             if self.val_samples:
@@ -1017,7 +1007,6 @@ class ConditionalUNetTrainer:
             restored_display = restored
             hq_display = hq
         
-         # --- FIX: Replace NaNs before casting to uint8 ---
         lq_display = torch.nan_to_num(lq_display.clamp(0, 1), nan=0.0)
         restored_display = torch.nan_to_num(restored_display.clamp(0, 1), nan=0.0)
         hq_display = torch.nan_to_num(hq_display.clamp(0, 1), nan=0.0)
@@ -1112,6 +1101,7 @@ class ConditionalUNetTrainer:
         ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
         
         # Restore model
+        from collections import OrderedDict
         ckpt_state_dict = ckpt['model_state_dict']
         new_state_dict = OrderedDict()
 
