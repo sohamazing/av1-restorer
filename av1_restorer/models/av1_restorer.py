@@ -251,7 +251,7 @@ class AV1_EfficientRestorer(nn.Module):
         
         # 6. Residual Connection
         restored = lq_image + residual
-        restored = torch.clamp(restored, self.clamp_min, self.clamp_max)
+        # restored = torch.clamp(restored, self.clamp_min, self.clamp_max)
         
         return restored
 
