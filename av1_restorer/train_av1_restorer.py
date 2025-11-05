@@ -796,28 +796,16 @@ class ConditionalUNetTrainer:
                 if self.scaler:
                     # --- This block will run for CUDA ---
                     self.scaler.scale(loss).backward()
-
-                    # --- ! PERMANENT GRADIENT CHECK (CUDA) ! ---
-                    # This is our safety net, even for CUDA
-                    self.scaler.unscale_(optimizer) # Unscale before checking
-                    for name, param in self.model.named_parameters():
-                        if param.grad is not None and not torch.isfinite(param.grad).all():
-                            logger.error(f"!!! NaN/Inf GRADIENT (CUDA) DETECTED at step {self.global_step} !!!")
-                            logger.error(f"Parameter: {name}")
-                            logger.error("This will corrupt model weights. Skipping optimizer step.")
-                            optimizer.zero_grad() # Clear the bad gradients
-                            raise StopIteration("NaN Gradient Detected") # Use custom error to skip batch
-                    # --- ! END CHECK ! ---
-
+                    self.scaler.unscale_(optimizer) 
                     grad_clip = self.config['training'].get('grad_clip_norm', 0.0)
                     if grad_clip > 0:
+                        # This clip is safe because GradScaler will skip if grads are NaN/Inf
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
                     self.scaler.step(optimizer)
                     self.scaler.update()
                 else:
                     # --- This block will run for MPS ---
                     loss.backward()
-                    
                     # --- ! PERMANENT MPS GRADIENT SAFETY NET ! ---
                     # We must check for NaN grads *before* clip_grad_norm_
                     # This acts as our safety net since GradScaler is not available.
@@ -829,7 +817,6 @@ class ConditionalUNetTrainer:
                             optimizer.zero_grad() # Clear the bad gradients
                             raise StopIteration("NaN Gradient Detected") # Use custom error to skip batch
                     # --- ! END MPS SAFETY NET ! ---
-
                     grad_clip = self.config['training'].get('grad_clip_norm', 0.0)
                     if grad_clip > 0:
                         # This will now only run if gradients are finite
