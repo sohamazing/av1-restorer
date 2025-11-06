@@ -165,13 +165,13 @@ class AV1_EfficientRestorer(nn.Module):
         #     nn.init.zeros_(self.tail_pred.bias)
         logger.info("✓ Weights initialized (tail_pred zeroed for residual learning)")
 
-    def forward(self, lq_image: torch.Tensor, crf: torch.Tensor, preset: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward_noclamp(self, lq_image: torch.Tensor, crf: torch.Tensor, preset: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Forward pass for EfficientRestorer.
         Args:
             lq_image : Input low-quality AV1 frame
             crf      : CRF tensor
-            preset   : Optional preset tensor
+            preset   : Preset tensor (Optional)
         Returns:
             Restored image (same shape as input)
         """
@@ -255,7 +255,7 @@ class AV1_EfficientRestorer(nn.Module):
         
         return restored
 
-    def forward_clamped(self, lq_image: torch.Tensor, crf: torch.Tensor, preset: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, lq_image: torch.Tensor, crf: torch.Tensor, preset: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Forward pass for EfficientRestorer.
         Spatially symmetric and numerically stable.
