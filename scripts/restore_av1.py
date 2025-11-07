@@ -70,7 +70,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 # Import all supported model architectures
 try:
-    from av1_restorer.models.av1_conditional_unet_restorer_v2 import create_av1_restorer
+    from av1_restorer.models.av1_restorer import create_av1_restorer
     from av1_restorer.models.av1_nano_unet_restorer import create_av1_nano_unet_restorer
     from av1_restorer.models.av1_nano_resnet_restorer import create_av1_nano_resnet_restorer
     from av1_restorer.models.av1_nano_fbcnn_restorer import create_av1_nano_fbcnn_restorer

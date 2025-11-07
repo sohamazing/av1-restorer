@@ -165,7 +165,8 @@ class AV1_EfficientRestorer(nn.Module):
         #     nn.init.zeros_(self.tail_pred.bias)
         logger.info("✓ Weights initialized (tail_pred zeroed for residual learning)")
 
-    def forward_noclamp(self, lq_image: torch.Tensor, crf: torch.Tensor, preset: Optional[torch.Tensor] = None) -> torch.Tensor:
+    # default forward pass (no stability clamps, clamp restored output?)
+    def forward(self, lq_image: torch.Tensor, crf: torch.Tensor, preset: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Forward pass for EfficientRestorer.
         Args:
@@ -183,31 +184,31 @@ class AV1_EfficientRestorer(nn.Module):
         
         e1 = self.encoder1['downsample'](skip0)
         e1 = self.encoder1['body'](e1)
-        # e1 = torch.clamp(e1, -10.0, 10.0) # Stability clamp
+        # e1 = torch.clamp(e1, -10.0, 10.0) # stability clamp
         e1 = self.encoder1['film'](e1, cond) # Conditioning embedding + Film alreding clamped
         skip1 = e1
         
         e2 = self.encoder2['downsample'](skip1)
         e2 = self.encoder2['body'](e2)
-        # e2 = torch.clamp(e2, -10.0, 10.0) # Stability clamp
+        # e2 = torch.clamp(e2, -10.0, 10.0) # stability clamp
         e2 = self.encoder2['film'](e2, cond)
         skip2 = e2
         
         e3 = self.encoder3['downsample'](skip2)
         e3 = self.encoder3['body'](e3)
-        # e3 = torch.clamp(e3, -10.0, 10.0) # Stability clamp
+        # e3 = torch.clamp(e3, -10.0, 10.0) # stability clamp
         e3 = self.encoder3['film'](e3, cond)
         skip3 = e3
         
         # 3. Bottleneck
         b = self.bottleneck_down(skip3)
         b = F.gelu(self.bottleneck_gn(b))
-        # b = torch.clamp(b, min=-10.0, max=10.0) # Stability clamp
+        # b = torch.clamp(b, min=-10.0, max=10.0) # stability clamp
         
         b = self.bottleneck_pre_attn(b)
-        b = self.bottleneck_attn(b) # Uses softmax clamp from blocks.py
+        b = self.bottleneck_attn(b) # uses softmax clamp from blocks.py
         b = self.bottleneck_film(b, cond)
-        # b = torch.clamp(b, min=-10.0, max=10.0) # Stability clamp
+        # b = torch.clamp(b, min=-10.0, max=10.0) # stability clamp
         b = self.bottleneck_post_attn(b)
         
         # 4. Decoder Path (with skip connections)
@@ -240,22 +241,24 @@ class AV1_EfficientRestorer(nn.Module):
         
         # 't' is 48ch. We must fuse it to 24ch *before* the GroupNorm.
         t_fused = self.tail_fusion(t)
-        t_in = self.tail_fusion_gn_act(t_fused) # Now this gets 24ch
+        t_in = self.tail_fusion_gn_act(t_fused) # now this gets 24ch
 
         # --- LEARNABLE RESIDUAL SCALE ---
         # This replaces the stability clamp on the tail.
         t_residual_features = self.tail_body(t_in)
         t_out = t_in + (t_residual_features * self.tail_residual_scale)
         
-        residual = self.tail_pred(t_out) # Use t_out here
+        residual = self.tail_pred(t_out) # use t_out here
         
         # 6. Residual Connection
         restored = lq_image + residual
-        # restored = torch.clamp(restored, self.clamp_min, self.clamp_max)
+        restored = torch.clamp(restored, self.clamp_min, self.clamp_max) # valid original data range
         
         return restored
 
-    def forward(self, lq_image: torch.Tensor, crf: torch.Tensor, preset: Optional[torch.Tensor] = None) -> torch.Tensor:
+
+    # clamped forawrd pass
+    def forward_clamp(self, lq_image: torch.Tensor, crf: torch.Tensor, preset: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Forward pass for EfficientRestorer.
         Spatially symmetric and numerically stable.
@@ -265,34 +268,35 @@ class AV1_EfficientRestorer(nn.Module):
 
         # 2. Encoder Path
         skip0 = self.head(lq_image)
+        skip0 = torch.clamp(skip0, -10.0, 10.0) # stability clamp
         
         e1 = self.encoder1['downsample'](skip0)
         e1 = self.encoder1['body'](e1)
-        e1 = torch.clamp(e1, -10.0, 10.0) # Stability clamp
+        e1 = torch.clamp(e1, -10.0, 10.0) # stability clamp
         e1 = self.encoder1['film'](e1, cond) # Conditioning embedding + Film alreding clamped
         skip1 = e1
         
         e2 = self.encoder2['downsample'](skip1)
         e2 = self.encoder2['body'](e2)
-        e2 = torch.clamp(e2, -10.0, 10.0) # Stability clamp
+        e2 = torch.clamp(e2, -10.0, 10.0) # stability clamp
         e2 = self.encoder2['film'](e2, cond)
         skip2 = e2
         
         e3 = self.encoder3['downsample'](skip2)
         e3 = self.encoder3['body'](e3)
-        e3 = torch.clamp(e3, -10.0, 10.0) # Stability clamp
+        e3 = torch.clamp(e3, -10.0, 10.0) # stability clamp
         e3 = self.encoder3['film'](e3, cond)
         skip3 = e3
         
         # 3. Bottleneck
         b = self.bottleneck_down(skip3)
         b = F.gelu(self.bottleneck_gn(b))
-        b = torch.clamp(b, min=-10.0, max=10.0) # Stability clamp
+        b = torch.clamp(b, min=-10.0, max=10.0) # stability clamp
         
         b = self.bottleneck_pre_attn(b)
-        b = self.bottleneck_attn(b) # Uses softmax clamp from blocks.py
+        b = self.bottleneck_attn(b) # uses softmax clamp from blocks.py
         b = self.bottleneck_film(b, cond)
-        b = torch.clamp(b, min=-10.0, max=10.0) # Stability clamp
+        b = torch.clamp(b, min=-10.0, max=10.0) # stability clamp
         b = self.bottleneck_post_attn(b)
         
         # 4. Decoder Path (with skip connections)
@@ -325,20 +329,150 @@ class AV1_EfficientRestorer(nn.Module):
         
         # 't' is 48ch. We must fuse it to 24ch *before* the GroupNorm.
         t_fused = self.tail_fusion(t)
-        t_in = self.tail_fusion_gn_act(t_fused) # Now this gets 24ch
+        t_in = self.tail_fusion_gn_act(t_fused) # now this gets 24ch
 
         # --- LEARNABLE RESIDUAL SCALE ---
         # This replaces the stability clamp on the tail.
         t_residual_features = self.tail_body(t_in)
         t_out = t_in + (t_residual_features * self.tail_residual_scale)
         
-        residual = self.tail_pred(t_out) # Use t_out here
+        residual = self.tail_pred(t_out) # use t_out here
         
         # 6. Residual Connection
         restored = lq_image + residual
         restored = torch.clamp(restored, self.clamp_min, self.clamp_max)
         
         return restored
+
+        # debug log forward pass
+    def forward_debug(self, lq_image: torch.Tensor, crf: torch.Tensor, preset: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Forward pass for EfficientRestorer.
+        Spatially symmetric and numerically stable.
+        REMOVED RIR and all autocast wrappers for clean float32 debugging.
+        """
+        
+        # --- DEBUG HELPER FUNCTION ---
+        def _check_nan(tensor, name):
+            if torch.isnan(tensor).any() or torch.isinf(tensor).any():
+                print(f"🚨🚨🚨 NaN/Inf DETECTED! 🚨🚨🚨")
+                print(f"Operation causing issue: {name}")
+                raise ValueError(f"NaN/Inf detected in tensor: {name}")
+            else:
+                # This will print the status of every block.
+                # Comment this line out if you only want to see the *error*.
+                print(f"✅ OK: {name} | Max: {tensor.max():.4f}, Mean: {tensor.mean():.4f}")
+            return tensor
+        # --- END DEBUG HELPER ---
+
+        print("\n" + "="*40)
+        print("STARTING FORWARD PASS DEBUG (v_STABLE)")
+        print("="*40)
+
+        # 1. Generate conditioning vector
+        cond = self.conditioning_embedder(crf, preset)
+        _check_nan(cond, "conditioning_embedder")
+
+        # 2. Encoder Path
+        skip0 = self.head(lq_image)
+        skip0 = torch.clamp(skip0, -10.0, 10.0)
+        _check_nan(skip0, "head")
+        
+        e1 = self.encoder1['downsample'](skip0)
+        e1 = _check_nan(e1, "encoder1.downsample")
+        e1_body = self.encoder1['body'](e1)
+        e1_body = torch.clamp(e1_body, -10.0, 10.0)
+        e1_body = _check_nan(e1_body, "encoder1.body")
+        e1 = self.encoder1['film'](e1_body, cond) # Pass body output to film
+        e1 = _check_nan(e1, "encoder1.film")
+        skip1 = e1
+        
+        e2 = self.encoder2['downsample'](skip1)
+        e2 = _check_nan(e2, "encoder2.downsample")
+        e2_body = self.encoder2['body'](e2)
+        e2_body = torch.clamp(e2_body, -10.0, 10.0)
+        e2_body = _check_nan(e2_body, "encoder2.body")
+        e2 = self.encoder2['film'](e2_body, cond)
+        e2 = _check_nan(e2, "encoder2.film")
+        skip2 = e2
+        
+        e3 = self.encoder3['downsample'](skip2)
+        e3 = _check_nan(e3, "encoder3.downsample")
+        e3_body = self.encoder3['body'](e3)
+        e3_body = torch.clamp(e3_body, -10.0, 10.0)
+        e3_body = _check_nan(e3_body, "encoder3.body")
+        e3 = self.encoder3['film'](e3_body, cond)
+        e3 = _check_nan(e3, "encoder3.film")
+        skip3 = e3
+        
+        # 3. Bottleneck
+        b = self.bottleneck_down(skip3)
+        b = _check_nan(b, "bottleneck_down")
+        b = F.gelu(self.bottleneck_gn(b))
+        b = _check_nan(b, "bottleneck_gn+gelu")
+        b = torch.clamp(b, min=-10.0, max=10.0) # stability clamp
+        
+        b = self.bottleneck_pre_attn(b)
+        b = _check_nan(b, "bottleneck_pre_attn")
+        b = self.bottleneck_attn(b) # uses softmax clamp from blocks.py
+        b = _check_nan(b, "bottleneck_attn")
+        b = self.bottleneck_film(b, cond)
+        b = _check_nan(b, "bottleneck_film")
+        b = torch.clamp(b, min=-10.0, max=10.0) # stability clamp
+        b = self.bottleneck_post_attn(b)
+        b = _check_nan(b, "bottleneck_post_attn")
+        
+        # 4. Decoder Path (with skip connections)
+        d3 = self.decoder3['upsample_op'](b)
+        d3 = self.decoder3['upsample_conv'](d3)
+        d3 = F.gelu(self.decoder3['upsample_gn'](d3))
+        d3 = torch.cat([d3, skip3], dim=1)
+        d3 = self.decoder3['fusion'](d3)
+        d3 = self.decoder3['body'](d3)
+        d3 = _check_nan(d3, "decoder3.body")
+        
+        d2 = self.decoder2['upsample_op'](d3)
+        d2 = self.decoder2['upsample_conv'](d2)
+        d2 = F.gelu(self.decoder2['upsample_gn'](d2))
+        d2 = torch.cat([d2, skip2], dim=1)
+        d2 = self.decoder2['fusion'](d2)
+        d2 = self.decoder2['body'](d2)
+        d2 = _check_nan(d2, "decoder2.body")
+        
+        d1 = self.decoder1['upsample_op'](d2)
+        d1 = self.decoder1['upsample_conv'](d1)
+        d1 = F.gelu(self.decoder1['upsample_gn'](d1))
+        d1 = torch.cat([d1, skip1], dim=1)
+        d1 = self.decoder1['fusion'](d1)
+        d1 = self.decoder1['body'](d1)
+        d1 = _check_nan(d1, "decoder1.body")
+        
+        # 5. Output Tail
+        t = self.tail_upsample_op(d1)
+        t = self.tail_upsample_conv(t)
+        t = F.gelu(self.tail_gn(t))
+        t = torch.cat([t, skip0], dim=1)
+        t_fused = self.tail_fusion(t)
+        t_in = self.tail_fusion_gn_act(t_fused) # now this gets 24 channels
+
+        # --- ! LEARNABLE RESIDUAL SCALE LOGIC ! ---
+        t_residual_features = self.tail_body(t_in)
+        t_out = t_in + (t_residual_features * self.tail_residual_scale)
+        
+        residual = self.tail_pred(t_out) # use t_out here
+        
+        # 6. Residual Connection
+        restored = lq_image + residual
+        restored = _check_nan(restored, "final_clamp")
+
+        print("="*40)
+        print("FORWARD PASS COMPLETED (NO NANS)")
+        print("="*40 + "\n")
+
+        restored = torch.clamp(restored, self.clamp_min, self.clamp_max)
+        
+        return restored
+
 
 # ==============================================================================
 # SECTION 2: BalancedRestorer Architecture
@@ -740,7 +874,7 @@ def _inference_tiled(
             output[:, :, h_start:h_end, w_start:w_end] += restored_tile * blend
             weight[:, :, h_start:h_end, w_start:w_end] += blend
 
-    output = output / (weight + 1e-8)  # Normalize by accumulated weights
+    output = output / (weight + 1e-8)  # normalize by accumulated weights
     return output
 
 

@@ -772,7 +772,7 @@ class ConditionalUNetTrainer:
             
             # --- STABILITY FIX: Run loss in float32 ---
             # Forward pass (respects mixed_precision config from your YAML)
-            with torch.amp.autocast(device_type=str(self.device.type), enabled=self.use_amp):
+            with torch.amp.autocast(device_type=str(self.device.type), enabled=self.use_amp and self.device.type == 'cuda'):
                 restored = self.model(lq, crf, preset) if self.model_needs_preset else self.model(lq, crf)
 
             # Loss computation (Forced to float32 for stability)
@@ -869,6 +869,145 @@ class ConditionalUNetTrainer:
                 wandb_log['epoch/avg_total_loss'] = avg_loss
                 wandb.log(wandb_log, step=self.global_step)
 
+    def _train_epoch_debug(self, epoch, total_epochs, stage_idx, train_loader, optimizer, scheduler, sub_stage_idx=-1):
+        """Train for one epoch."""
+        self.model.train()
+        
+        # Progress bar
+        stage_desc = f"Stage {stage_idx+1}"
+        if sub_stage_idx != -1:
+            stage_desc += f".{sub_stage_idx+1}"
+        pbar = tqdm(train_loader, desc=f"{stage_desc} | Epoch {epoch+1}/{total_epochs}", leave=True, dynamic_ncols=True)
+        
+        epoch_total_loss = 0.0
+        epoch_loss_components = defaultdict(float)
+        
+        for batch_idx, batch in enumerate(pbar):
+            try:
+                lq = batch['lq'].to(self.device, non_blocking=True)
+                hq = batch['hq'].to(self.device, non_blocking=True)
+                crf = batch['crf'].to(self.device, non_blocking=True)
+                preset = batch['preset'].to(self.device, non_blocking=True) if self.model_needs_preset else None
+            except Exception as e:
+                logger.error(f"Error loading batch: {e}")
+                raise
+
+            # --- ! STRATEGIC DEBUG CHECK 1: WEIGHTS ! ---
+            # Check model weights *before* the forward pass.
+            # If this triggers, it proves the PREVIOUS optimizer.step() corrupted the model.
+            if batch_idx > 0: # Only check after the first step
+                check_param = self.model.conditioning_embedder.crf_embedder[0].weight
+                if torch.isnan(check_param).any():
+                    logger.error(f"!!! WEIGHTS ARE NaN at start of step {self.global_step} !!!")
+                    logger.error("This means the PREVIOUS optimizer step (step {self.global_step - 1}) failed.")
+                    self._save_checkpoint(epoch, stage_idx, optimizer, scheduler, is_emergency=True)
+                    raise ValueError(f"Weights became NaN at step {self.global_step}. Check optimizer/grad clipping.")
+            # --- ! END DEBUG CHECK 1 ! ---
+                
+            # --- STABILITY FIX: Run loss in float32 ---
+            # Forward pass (Model in mixed precision)
+            with torch.amp.autocast(device_type=str(self.device.type), enabled=False): # self.use_amp):
+                # This is the line that *reveals* the crash, but doesn't *cause* it
+                restored = self.model(lq, crf, preset) if self.model_needs_preset else self.model(lq, crf)
+
+            # Loss computation (Forced to float32)
+            with torch.amp.autocast(device_type=str(self.device.type), enabled=False):
+                try:
+                    loss, loss_dict = self.loss_fn(restored.float(), hq.float())
+                    
+                    if not torch.isfinite(loss):
+                        logger.error(f"Loss NaN/Inf at step {self.global_step}")
+                        self._save_checkpoint(epoch, stage_idx, optimizer, scheduler, is_emergency=True)
+                        raise RuntimeError("Loss became NaN/Inf")
+                except Exception as e:
+                    # This is the block that is catching your current crash
+                    logger.error(f"Forward pass or Loss calculation error: {e}")
+                    self._save_checkpoint(epoch, stage_idx, optimizer, scheduler, is_emergency=True)
+                    raise
+            # --- END STABILITY FIX ---
+
+            # Backward pass
+            optimizer.zero_grad(set_to_none=True)
+            try:
+                if self.scaler:
+                    self.scaler.scale(loss).backward()
+                    # --- ! STRATEGIC DEBUG CHECK 2: GRADIENTS ! ---
+                    self.scaler.unscale_(optimizer) # Unscale before checking
+                    for name, param in self.model.named_parameters():
+                        if param.grad is not None and not torch.isfinite(param.grad).all():
+                            logger.error(f"!!! NaN/Inf GRADIENT DETECTED at step {self.global_step} !!!")
+                            logger.error(f"Parameter: {name}")
+                            logger.error("This will corrupt model weights. Skipping optimizer step.")
+                            optimizer.zero_grad() # Clear the bad gradients
+                            raise StopIteration("NaN Gradient Detected") # Use custom error to skip batch
+                    # --- ! END DEBUG CHECK 2 ! ---
+                    grad_clip = self.config['training'].get('grad_clip_norm', 0.0)
+                    if grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
+                    self.scaler.step(optimizer)
+                    self.scaler.update()
+                else:
+                    loss.backward()
+                    # --- ! STRATEGIC DEBUG CHECK 2: GRADIENTS ! ---
+                    for name, param in self.model.named_parameters():
+                        if param.grad is not None and not torch.isfinite(param.grad).all():
+                            logger.error(f"!!! NaN/Inf GRADIENT DETECTED at step {self.global_step} !!!")
+                            logger.error(f"Parameter: {name}")
+                            logger.error("This will corrupt model weights. Skipping optimizer step.")
+                            optimizer.zero_grad() # Clear the bad gradients
+                            raise StopIteration("NaN Gradient Detected") # Use custom error to skip batch
+                    # --- ! END DEBUG CHECK 2 ! ---
+                    grad_clip = self.config['training'].get('grad_clip_norm', 0.0)
+                    if grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip)
+                    optimizer.step()
+
+            except StopIteration as e: # Catch our custom "skip batch" error
+                logger.warning(f"Skipping optimizer step for batch {batch_idx} due to: {e}")
+                continue # This skips the rest of the loop and goes to the next batch
+
+            except Exception as e:
+                logger.error(f"Backward pass error: {e}")
+                self._save_checkpoint(epoch, stage_idx, optimizer, scheduler, is_emergency=True)
+                raise
+            
+            if scheduler:
+                scheduler.step()
+            if self.ema:
+                self.ema.update()
+            
+            # Metrics
+            batch_loss = loss.item()
+            epoch_total_loss += batch_loss
+            for k, v in loss_dict.items():
+                epoch_loss_components[k] += v.item()
+            
+            lr = optimizer.param_groups[0]['lr']
+            pbar.set_postfix(Loss=f"{batch_loss:.4f}", LR=f"{lr:.2e}", refresh=(batch_idx % 10 == 0))
+            
+            # W&B logging
+            if WANDB_AVAILABLE and wandb.run:
+                log_freq = self.config['training'].get('log_every_n_steps', 50)
+                if self.global_step % log_freq == 0:
+                    wandb_log = {f'train/{k.replace("loss_", "")}': v.item() for k, v in loss_dict.items()}
+                    wandb_log['train/learning_rate'] = lr
+                    wandb.log(wandb_log, step=self.global_step)
+            
+            self.global_step += 1
+        
+        # Epoch summary
+        if len(train_loader) > 0:
+            avg_loss = epoch_total_loss / len(train_loader)
+            logger.info(f"Epoch {epoch+1}/{total_epochs} | Avg Train Loss: {avg_loss:.6f}")
+            
+            if WANDB_AVAILABLE and wandb.run:
+                wandb_log = {
+                    f'epoch/avg_{k.replace("loss_", "")}': v / len(train_loader)
+                    for k, v in epoch_loss_components.items()
+                }
+                wandb_log['epoch/avg_total_loss'] = avg_loss
+                wandb.log(wandb_log, step=self.global_step)
+
     def _validate_and_checkpoint(self, epoch, total_epochs, stage_idx, val_loader, optimizer, scheduler):
         """Run validation and save checkpoints."""
         val_freq = self.config['training'].get('validate_every_n_epochs', 1)
@@ -909,7 +1048,7 @@ class ConditionalUNetTrainer:
                 crf = batch['crf'].to(self.device, non_blocking=True)
                 preset = batch['preset'].to(self.device, non_blocking=True) if self.model_needs_preset else None
                 
-                with torch.amp.autocast(device_type=str(self.device.type), enabled=self.use_amp):
+                with torch.amp.autocast(device_type=str(self.device.type), enabled=self.use_amp and self.device.type == 'cuda'):
                     inference_fn = getattr(self.model, 'inference', self.model.forward)
                     restored = inference_fn(lq, crf, preset) if self.model_needs_preset else inference_fn(lq, crf)
                     loss, loss_dict = self.loss_fn(restored, hq)
@@ -986,7 +1125,7 @@ class ConditionalUNetTrainer:
         
         inference_fn = getattr(self.model, 'inference', self.model.forward)
         
-        with torch.amp.autocast(device_type=str(self.device.type), enabled=self.use_amp):
+        with torch.amp.autocast(device_type=str(self.device.type), enabled=self.use_amp and self.device.type == 'cuda'):
             if self.model_needs_preset:
                 restored = inference_fn(lq, crf, preset)
             else:
