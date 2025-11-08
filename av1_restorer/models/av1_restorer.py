@@ -58,7 +58,7 @@ class AV1_EfficientRestorer(nn.Module):
         norm_range = tuple(config.get('norm_range', (0, 1)))
         self.clamp_min, self.clamp_max = norm_range
         self.cond_dim = 128 if preset_range[0] == preset_range[1] else 192 
-
+        self.min_div = 32
         logger.info("  > Instantiating EfficientRestorer (SOTA Efficiency)")
         
         # Conditioning network
@@ -166,7 +166,7 @@ class AV1_EfficientRestorer(nn.Module):
         logger.info("✓ Weights initialized (tail_pred zeroed for residual learning)")
 
     # default forward pass (no stability clamps, clamp restored output?)
-    def forward(self, lq_image: torch.Tensor, crf: torch.Tensor, preset: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward_noclamp(self, lq_image: torch.Tensor, crf: torch.Tensor, preset: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Forward pass for EfficientRestorer.
         Args:
@@ -184,31 +184,25 @@ class AV1_EfficientRestorer(nn.Module):
         
         e1 = self.encoder1['downsample'](skip0)
         e1 = self.encoder1['body'](e1)
-        # e1 = torch.clamp(e1, -10.0, 10.0) # stability clamp
         e1 = self.encoder1['film'](e1, cond) # Conditioning embedding + Film alreding clamped
         skip1 = e1
         
         e2 = self.encoder2['downsample'](skip1)
         e2 = self.encoder2['body'](e2)
-        # e2 = torch.clamp(e2, -10.0, 10.0) # stability clamp
         e2 = self.encoder2['film'](e2, cond)
         skip2 = e2
         
         e3 = self.encoder3['downsample'](skip2)
         e3 = self.encoder3['body'](e3)
-        # e3 = torch.clamp(e3, -10.0, 10.0) # stability clamp
         e3 = self.encoder3['film'](e3, cond)
         skip3 = e3
         
         # 3. Bottleneck
         b = self.bottleneck_down(skip3)
         b = F.gelu(self.bottleneck_gn(b))
-        # b = torch.clamp(b, min=-10.0, max=10.0) # stability clamp
-        
         b = self.bottleneck_pre_attn(b)
         b = self.bottleneck_attn(b) # uses softmax clamp from blocks.py
         b = self.bottleneck_film(b, cond)
-        # b = torch.clamp(b, min=-10.0, max=10.0) # stability clamp
         b = self.bottleneck_post_attn(b)
         
         # 4. Decoder Path (with skip connections)
@@ -252,7 +246,6 @@ class AV1_EfficientRestorer(nn.Module):
         
         # 6. Residual Connection
         restored = lq_image + residual
-        restored = torch.clamp(restored, self.clamp_min, self.clamp_max) # valid original data range
         
         return restored
 
@@ -345,7 +338,7 @@ class AV1_EfficientRestorer(nn.Module):
         return restored
 
         # debug log forward pass
-    def forward_debug(self, lq_image: torch.Tensor, crf: torch.Tensor, preset: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, lq_image: torch.Tensor, crf: torch.Tensor, preset: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Forward pass for EfficientRestorer.
         Spatially symmetric and numerically stable.
@@ -375,13 +368,13 @@ class AV1_EfficientRestorer(nn.Module):
 
         # 2. Encoder Path
         skip0 = self.head(lq_image)
-        skip0 = torch.clamp(skip0, -10.0, 10.0)
+        # skip0 = torch.clamp(skip0, -10.0, 10.0)
         _check_nan(skip0, "head")
         
         e1 = self.encoder1['downsample'](skip0)
         e1 = _check_nan(e1, "encoder1.downsample")
         e1_body = self.encoder1['body'](e1)
-        e1_body = torch.clamp(e1_body, -10.0, 10.0)
+        # e1_body = torch.clamp(e1_body, -10.0, 10.0)
         e1_body = _check_nan(e1_body, "encoder1.body")
         e1 = self.encoder1['film'](e1_body, cond) # Pass body output to film
         e1 = _check_nan(e1, "encoder1.film")
@@ -390,7 +383,7 @@ class AV1_EfficientRestorer(nn.Module):
         e2 = self.encoder2['downsample'](skip1)
         e2 = _check_nan(e2, "encoder2.downsample")
         e2_body = self.encoder2['body'](e2)
-        e2_body = torch.clamp(e2_body, -10.0, 10.0)
+        # e2_body = torch.clamp(e2_body, -10.0, 10.0)
         e2_body = _check_nan(e2_body, "encoder2.body")
         e2 = self.encoder2['film'](e2_body, cond)
         e2 = _check_nan(e2, "encoder2.film")
@@ -399,7 +392,7 @@ class AV1_EfficientRestorer(nn.Module):
         e3 = self.encoder3['downsample'](skip2)
         e3 = _check_nan(e3, "encoder3.downsample")
         e3_body = self.encoder3['body'](e3)
-        e3_body = torch.clamp(e3_body, -10.0, 10.0)
+        # e3_body = torch.clamp(e3_body, -10.0, 10.0)
         e3_body = _check_nan(e3_body, "encoder3.body")
         e3 = self.encoder3['film'](e3_body, cond)
         e3 = _check_nan(e3, "encoder3.film")
@@ -410,7 +403,7 @@ class AV1_EfficientRestorer(nn.Module):
         b = _check_nan(b, "bottleneck_down")
         b = F.gelu(self.bottleneck_gn(b))
         b = _check_nan(b, "bottleneck_gn+gelu")
-        b = torch.clamp(b, min=-10.0, max=10.0) # stability clamp
+        # b = torch.clamp(b, min=-10.0, max=10.0) # stability clamp
         
         b = self.bottleneck_pre_attn(b)
         b = _check_nan(b, "bottleneck_pre_attn")
@@ -418,7 +411,7 @@ class AV1_EfficientRestorer(nn.Module):
         b = _check_nan(b, "bottleneck_attn")
         b = self.bottleneck_film(b, cond)
         b = _check_nan(b, "bottleneck_film")
-        b = torch.clamp(b, min=-10.0, max=10.0) # stability clamp
+        # b = torch.clamp(b, min=-10.0, max=10.0) # stability clamp
         b = self.bottleneck_post_attn(b)
         b = _check_nan(b, "bottleneck_post_attn")
         
@@ -463,13 +456,14 @@ class AV1_EfficientRestorer(nn.Module):
         
         # 6. Residual Connection
         restored = lq_image + residual
-        restored = _check_nan(restored, "final_clamp")
+        restored = _check_nan(restored, "final_restored")
 
         print("="*40)
         print("FORWARD PASS COMPLETED (NO NANS)")
         print("="*40 + "\n")
 
-        restored = torch.clamp(restored, self.clamp_min, self.clamp_max)
+        # restored = torch.clamp(restored, self.clamp_min, self.clamp_max)
+        # restored = _check_nan(restored, "final_clamp")
         
         return restored
 
@@ -495,7 +489,8 @@ class AV1_BalancedRestorer(nn.Module):
         norm_range = tuple(config.get('norm_range', (0, 1)))
         self.clamp_min, self.clamp_max = norm_range
         self.cond_dim = 128 if preset_range[0] == preset_range[1] else 192 
-            
+        self.min_div = 128
+
         logger.info("  > Instantiating BalancedRestorer (SOTA Balanced Quality-Efficiency)")
 
         # --- Conditioning network ---
@@ -582,7 +577,8 @@ class AV1_QualityRestorer(nn.Module):
         
         self.clamp_min, self.clamp_max = norm_range
         self.cond_dim = 128 if preset_range[0] == preset_range[1] else 192
-        
+        self.min_div = 128
+
         logger.info("  > Instantiating QualityRestorer (SOTA Maximum Quality)")
 
         # --- Conditioning network ---
@@ -766,7 +762,7 @@ def _inference_tiled(
     """
     model.eval()
     B, C, H, W = lq_image.shape
-    min_div = 32  # Model requires 5 levels of 2x downsampling (2^5=32)
+    min_div = model.min_div  # requires 4 (or 5) levels of 2x downsampling (2^4=16) + (swin_window=8)
 
     # --- Internal helper: Single model forward pass (handles CRF-only or CRF+Preset mode) ---
     def _model_pass(tile, base_crf, base_preset):
