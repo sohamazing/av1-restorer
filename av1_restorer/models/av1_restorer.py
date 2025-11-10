@@ -166,7 +166,7 @@ class AV1_EfficientRestorer(nn.Module):
         logger.info("✓ Weights initialized (tail_pred zeroed for residual learning)")
 
     # default forward pass (no stability clamps, clamp restored output?)
-    def forward_noclamp(self, lq_image: torch.Tensor, crf: torch.Tensor, preset: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, lq_image: torch.Tensor, crf: torch.Tensor, preset: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Forward pass for EfficientRestorer.
         Args:
@@ -338,7 +338,7 @@ class AV1_EfficientRestorer(nn.Module):
         return restored
 
         # debug log forward pass
-    def forward(self, lq_image: torch.Tensor, crf: torch.Tensor, preset: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward_debug(self, lq_image: torch.Tensor, crf: torch.Tensor, preset: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Forward pass for EfficientRestorer.
         Spatially symmetric and numerically stable.
