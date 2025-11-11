@@ -989,7 +989,7 @@ class ConditionalUNetTrainer:
         
         inference_fn = getattr(self.model, 'inference', self.model.forward)
         
-        with torch.amp.autocast(device_type=str(self.device.type), enabled=self.use_amp):
+        with torch.amp.autocast(device_type=str(self.device.type), enabled=self.use_amp and self.device.type == 'cuda'):
             if self.model_needs_preset:
                 restored = inference_fn(lq, crf, preset)
             else:

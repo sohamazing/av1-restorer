@@ -287,7 +287,7 @@ class AV1_EfficientRestorer(nn.Module):
         # print("FORWARD PASS COMPLETED (NO NANS)")
         # print("="*40 + "\n")
 
-        # restored = torch.clamp(restored, self.clamp_min, self.clamp_max)
+        restored = torch.clamp(restored, self.clamp_min, self.clamp_max)
         
         return restored
 
